@@ -49,15 +49,20 @@ to the milestone that needs them, with the re-add trigger noted):
 | Doc puts in v1 | Roadmap defers to | Re-add trigger / rationale |
 |---|---|---|
 | **Slack** (3rd connector) | M6 | RSS + GitHub already exercise *every* architectural axis: poll-only, webhook, public scope, **private scope** (private GitHub repos), and 2 of 3 `content_kind`s. Slack adds `message` + heaviest OAuth for marginal architectural coverage. |
-| **OAuth `/connect` flow** (UI install dance) | M5 | Seed `connection` rows by hand (config/SQL) through M4. The flow is real product surface but blocks nothing in the pipeline. |
-| **Two-context RLS** | M5 | The doc itself calls RLS "the backstop"; typed `Scope` + property test are "primary." Carry the primary defense from M2; add the DB backstop before real private data / real users. |
-| **KMS / envelope encryption** | M4 (interim master key) | RSS needs no creds. Only GitHub (M2) stores a secret, and `installation_id` is *not* a secret. Real secret-at-rest is forced only by Slack tokens / production. |
+| **OAuth `/connect` flow** (UI install dance) | M5 | Seed `connection` rows by hand (config/SQL) through M4 — you install your own GitHub App once. The flow is real product surface but blocks nothing in the pipeline. |
+| **Managed KMS backend** (aws-sdk-kms) | M5 (optional) | The interim sealed-master-key envelope encryption (in M2) is the actual v1 design and is sufficient for self-hosting. Swapping to a managed KMS is a *backend* change behind `creds_ref`, never a schema change. |
 | **Per-subscriber linking** | M3 | A group-only digest (one cluster = one story) is a valid, shippable intermediate. Linking is the headline feature but the highest-complexity component — earn the pipeline first. |
 | **Relevance gate + affinity feedback loop** | M4 | Start with a hard subscription/keyword filter (M1). Learned-ish affinity weighting + the feedback loop come once there's a digest to give feedback *on*. |
 | **DST-correct per-subscriber scheduling** | M5 | M1–M4 run a single global UTC daily/weekly tick. Timezone + DST math is threaded in before multi-timezone users. |
 | **Nix / Cachix / OCI images** | Parallel track, lands by M5 | Plain Cargo workspace + GitHub Actions is enough to build and test. Add Nix when reproducibility/CI-cache pain is real or before first deploy — not on day one. |
 | **OTel / Sentry / tokio-metrics** | M5 | `tracing` to stdout + pipeline counters carry M1–M4. Full observability stack lands with hardening. |
 | **turmoil / madsim DST simulation** | M5 | `proptest` + `insta` on the pure `core` (fingerprint, selection, linking determinism) is high-value and cheap — keep from M1. Crash-injection simulation waits until the DAG stops changing shape. |
+
+**Pulled *forward* (because we want to dogfood live private data early):** **two-context RLS** and
+**credential-at-rest encryption** move from the back of the line into **M2**, the moment private scope
+and real credentials first exist. The doc lists both in v1; this roadmap originally batched them into
+hardening, but validating usefulness/tuning against your own real GitHub repos means private data must
+be DB-isolated and your GitHub App key must be encrypted *as soon as they land*. See M2.
 
 **What we do *not* cut from v1:** the modular monolith on one Postgres, the `core`-vs-rest crate
 boundary, the apalis job queue + cron tick, the canonical `Event` + fingerprint dedup, the
@@ -127,10 +132,12 @@ restarting reprocesses the same window without dup-sending.
 
 ---
 
-### M2 — Multi-source & the scope boundary (GitHub + webhooks)
+### M2 — Multi-source, the scope boundary & isolation hardening (GitHub + webhooks) ★ "safe for my own live data"
 
 *Goal:* add GitHub as a second source exercising **webhooks**, the **poll-reconciliation backstop**,
-and **private scope** (private repos). The scope-isolation invariant becomes real and is tested.
+and **private scope** (private repos) — and make it **safe to point at your own real account**: private
+data is DB-isolated by RLS and your real credentials are encrypted at rest. This is the milestone where
+you can start dogfooding for usefulness/tuning on live private data.
 
 **Build**
 - **GitHub connector** as `Connection + RealtimeConnection` (tech §5.4): poll = REST reconciliation
@@ -147,16 +154,32 @@ and **private scope** (private repos). The scope-isolation invariant becomes rea
   pull-only source" uncompilable (tech §5.1/§5.4).
 - **Scope becomes load-bearing:** private GitHub repos → `scope = Private(subscriber)`.
   `PublicBuild` builds public clusters; private clusters built per-subscriber inside `GenerateDigest`.
-  **Add the build-path scope-invariant property test** (no private datum in a public artifact) — this
-  is the primary isolation defense until RLS lands in M5 (design §12).
+  **Build-path scope-invariant property test** (no private datum in a public artifact) — a *primary*
+  isolation defense alongside the typed `Scope` (design §12).
+- **Two-context RLS — pulled forward (design §12, tech §6):** the DB backstop behind the typed `Scope`,
+  here from day one of private data so your own private repos are isolated even against a logic bug.
+  `PublicBuild` runs in a no-subscriber context (policy exposes only `scope_kind='public'`);
+  `GenerateDigest` runs in the subscriber context (`SET LOCAL app.subscriber_id`, SELECT-only on
+  public, writes confined to own-private). Prereqs: **non-owner runtime role, no `BYPASSRLS`,
+  `FORCE ROW LEVEL SECURITY`** on every scoped table, a separate migration role owning DDL, and a
+  `with_scope(ctx, …)` wrapper as the *only* connection path.
+- **Credential-at-rest — pulled forward (interim envelope encryption, tech §6):** `secrecy`/`zeroize`
+  in memory (redacted `Debug`, zeroized on drop); the app-level **GitHub App private key + webhook
+  signing secret** sealed at rest (sealed file/env via XChaCha20-Poly1305) and loaded once; the
+  `creds_ref` + wrapped-DEK indirection scaffolded in the schema so per-connection secrets (Slack, M6)
+  and a managed-KMS swap are later *backend* changes, not migrations. (GitHub per-connection creds =
+  just `installation_id`, **not** a secret; the secret to protect is the app-level key.)
 - `content_depth` now spans `announcement` (releases) + `longform` (RSS) + foundations for `message`.
 
-**Defer:** OAuth connect flow (still hand-seeded), KMS, RLS, Slack, linking.
+**Defer:** OAuth connect flow (hand-seed your own single install), managed-KMS backend (the interim
+sealed master key is sufficient for self-hosting), Slack, linking. SSRF guard stays in M5 while *you*
+are the only one adding feeds — pull it forward the moment anyone but you can add a feed/URL.
 
-**Exit:** push to a watched public repo → it appears in the next digest via webhook; drop the
-webhook and it still appears via the reconciliation poll (fingerprint collapses the overlap). A
-private repo's events appear **only** in their owner's digest, and the scope-invariant property test
-passes.
+**Exit:** push to a watched public repo → it appears in the next digest via webhook; drop the webhook
+and it still appears via the reconciliation poll (fingerprint collapses the overlap). Your **private
+repo's events appear only in your own digest** *and* are DB-isolated: a deliberately mis-scoped query
+run under the runtime role returns nothing (RLS verified), and the scope-invariant property test
+passes. Your GitHub App key is never stored or logged in plaintext.
 
 ---
 
@@ -209,12 +232,9 @@ story's id stable; a later strong link retro-merges two stories with the oldest 
   subscriber's next recompute — nothing shared to mutate).
 - **Windowing & re-surface suppression (design §9.4):** compare `last_event_time` vs the
   `story_last_event_time` snapshot; re-surface only on new events or Note→Story graduation.
-- **Interim secret-at-rest:** `creds_ref` + wrapped-DEK with a single app master key +
-  XChaCha20-Poly1305 (tech §6), `creds_ref` indirection preserved so swapping to KMS later is a
-  backend change, not a schema change. `secrecy`/`zeroize` in memory.
 
-**Defer:** learned scoring, `confidence`, prospective events, KMS proper, entropy/variety budget,
-engagement ("already dealt-with") suppression.
+**Defer:** learned scoring, `confidence`, prospective events, managed-KMS backend, entropy/variety
+budget, engagement ("already dealt-with") suppression. (Credential-at-rest + RLS already landed in M2.)
 
 **Exit:** a digest shows a mix of Stories and Notes, priority-ordered, each with a human-readable
 reason; "show the data behind this" renders the event timeline; clicking "don't care" demotes that
@@ -222,19 +242,17 @@ entity next tick; "wrong aggregation" splits the story for that user only.
 
 ---
 
-### M5 — Production hardening
+### M5 — Production hardening (safe for users beyond yourself)
 
-*Goal:* safe to point at real accounts and real users.
+*Goal:* full product surface + safe for *other* users / multi-tenant operation. (Single-user live
+dogfooding was already unlocked at M2 by RLS + credential-at-rest.)
 
 **Build**
-- **Two-context RLS (design §12, tech §6):** `PublicBuild` in a no-subscriber context (public rows
-  only); `GenerateDigest` in subscriber context (`SET LOCAL app.subscriber_id`). Prereqs:
-  non-owner runtime role, no `BYPASSRLS`, `FORCE ROW LEVEL SECURITY` on scoped tables, separate
-  migration role, a `with_scope(ctx, …)` wrapper as the only connection path. RLS is the backstop
-  behind the M2 typed-`Scope` + property test.
 - **OAuth / app-install connect flow:** `GET /connect/{source}` (signed `state`) + callback (bind
-  provider-account → subscriber → scope, encrypt creds) for GitHub App (tech §3A).
-- **KMS-backed envelope encryption** (swap the M4 master key behind `creds_ref`); rotation/revocation.
+  provider-account → subscriber → scope, encrypt creds) for GitHub App (tech §3A) — replaces the
+  hand-seeded connections so users other than you can onboard.
+- **Managed-KMS backend (optional):** swap the M2 interim sealed master key for `aws-sdk-kms` behind
+  the existing `creds_ref` indirection — a backend change, not a schema change; plus rotation/revocation.
 - **SSRF guard** finalized: resolve-then-pin resolver, RFC1918/loopback/link-local/CGNAT/metadata-IP
   denylist, post-`url`-crate IP validation, redirect re-validation, timeouts + size caps (tech §6).
 - **Timezone-aware scheduling + DST** (tech §12): per-subscriber `next_run_at` in their tz, UTC
@@ -248,9 +266,9 @@ entity next tick; "wrong aggregation" splits the story for that user only.
 - **Nix/CI** finalized (crane + rust-overlay + Cachix, minimal OCI image) if not already done in the
   parallel track (tech §7).
 
-**Exit:** a real GitHub App install via the connect flow; private data provably confined by RLS (a
-deliberately mis-scoped query returns nothing); SSRF probes blocked; a multi-timezone "daily 8am"
-fires at each subscriber's local 8am; crash-injection tests pass.
+**Exit:** a real GitHub App install via the connect flow (no hand-seeding); SSRF probes blocked; a
+multi-timezone "daily 8am" fires at each subscriber's local 8am; crash-injection tests pass. (Private
+data is already provably RLS-confined since M2.)
 
 ---
 
@@ -282,17 +300,25 @@ partitioning + normalized signal tables, object-storage raw offload, multi-chann
   scope only* — the least friction to a working loop.
 - **M2 adds the two hardest mechanisms (webhooks, scope) on a working pipeline,** not a blank page —
   and GitHub alone covers public + private + push + pull, so M2 retires most architectural risk
-  without Slack.
+  without Slack. **It also absorbs RLS + credential-at-rest, pulled forward** so that the instant
+  private data and real creds exist they are isolated and encrypted — the price of dogfooding live
+  private data early. This makes M2 the heaviest milestone, deliberately: it is the "safe to use my own
+  account" gate.
 - **M3 is isolated** because per-subscriber linking (blocking + connected-components + id-forwarding +
   asymmetric merge thresholds) is the single most intricate algorithm in the system; it deserves a
   milestone where the rest of the pipeline is stable underneath it.
 - **M4 delivers the "trust" half** only once there are real stories to gate, explain, and correct.
-- **M5 is hardening, batched last** because RLS, KMS, OAuth, SSRF, and DST are each load-bearing for
-  *production* but block *nothing* in the build loop — and the M2 typed-`Scope` + property test carry
-  the critical invariant until then. **The one caveat: do not point M5-deferred items at real third-party
-  accounts or real users' private data before M5 lands.** Synthetic/owned test data only through M4.
+- **M5 batches the *remaining* hardening** (OAuth onboarding, managed-KMS, SSRF, DST, observability,
+  crash-sim) — load-bearing for *other users / multi-tenant production* but not for self-dogfooding.
+  Because the isolation + secrets work was pulled into M2, **running your own live private data through
+  M2–M4 is safe.** The remaining caveat is narrow: do not expose feed/URL-adding or onboard *other*
+  users before M5 (SSRF + OAuth + managed-KMS + DST land there).
 
 ## 4. Definition of done for "v1"
+
+**Dogfoodable on your own live private data from M2 onward** — RLS-isolated and creds-encrypted — with
+the product getting richer through M3 (linking) and M4 (relevance/trust). Full multi-user v1 completes
+at M5.
 
 End of **M5**: a real user connects RSS feeds and a GitHub App; on their schedule (correct in their
 timezone) they receive an email notification linking to an authenticated digest of priority-ordered
