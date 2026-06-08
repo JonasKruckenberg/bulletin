@@ -1,0 +1,9 @@
+[package]
+name    = "bulletin-connectors"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bulletin-core = { path = "../core" }
+serde         = { workspace = true }
+serde_json    = { workspace = true }

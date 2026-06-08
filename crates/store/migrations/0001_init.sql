@@ -1,0 +1,2 @@
+-- baseline; domain tables added per milestone
+-- requires PostgreSQL 17+ (built-in uuidv7)
