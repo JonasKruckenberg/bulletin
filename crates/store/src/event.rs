@@ -43,12 +43,16 @@ pub async fn insert_event(pool: &PgPool, ev: &NewEvent) -> Result<Option<Event>,
     .bind(ev.content_kind.as_str())
     .bind(ev.severity_hint)
     .bind(ev.raw.as_deref())
-    .map(row_to_event)
+    .try_map(row_to_event)
     .fetch_optional(pool)
     .await
 }
 
-fn row_to_event(row: PgRow) -> Event {
+fn decode_err(msg: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> sqlx::Error {
+    sqlx::Error::Decode(msg.into())
+}
+
+fn row_to_event(row: PgRow) -> Result<Event, sqlx::Error> {
     let fp_bytes: Vec<u8> = row.get("fingerprint");
     let mut fp = [0u8; 32];
     fp.copy_from_slice(&fp_bytes);
@@ -56,21 +60,23 @@ fn row_to_event(row: PgRow) -> Event {
     let scope_kind: String = row.get("scope_kind");
     let scope_subscriber_id: Option<Uuid> = row.get("scope_subscriber_id");
     let scope = match scope_kind.as_str() {
-        "private" => Scope::Private(Id::new(
-            scope_subscriber_id.expect("private scope_subscriber_id must be set"),
-        )),
+        "private" => {
+            let sub_id = scope_subscriber_id
+                .ok_or_else(|| decode_err("private event missing scope_subscriber_id"))?;
+            Scope::Private(Id::new(sub_id))
+        }
         _ => Scope::Public,
     };
 
     let source: String = row.get("source");
     let source = SourceKind::try_from(source.as_str())
-        .unwrap_or_else(|_| panic!("unknown source in event row: {source}"));
+        .map_err(|_| decode_err(format!("unknown source kind: {source}")))?;
 
     let content_kind: String = row.get("content_kind");
     let content_kind = ContentKind::try_from(content_kind.as_str())
-        .unwrap_or_else(|_| panic!("unknown content_kind in event row: {content_kind}"));
+        .map_err(|_| decode_err(format!("unknown content kind: {content_kind}")))?;
 
-    Event {
+    Ok(Event {
         id: Id::new(row.get("id")),
         fingerprint: Fingerprint(fp),
         source,
@@ -85,5 +91,5 @@ fn row_to_event(row: PgRow) -> Event {
         severity_hint: row.get("severity_hint"),
         ingest_time: row.get("ingest_time"),
         raw: row.get("raw"),
-    }
+    })
 }

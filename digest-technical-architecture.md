@@ -624,7 +624,7 @@ clippy/nextest/fmt) + `oxalica/rust-overlay` (pure eval, reads `rust-toolchain.t
 
 **v1 = RSS + GitHub + Slack** (Slack is the private-scope exemplar). **All paid/compliance-gated
 sources deferred.**
-- **RSS:** poll w/ conditional GET (ETag / Last-Modified); `feed-rs` parses (no HTTP — pair with
+- **RSS:** poll w/ conditional GET (ETag / Last-Modified); `rss`,`atom` parses (no HTTP — pair with
   the SSRF-guarded `reqwest`). Cursor = validators.
 - **GitHub:** use a **GitHub App** (15k req/hr/install, fine-grained perms) — not PATs. Webhooks
   primary + REST/GraphQL backfill.
@@ -660,7 +660,7 @@ sources deferred.**
 | HTTP client | reqwest (custom DNS resolver) | 0.13 |
 | Testing | proptest / insta / testcontainers(+modules) / turmoil / madsim / loom | 1.11 / 1.47 / 0.27(+0.15) / 0.7 / 0.2 / 0.7 |
 | Supply chain | cargo-deny (+cargo-audit) | 0.19 |
-| Feeds | feed-rs | — |
+| Feeds | rss/atom | — |
 | Rate limit | governor | — |
 | Nix | crane / oxalica rust-overlay / cargo-nextest | 0.23.4 |
 

@@ -3,7 +3,16 @@ name    = "bulletin-connectors"
 version.workspace = true
 edition.workspace = true
 
+[dev-dependencies]
+bulletin-core = { path = "../core" }
+chrono        = { workspace = true }
+
 [dependencies]
 bulletin-core = { path = "../core" }
 serde         = { workspace = true }
 serde_json    = { workspace = true }
+chrono        = { workspace = true }
+reqwest          = { workspace = true }
+rss              = { workspace = true }
+atom_syndication = { workspace = true }
+tracing          = { workspace = true }

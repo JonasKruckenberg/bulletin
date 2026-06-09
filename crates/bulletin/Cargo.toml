@@ -8,7 +8,10 @@ name = "bulletin"
 path = "src/main.rs"
 
 [dependencies]
-bulletin-store  = { path = "../store" }
+bulletin-store      = { path = "../store" }
+bulletin-core       = { path = "../core" }
+bulletin-connectors = { path = "../connectors" }
+anyhow          = { workspace = true }
 clap            = { workspace = true }
 tokio           = { workspace = true }
 tracing         = { workspace = true }
@@ -16,6 +19,7 @@ tracing-subscriber = { workspace = true }
 axum            = { workspace = true }
 tower-http      = { workspace = true }
 sqlx            = { workspace = true }
+uuid            = { workspace = true }
 serde           = { workspace = true }
 serde_json      = { workspace = true }
 apalis          = { workspace = true }
