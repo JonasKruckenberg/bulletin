@@ -7,6 +7,9 @@ use cron::Schedule;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::str::FromStr;
+use std::time::Instant;
+use tracing::Instrument;
+use ulid::Ulid;
 use uuid::Uuid;
 
 use bulletin_connectors::rss::RssConnection;
@@ -43,6 +46,36 @@ pub struct GenerateDigestJob {
     pub subscriber_id: Uuid,
 }
 
+// ── Job instrumentation ────────────────────────────────────────────────
+
+/// Wraps a queued-job body in a stable span + timing. The apalis `TaskId` is a ULID, so it is
+/// both a stable correlation id (stamped on every log line for the task) and an embedded enqueue
+/// clock — `wait_ms` (enqueue → pickup) and `elapsed_ms` (run time) come for free, no backend
+/// peeking. A slow or backed-up pipeline then shows up directly as large wait/elapsed on the
+/// "job complete" line, and `attempt > 1` flags a retry.
+async fn traced(
+    job: &'static str,
+    task_id: TaskId<Ulid>,
+    attempt: Attempt,
+    fut: impl std::future::Future<Output = Result<(), BoxDynError>>,
+) -> Result<(), BoxDynError> {
+    let enqueued_ms = task_id.inner().timestamp_ms() as i64;
+    let span = tracing::info_span!("job", job, task_id = %task_id, attempt = attempt.current());
+    async move {
+        let wait_ms = (Utc::now().timestamp_millis() - enqueued_ms).max(0);
+        let started = Instant::now();
+        let result = fut.await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match &result {
+            Ok(()) => tracing::info!(wait_ms, elapsed_ms, "job complete"),
+            Err(e) => tracing::warn!(wait_ms, elapsed_ms, error = %e, "job failed"),
+        }
+        result
+    }
+    .instrument(span)
+    .await
+}
+
 // ── PollConnection ─────────────────────────────────────────────────────
 
 /// M1 dispatch: RSS only. Becomes a full enum when GitHub lands in M2.
@@ -67,8 +100,14 @@ fn build_dispatch(row: &ConnectionRow) -> Result<ConnDispatch, Box<dyn std::erro
 
 async fn handle_poll_connection(
     job: PollConnectionJob,
+    task_id: TaskId<Ulid>,
+    attempt: Attempt,
     pool: Data<PgPool>,
 ) -> Result<(), BoxDynError> {
+    traced("poll_connection", task_id, attempt, poll_connection(job, pool)).await
+}
+
+async fn poll_connection(job: PollConnectionJob, pool: Data<PgPool>) -> Result<(), BoxDynError> {
     let conn_row = match load_connection(&pool, job.connection_id).await? {
         Some(r) => r,
         None => {
@@ -142,7 +181,16 @@ async fn handle_poll_connection(
 
 // ── PublicBuild ────────────────────────────────────────────────────────
 
-async fn handle_public_build(_: PublicBuildJob, pool: Data<PgPool>) -> Result<(), BoxDynError> {
+async fn handle_public_build(
+    job: PublicBuildJob,
+    task_id: TaskId<Ulid>,
+    attempt: Attempt,
+    pool: Data<PgPool>,
+) -> Result<(), BoxDynError> {
+    traced("public_build", task_id, attempt, public_build(job, pool)).await
+}
+
+async fn public_build(_: PublicBuildJob, pool: Data<PgPool>) -> Result<(), BoxDynError> {
     match crate::build::run(&pool).await {
         Ok(Some(stats)) => {
             tracing::info!(dirty_groups = stats.dirty_groups, "public build complete");
@@ -159,6 +207,16 @@ async fn handle_public_build(_: PublicBuildJob, pool: Data<PgPool>) -> Result<()
 // ── GenerateDigest ─────────────────────────────────────────────────────
 
 async fn handle_generate_digest(
+    job: GenerateDigestJob,
+    task_id: TaskId<Ulid>,
+    attempt: Attempt,
+    pool: Data<PgPool>,
+    email: Data<EmailConfig>,
+) -> Result<(), BoxDynError> {
+    traced("generate_digest", task_id, attempt, generate_digest(job, pool, email)).await
+}
+
+async fn generate_digest(
     job: GenerateDigestJob,
     pool: Data<PgPool>,
     email: Data<EmailConfig>,
@@ -190,6 +248,22 @@ fn is_duplicate_enqueue(e: &TaskSinkError<sqlx::Error>) -> bool {
 /// returns a subscriber once every public event before its boundary is built), so no job needs
 /// to chain another.
 async fn handle_tick(_: Tick<Utc>, pool: Data<PgPool>) -> Result<(), BoxDynError> {
+    let span = tracing::info_span!("tick");
+    async move {
+        let started = Instant::now();
+        let result = run_tick(pool).await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match &result {
+            Ok(()) => tracing::debug!(elapsed_ms, "tick complete"),
+            Err(e) => tracing::warn!(elapsed_ms, error = %e, "tick failed"),
+        }
+        result
+    }
+    .instrument(span)
+    .await
+}
+
+async fn run_tick(pool: Data<PgPool>) -> Result<(), BoxDynError> {
     // 1. Connections due to poll → PollConnection (dedup: next_poll_at watermark).
     let due = due_connections(&pool).await?;
     if !due.is_empty() {

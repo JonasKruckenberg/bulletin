@@ -75,6 +75,10 @@ enum DebugCommand {
         #[arg(long, default_value = "20")]
         limit: i64,
     },
+    /// Explain a subscriber's selection: every candidate cluster + why it's in or out (dry-run)
+    DigestExplain { subscriber: Uuid },
+    /// Print a single-glance snapshot of pipeline state (events, clusters, queue, …)
+    Status,
 }
 
 #[tokio::main]
@@ -240,9 +244,104 @@ async fn main() -> Result<()> {
                         );
                     }
                 }
+                DebugCommand::DigestExplain { subscriber } => {
+                    let rows = digest::explain(&pool, subscriber).await?;
+                    print_explain(&rows);
+                }
+                DebugCommand::Status => {
+                    let report = bulletin_store::status::gather(&pool).await?;
+                    print_status(&report);
+                }
             }
         }
     }
 
     Ok(())
+}
+
+/// Renders a `digest-explain` dry-run: one tab-separated row per candidate (verdict, position
+/// or recency rank, relevance, time, source, title), then a one-line tally. Read top-down to
+/// see exactly where the cap fell.
+fn print_explain(rows: &[digest::ExplainRow]) {
+    use bulletin_core::select::Verdict;
+
+    if rows.is_empty() {
+        println!("no candidate clusters in this subscriber's window");
+        return;
+    }
+
+    let (mut selected, mut over_cap, mut below_floor) = (0, 0, 0);
+    for r in rows {
+        let (verdict, slot) = match r.verdict {
+            Verdict::Selected { position } => {
+                selected += 1;
+                ("SELECTED", format!("pos={position}"))
+            }
+            Verdict::OverCap { rank } => {
+                over_cap += 1;
+                ("OVER_CAP", format!("rank={rank}"))
+            }
+            Verdict::BelowFloor => {
+                below_floor += 1;
+                ("BELOW_FLOOR", "-".to_string())
+            }
+        };
+        println!(
+            "{verdict}\t{slot}\trel={:.2}\t{}\t{}\t{}\t{}",
+            r.relevance,
+            r.last_event_time.format("%Y-%m-%dT%H:%M:%SZ"),
+            r.source.map(|s| s.as_str()).unwrap_or("?"),
+            r.cluster_id,
+            r.title.as_deref().unwrap_or("<missing cluster>"),
+        );
+    }
+    println!("\n{selected} selected · {over_cap} over cap · {below_floor} below floor");
+}
+
+/// Renders the `status` dashboard: each subsystem on its own line(s), with the watchpoints that
+/// usually explain "why is nothing happening?" (unbuilt events, build lag, due counts, queue
+/// backlog) called out inline.
+fn print_status(r: &bulletin_store::status::StatusReport) {
+    fn ts(t: Option<chrono::DateTime<chrono::Utc>>) -> String {
+        t.map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string()).unwrap_or_else(|| "never".to_string())
+    }
+
+    let c = &r.connections;
+    println!("connections  {} total ({} active, {} paused, {} errored); {} due now", c.total, c.active, c.paused, c.errored, c.due_now);
+
+    let e = &r.events;
+    println!("events       {} total, {} unbuilt; latest ingest {}", e.total, e.unbuilt, ts(e.latest_ingest));
+    for (source, n) in &e.by_source {
+        println!("               {source}: {n}");
+    }
+
+    let b = &r.build;
+    println!("build        built_through {} ({}s behind now)", b.built_through.format("%Y-%m-%dT%H:%M:%SZ"), b.lag_secs);
+
+    let cl = &r.clusters;
+    println!("clusters     {} total; latest updated {}", cl.total, ts(cl.latest_updated));
+
+    let s = &r.subscribers;
+    println!("subscribers  {} total; {} due now; next run {}", s.total, s.due_now, ts(s.next_run));
+
+    let d = &r.digests;
+    println!("digests      {} total ({} pending, {} delivered); last delivered {}", d.total, d.pending, d.delivered, ts(d.last_delivered));
+
+    match &r.queue {
+        None => println!("queue        not initialized (run `migrate`)"),
+        Some(rows) if rows.is_empty() => println!("queue        empty"),
+        Some(rows) => {
+            println!("queue        (apalis jobs by type)");
+            for q in rows {
+                let oldest = q
+                    .oldest_pending_secs
+                    .map(|s| format!("; oldest pending {s}s"))
+                    .unwrap_or_default();
+                println!(
+                    "               {}: {} pending, {} running, {} done, {} failed, {} killed{}",
+                    q.job_type, q.pending, q.running, q.done, q.failed, q.killed, oldest,
+                );
+            }
+        }
+    }
 }

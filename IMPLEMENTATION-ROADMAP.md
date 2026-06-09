@@ -75,41 +75,12 @@ These are load-bearing for everything after them.
 
 Each milestone: **Goal · Build · Defer · Exit criteria.** Exit criteria are demoable.
 
-### M0 — Foundations (skeleton that compiles & tests)
-
-*Goal:* a workspace that builds, a database that migrates, a test harness that runs. No features.
-
-**Build**
-- Cargo workspace with the `core`-vs-rest boundary made literal (tech §4). Start lean:
-  `core` (pure domain), `runtime` (apalis handlers + axum + orchestration), `connectors`,
-  `store` (sqlx + migrations), `bulletin` (bin, `clap` role dispatch). Fold `support` into
-  `runtime` for now.
-- `core` foundations (tech §5.1): generic `Id<T>` with `derive-where` + `PhantomData<fn() -> T>`,
-  feature-gated sqlx impls; `Scope`, `SourceKind`, `ContentKind` enums; `Fingerprint([u8;32])`.
-- **Injectable clock** (tech §6 — load-bearing). No ambient `now()` in logic, ever.
-- One binary, roles via `clap`: `serve | worker | migrate | all` (tech §2).
-- Postgres via `sqlx` (compile-time-checked raw SQL) + migrations; apalis `migrate` storage setup.
-- `proptest` + `insta` wired into `core`; `cargo-nextest` runner; `testcontainers` for the one
-  real-Postgres integration test (queue round-trip). GitHub Actions: fmt, clippy, nextest,
-  `cargo-deny`.
-
-**Defer:** Nix, OTel, every connector, every domain feature.
-
-**Exit:** `bulletin migrate && bulletin all` boots; an empty cron tick fires and logs; CI is green.
-
----
-
 ### M1 — Walking skeleton (RSS → email, end to end) ★ the keystone
 
 *Goal:* one subscriber receives a scheduled email digest of recent **RSS** items. Group = Story.
 No linking, no relevance scoring, no auth, no private data.
 
 **Build**
-- **Canonical `Event`** + the `fingerprint` recipe, property-tested (tech §5.2). `event` table,
-  `UNIQUE(fingerprint)`, `INSERT … ON CONFLICT DO NOTHING`.
-- **RSS connector** as a pure `Connection` (poll-only, conditional GET, cursor = ETag/Last-Modified;
-  [`rss`](https://github.com/rust-syndication/rss) + [`atom`](https://github.com/rust-syndication/atom) + SSRF-guarded `reqwest`). `to_events` sets `entities`/`content_kind`/`group_key`/`links`;
-  infra `finalize` stamps scope (all `public` here) + fingerprint (tech §5.4).
 - **The tick DAG, minimal:** `PollConnection` (events-before-cursor ordering, tech §3) →
   `PublicBuild` (group events into `cluster` by `(scope, source, group_key)` + rollups) →
   `GenerateDigest` (one subscriber: select recent clusters → 1 cluster = 1 story → render → deliver).

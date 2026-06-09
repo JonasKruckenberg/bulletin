@@ -6,6 +6,7 @@ use bulletin_core::{
 };
 use chrono::{DateTime, Utc};
 use sqlx::{postgres::PgRow, PgExecutor, Row};
+use uuid::Uuid;
 
 /// A 64-bit key for the PublicBuild transaction-level advisory lock. Arbitrary but fixed;
 /// `pg_try_advisory_xact_lock` auto-releases at transaction end (no leak on crash).
@@ -112,6 +113,33 @@ pub async fn unbuilt_public_events_exist(
     .fetch_one(executor)
     .await?;
     Ok(row.get("dirty"))
+}
+
+/// Human-readable identity (source, title) of a cluster — the display half of a selection
+/// `Decision`, which carries only the id.
+pub struct ClusterDisplay {
+    pub id: Uuid,
+    pub source: SourceKind,
+    pub title: String,
+}
+
+/// Display fields for a set of clusters by id, for `debug digest-explain` to pair each
+/// selection verdict with a human-readable cluster. Order is unspecified — callers index by id.
+pub async fn cluster_display(
+    executor: impl PgExecutor<'_>,
+    ids: &[Uuid],
+) -> Result<Vec<ClusterDisplay>, sqlx::Error> {
+    sqlx::query("SELECT id, source, title FROM cluster WHERE id = ANY($1)")
+        .bind(ids)
+        .try_map(|row: PgRow| {
+            let source: String = row.get("source");
+            let source = SourceKind::try_from(source.as_str()).map_err(|_| {
+                sqlx::Error::Decode(format!("unknown source kind: {source}").into())
+            })?;
+            Ok(ClusterDisplay { id: row.get("id"), source, title: row.get("title") })
+        })
+        .fetch_all(executor)
+        .await
 }
 
 /// Clusters that received a new event (by ingest_time) in `(last_run, window_end]` — the
