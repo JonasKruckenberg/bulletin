@@ -45,6 +45,11 @@ enum DebugCommand {
     ConnectionList,
     /// Delete a connection row by id
     ConnectionRm { id: Uuid },
+    /// Dump recent events
+    EventList {
+        #[arg(long, default_value = "20")]
+        limit: i64,
+    },
 }
 
 #[tokio::main]
@@ -127,6 +132,24 @@ async fn main() -> Result<()> {
                         println!("deleted {id}");
                     } else {
                         println!("not found: {id}");
+                    }
+                }
+                DebugCommand::EventList { limit } => {
+                    let events = bulletin_store::event::list_events(&pool, limit).await?;
+                    if events.is_empty() {
+                        println!("no events");
+                    }
+                    for ev in events {
+                        println!(
+                            "{}\t{}\t{}\t{}",
+                            ev.ingest_time.format("%Y-%m-%dT%H:%M:%SZ"),
+                            ev.source.as_str(),
+                            ev.content_kind.as_str(),
+                            ev.title,
+                        );
+                        for link in &ev.links {
+                            println!("  {link}");
+                        }
                     }
                 }
             }

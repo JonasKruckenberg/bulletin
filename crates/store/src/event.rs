@@ -48,6 +48,22 @@ pub async fn insert_event(pool: &PgPool, ev: &NewEvent) -> Result<Option<Event>,
     .await
 }
 
+/// Returns the most recent `limit` events ordered by ingest_time descending.
+pub async fn list_events(pool: &PgPool, limit: i64) -> Result<Vec<Event>, sqlx::Error> {
+    sqlx::query(
+        "SELECT id, fingerprint, source, scope_kind, scope_subscriber_id,
+                event_time, title, body, links, group_key, entities,
+                content_kind, severity_hint, ingest_time, raw
+         FROM event
+         ORDER BY ingest_time DESC
+         LIMIT $1",
+    )
+    .bind(limit)
+    .try_map(row_to_event)
+    .fetch_all(pool)
+    .await
+}
+
 fn decode_err(msg: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> sqlx::Error {
     sqlx::Error::Decode(msg.into())
 }
