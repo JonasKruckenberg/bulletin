@@ -17,5 +17,6 @@ bulletin-core          = { path = "../core" }
 bulletin-connectors    = { path = "../connectors" }
 axum                   = { workspace = true }
 chrono                 = { workspace = true }
+uuid                   = { workspace = true, features = ["v4"] }  # tests build random ids
 testcontainers         = { workspace = true }
 testcontainers-modules = { workspace = true }

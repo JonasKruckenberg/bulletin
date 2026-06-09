@@ -48,6 +48,28 @@ pub async fn insert_event(pool: &PgPool, ev: &NewEvent) -> Result<Option<Event>,
     .await
 }
 
+/// Loads every public event in one within-source group `(source, group_key)`, ordered by
+/// `(event_time, id)` so the pure rollup is deterministic. PublicBuild calls this per dirty group.
+pub async fn list_public_group_events(
+    executor: impl sqlx::PgExecutor<'_>,
+    source: SourceKind,
+    group_key: &str,
+) -> Result<Vec<Event>, sqlx::Error> {
+    sqlx::query(
+        "SELECT id, fingerprint, source, scope_kind, scope_subscriber_id,
+                event_time, title, body, links, group_key, entities,
+                content_kind, severity_hint, ingest_time, raw
+         FROM event
+         WHERE scope_kind = 'public' AND source = $1 AND group_key = $2
+         ORDER BY event_time, id",
+    )
+    .bind(source.as_str())
+    .bind(group_key)
+    .try_map(row_to_event)
+    .fetch_all(executor)
+    .await
+}
+
 /// Returns the most recent `limit` events ordered by ingest_time descending.
 pub async fn list_events(pool: &PgPool, limit: i64) -> Result<Vec<Event>, sqlx::Error> {
     sqlx::query(

@@ -1,3 +1,6 @@
+mod build;
+mod digest;
+mod email;
 mod serve;
 mod worker;
 
@@ -15,6 +18,9 @@ struct Cli {
     command: Command,
     #[arg(long, env = "DATABASE_URL")]
     database_url: String,
+    /// Email delivery config (worker + `debug digest-run`); defaults to local file transport.
+    #[command(flatten)]
+    email: email::EmailConfig,
 }
 
 #[derive(Subcommand)]
@@ -50,6 +56,25 @@ enum DebugCommand {
         #[arg(long, default_value = "20")]
         limit: i64,
     },
+    /// Seed a subscriber (first digest is due immediately)
+    SubscriberAdd {
+        #[arg(long)]
+        email: String,
+        /// Digest cadence in days (1 = daily, 7 = weekly)
+        #[arg(long, default_value_t = 1)]
+        interval_days: i32,
+    },
+    /// List subscribers
+    SubscriberList,
+    /// Run PublicBuild once, inline (cluster new public events now)
+    BuildRun,
+    /// Run GenerateDigest once for a subscriber, inline (select → render → deliver)
+    DigestRun { subscriber: Uuid },
+    /// List recent digests with their state
+    DigestList {
+        #[arg(long, default_value = "20")]
+        limit: i64,
+    },
 }
 
 #[tokio::main]
@@ -82,7 +107,7 @@ async fn main() -> Result<()> {
                 .await
                 .context("failed to connect to database")?;
             tracing::info!("starting worker");
-            worker::start(pool).await?;
+            worker::start(pool, cli.email.clone()).await?;
         }
         Command::All => {
             let pool = bulletin_store::connect(&cli.database_url)
@@ -90,7 +115,7 @@ async fn main() -> Result<()> {
                 .context("failed to connect to database")?;
             let addr: SocketAddr = "0.0.0.0:3000".parse()?;
             tracing::info!(%addr, "starting server + worker");
-            tokio::try_join!(serve::start(addr), worker::start(pool))?;
+            tokio::try_join!(serve::start(addr), worker::start(pool, cli.email.clone()))?;
         }
         Command::Debug { command } => {
             let pool = bulletin_store::connect(&cli.database_url)
@@ -150,6 +175,69 @@ async fn main() -> Result<()> {
                         for link in &ev.links {
                             println!("  {link}");
                         }
+                    }
+                }
+                DebugCommand::SubscriberAdd { email, interval_days } => {
+                    if interval_days < 1 {
+                        anyhow::bail!("--interval-days must be >= 1");
+                    }
+                    let id = bulletin_store::subscriber::insert_subscriber(
+                        &pool,
+                        &email,
+                        interval_days,
+                    )
+                    .await?;
+                    println!("{id}");
+                }
+                DebugCommand::SubscriberList => {
+                    let rows = bulletin_store::subscriber::list_subscribers(&pool).await?;
+                    if rows.is_empty() {
+                        println!("no subscribers");
+                    }
+                    for s in rows {
+                        println!(
+                            "{}\t{}\tevery {}d\tmax={}\tnext={}\tlast={}",
+                            s.id,
+                            s.email,
+                            s.interval_days,
+                            s.max_items,
+                            s.next_run_at.format("%Y-%m-%dT%H:%M:%SZ"),
+                            s.last_run_at
+                                .map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                                .unwrap_or_else(|| "never".to_string()),
+                        );
+                    }
+                }
+                DebugCommand::BuildRun => match build::run(&pool).await? {
+                    Some(stats) => println!(
+                        "built {} group(s); watermark → {}",
+                        stats.dirty_groups,
+                        stats.built_through.format("%Y-%m-%dT%H:%M:%SZ")
+                    ),
+                    None => println!("skipped (another build in progress)"),
+                },
+                DebugCommand::DigestRun { subscriber } => {
+                    let outcome = digest::run(&pool, &cli.email, subscriber).await?;
+                    println!("{outcome:?}");
+                }
+                DebugCommand::DigestList { limit } => {
+                    let rows = bulletin_store::digest::list_digests(&pool, limit).await?;
+                    if rows.is_empty() {
+                        println!("no digests");
+                    }
+                    for (d, email, item_count) in rows {
+                        let status = d
+                            .delivered_at
+                            .map(|t| format!("delivered {}", t.format("%Y-%m-%dT%H:%M:%SZ")))
+                            .unwrap_or_else(|| "pending".to_string());
+                        println!(
+                            "{}\t{}\t{}\titems={}\twindow_end={}",
+                            d.id,
+                            email,
+                            status,
+                            item_count,
+                            d.window_end.format("%Y-%m-%dT%H:%M:%SZ"),
+                        );
                     }
                 }
             }

@@ -1,5 +1,8 @@
+pub mod cluster;
 pub mod connection;
+pub mod digest;
 pub mod event;
+pub mod subscriber;
 
 use sqlx::PgPool;
 
