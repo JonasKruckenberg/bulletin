@@ -29,3 +29,5 @@ apalis          = { version = "=1.0.0-rc.9" }
 apalis-postgres = { version = "=1.0.0-rc.8" }
 apalis-cron     = { version = "=1.0.0-rc.8" }
 proptest    = "1"
+testcontainers         = { version = "0.27" }
+testcontainers-modules = { version = "0.15", features = ["postgres"] }

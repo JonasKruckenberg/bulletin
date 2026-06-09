@@ -108,7 +108,7 @@ No linking, no relevance scoring, no auth, no private data.
 - **Canonical `Event`** + the `fingerprint` recipe, property-tested (tech §5.2). `event` table,
   `UNIQUE(fingerprint)`, `INSERT … ON CONFLICT DO NOTHING`.
 - **RSS connector** as a pure `Connection` (poll-only, conditional GET, cursor = ETag/Last-Modified;
-  `feed-rs` + SSRF-guarded `reqwest`). `to_events` sets `entities`/`content_kind`/`group_key`/`links`;
+  [`rss`](https://github.com/rust-syndication/rss) + [`atom`](https://github.com/rust-syndication/atom) + SSRF-guarded `reqwest`). `to_events` sets `entities`/`content_kind`/`group_key`/`links`;
   infra `finalize` stamps scope (all `public` here) + fingerprint (tech §5.4).
 - **The tick DAG, minimal:** `PollConnection` (events-before-cursor ordering, tech §3) →
   `PublicBuild` (group events into `cluster` by `(scope, source, group_key)` + rollups) →
