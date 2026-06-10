@@ -2,6 +2,7 @@
 name    = "bulletin"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [[bin]]
 name = "bulletin"
@@ -16,6 +17,8 @@ clap            = { workspace = true }
 tokio           = { workspace = true }
 tracing         = { workspace = true }
 tracing-subscriber = { workspace = true }
+metrics         = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
 axum            = { workspace = true }
 tower-http      = { workspace = true }
 sqlx            = { workspace = true }

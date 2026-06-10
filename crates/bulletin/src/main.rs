@@ -6,7 +6,7 @@ mod worker;
 
 use anyhow::{Context, Result};
 use bulletin_core::kind::SourceKind;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::net::SocketAddr;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use uuid::Uuid;
@@ -18,9 +18,24 @@ struct Cli {
     command: Command,
     #[arg(long, env = "DATABASE_URL")]
     database_url: String,
+    /// Bind address for the health HTTP server (`serve` / `all`).
+    #[arg(long, env = "BULLETIN_HTTP_ADDR", default_value = "127.0.0.1:3000")]
+    http_addr: SocketAddr,
+    /// Bind address for the Prometheus metrics exporter (`worker` / `all`).
+    #[arg(long, env = "BULLETIN_METRICS_ADDR", default_value = "127.0.0.1:9464")]
+    metrics_addr: SocketAddr,
+    /// Log output format: `text` (human) or `json` (one structured line per event, for Loki).
+    #[arg(long, env = "BULLETIN_LOG_FORMAT", default_value = "text")]
+    log_format: LogFormat,
     /// Email delivery config (worker + `debug digest-run`); defaults to local file transport.
     #[command(flatten)]
     email: email::EmailConfig,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum LogFormat {
+    Text,
+    Json,
 }
 
 #[derive(Subcommand)]
@@ -83,12 +98,8 @@ enum DebugCommand {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::registry()
-        .with(EnvFilter::from_default_env())
-        .with(tracing_subscriber::fmt::layer())
-        .init();
-
     let cli = Cli::parse();
+    init_tracing(cli.log_format);
 
     match cli.command {
         Command::Migrate => {
@@ -96,17 +107,21 @@ async fn main() -> Result<()> {
                 .await
                 .context("failed to connect to database")?;
             tracing::info!("running bulletin migrations");
-            bulletin_store::migrate(&pool).await.context("bulletin migrations failed")?;
+            bulletin_store::migrate(&pool)
+                .await
+                .context("bulletin migrations failed")?;
             tracing::info!("running apalis storage setup");
-            worker::setup_storage(&pool).await.context("apalis storage setup failed")?;
+            worker::setup_storage(&pool)
+                .await
+                .context("apalis storage setup failed")?;
             tracing::info!("migrations complete");
         }
         Command::Serve => {
-            let addr: SocketAddr = "0.0.0.0:3000".parse()?;
-            tracing::info!(%addr, "starting HTTP server");
-            serve::start(addr).await?;
+            tracing::info!(addr = %cli.http_addr, "starting HTTP server");
+            serve::start(cli.http_addr).await?;
         }
         Command::Worker => {
+            install_metrics(cli.metrics_addr)?;
             let pool = bulletin_store::connect(&cli.database_url)
                 .await
                 .context("failed to connect to database")?;
@@ -114,25 +129,36 @@ async fn main() -> Result<()> {
             worker::start(pool, cli.email.clone()).await?;
         }
         Command::All => {
+            install_metrics(cli.metrics_addr)?;
             let pool = bulletin_store::connect(&cli.database_url)
                 .await
                 .context("failed to connect to database")?;
-            let addr: SocketAddr = "0.0.0.0:3000".parse()?;
-            tracing::info!(%addr, "starting server + worker");
-            tokio::try_join!(serve::start(addr), worker::start(pool, cli.email.clone()))?;
+            tracing::info!(addr = %cli.http_addr, "starting server + worker");
+            tokio::try_join!(
+                serve::start(cli.http_addr),
+                worker::start(pool, cli.email.clone())
+            )?;
         }
         Command::Debug { command } => {
             let pool = bulletin_store::connect(&cli.database_url)
                 .await
                 .context("failed to connect to database")?;
             match command {
-                DebugCommand::ConnectionAdd { source, config, poll_interval } => {
-                    let source = SourceKind::try_from(source.as_str())
-                        .map_err(|_| anyhow::anyhow!("unknown source '{}'; valid: rss, github, slack", source))?;
-                    let config: serde_json::Value = serde_json::from_str(&config)
-                        .context("--config is not valid JSON")?;
+                DebugCommand::ConnectionAdd {
+                    source,
+                    config,
+                    poll_interval,
+                } => {
+                    let source = SourceKind::try_from(source.as_str()).map_err(|_| {
+                        anyhow::anyhow!("unknown source '{}'; valid: rss, github, slack", source)
+                    })?;
+                    let config: serde_json::Value =
+                        serde_json::from_str(&config).context("--config is not valid JSON")?;
                     let id = bulletin_store::connection::insert_connection(
-                        &pool, source, config, poll_interval,
+                        &pool,
+                        source,
+                        config,
+                        poll_interval,
                     )
                     .await?;
                     println!("{id}");
@@ -155,8 +181,7 @@ async fn main() -> Result<()> {
                     }
                 }
                 DebugCommand::ConnectionRm { id } => {
-                    let deleted =
-                        bulletin_store::connection::delete_connection(&pool, id).await?;
+                    let deleted = bulletin_store::connection::delete_connection(&pool, id).await?;
                     if deleted {
                         println!("deleted {id}");
                     } else {
@@ -181,16 +206,16 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-                DebugCommand::SubscriberAdd { email, interval_days } => {
+                DebugCommand::SubscriberAdd {
+                    email,
+                    interval_days,
+                } => {
                     if interval_days < 1 {
                         anyhow::bail!("--interval-days must be >= 1");
                     }
-                    let id = bulletin_store::subscriber::insert_subscriber(
-                        &pool,
-                        &email,
-                        interval_days,
-                    )
-                    .await?;
+                    let id =
+                        bulletin_store::subscriber::insert_subscriber(&pool, &email, interval_days)
+                            .await?;
                     println!("{id}");
                 }
                 DebugCommand::SubscriberList => {
@@ -259,6 +284,33 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Initializes tracing. `text` is the human default for local dev; `json` emits one structured
+/// object per event (`flatten_event` lifts span/event fields to the top level) so the server's
+/// journald → Alloy → Loki pipeline parses fields without unwrapping. `RUST_LOG` drives the filter
+/// in both modes.
+fn init_tracing(format: LogFormat) {
+    let registry = tracing_subscriber::registry().with(EnvFilter::from_default_env());
+    match format {
+        LogFormat::Text => registry.with(tracing_subscriber::fmt::layer()).init(),
+        LogFormat::Json => registry
+            .with(tracing_subscriber::fmt::layer().json().flatten_event(true))
+            .init(),
+    }
+}
+
+/// Installs the global Prometheus recorder and starts its own HTTP exporter on `addr` (not an app
+/// route — the exporter's listener also drives histogram upkeep). The long-running pipeline
+/// (`worker` / `all`) then exposes `bulletin_*` series for Prometheus to scrape. Must run inside
+/// the tokio runtime, since it spawns the listener.
+fn install_metrics(addr: SocketAddr) -> Result<()> {
+    metrics_exporter_prometheus::PrometheusBuilder::new()
+        .with_http_listener(addr)
+        .install()
+        .context("install prometheus exporter")?;
+    tracing::info!(%addr, "metrics exporter listening");
+    Ok(())
+}
+
 /// Renders a `digest-explain` dry-run: one tab-separated row per candidate (verdict, position
 /// or recency rank, relevance, time, source, title), then a one-line tally. Read top-down to
 /// see exactly where the cap fell.
@@ -303,29 +355,57 @@ fn print_explain(rows: &[digest::ExplainRow]) {
 /// backlog) called out inline.
 fn print_status(r: &bulletin_store::status::StatusReport) {
     fn ts(t: Option<chrono::DateTime<chrono::Utc>>) -> String {
-        t.map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string()).unwrap_or_else(|| "never".to_string())
+        t.map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+            .unwrap_or_else(|| "never".to_string())
     }
 
     let c = &r.connections;
-    println!("connections  {} total ({} active, {} paused, {} errored); {} due now", c.total, c.active, c.paused, c.errored, c.due_now);
+    println!(
+        "connections  {} total ({} active, {} paused, {} errored); {} due now",
+        c.total, c.active, c.paused, c.errored, c.due_now
+    );
 
     let e = &r.events;
-    println!("events       {} total, {} unbuilt; latest ingest {}", e.total, e.unbuilt, ts(e.latest_ingest));
+    println!(
+        "events       {} total, {} unbuilt; latest ingest {}",
+        e.total,
+        e.unbuilt,
+        ts(e.latest_ingest)
+    );
     for (source, n) in &e.by_source {
         println!("               {source}: {n}");
     }
 
     let b = &r.build;
-    println!("build        built_through {} ({}s behind now)", b.built_through.format("%Y-%m-%dT%H:%M:%SZ"), b.lag_secs);
+    println!(
+        "build        built_through {} ({}s behind now)",
+        b.built_through.format("%Y-%m-%dT%H:%M:%SZ"),
+        b.lag_secs
+    );
 
     let cl = &r.clusters;
-    println!("clusters     {} total; latest updated {}", cl.total, ts(cl.latest_updated));
+    println!(
+        "clusters     {} total; latest updated {}",
+        cl.total,
+        ts(cl.latest_updated)
+    );
 
     let s = &r.subscribers;
-    println!("subscribers  {} total; {} due now; next run {}", s.total, s.due_now, ts(s.next_run));
+    println!(
+        "subscribers  {} total; {} due now; next run {}",
+        s.total,
+        s.due_now,
+        ts(s.next_run)
+    );
 
     let d = &r.digests;
-    println!("digests      {} total ({} pending, {} delivered); last delivered {}", d.total, d.pending, d.delivered, ts(d.last_delivered));
+    println!(
+        "digests      {} total ({} pending, {} delivered); last delivered {}",
+        d.total,
+        d.pending,
+        d.delivered,
+        ts(d.last_delivered)
+    );
 
     match &r.queue {
         None => println!("queue        not initialized (run `migrate`)"),

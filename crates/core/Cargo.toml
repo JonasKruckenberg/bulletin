@@ -2,6 +2,7 @@
 name    = "bulletin-core"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [features]
 sqlx = ["dep:sqlx"]

@@ -2,6 +2,7 @@
 name    = "bulletin-store"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [dependencies]
 bulletin-core = { path = "../core", features = ["sqlx"] }

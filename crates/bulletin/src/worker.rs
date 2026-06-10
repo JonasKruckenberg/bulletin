@@ -65,7 +65,12 @@ async fn traced(
         let wait_ms = (Utc::now().timestamp_millis() - enqueued_ms).max(0);
         let started = Instant::now();
         let result = fut.await;
-        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let elapsed = started.elapsed();
+        let elapsed_ms = elapsed.as_millis() as u64;
+        let outcome = if result.is_ok() { "ok" } else { "err" };
+        metrics::histogram!("bulletin_job_duration_seconds", "job" => job)
+            .record(elapsed.as_secs_f64());
+        metrics::counter!("bulletin_jobs_total", "job" => job, "outcome" => outcome).increment(1);
         match &result {
             Ok(()) => tracing::info!(wait_ms, elapsed_ms, "job complete"),
             Err(e) => tracing::warn!(wait_ms, elapsed_ms, error = %e, "job failed"),
@@ -104,7 +109,13 @@ async fn handle_poll_connection(
     attempt: Attempt,
     pool: Data<PgPool>,
 ) -> Result<(), BoxDynError> {
-    traced("poll_connection", task_id, attempt, poll_connection(job, pool)).await
+    traced(
+        "poll_connection",
+        task_id,
+        attempt,
+        poll_connection(job, pool),
+    )
+    .await
 }
 
 async fn poll_connection(job: PollConnectionJob, pool: Data<PgPool>) -> Result<(), BoxDynError> {
@@ -161,9 +172,14 @@ async fn poll_connection(job: PollConnectionJob, pool: Data<PgPool>) -> Result<(
                     inserted += 1;
                 }
             }
+            let source = conn_row.source.as_str();
+            metrics::counter!("bulletin_events_ingested_total", "source" => source)
+                .increment(inserted as u64);
+            metrics::counter!("bulletin_events_deduplicated_total", "source" => source)
+                .increment((total - inserted) as u64);
             tracing::info!(
                 connection_id = %conn_row.id,
-                source = %conn_row.source.as_str(),
+                source,
                 inserted,
                 deduplicated = total - inserted,
                 "poll complete"
@@ -171,6 +187,8 @@ async fn poll_connection(job: PollConnectionJob, pool: Data<PgPool>) -> Result<(
             advance_cursor(&pool, conn_row.id, new_cursor).await?;
         }
         Err(e) => {
+            metrics::counter!("bulletin_poll_failures_total", "source" => conn_row.source.as_str())
+                .increment(1);
             tracing::warn!(connection_id = %job.connection_id, error = %e, "poll failed");
             record_failure(&pool, conn_row.id).await?;
         }
@@ -213,7 +231,13 @@ async fn handle_generate_digest(
     pool: Data<PgPool>,
     email: Data<EmailConfig>,
 ) -> Result<(), BoxDynError> {
-    traced("generate_digest", task_id, attempt, generate_digest(job, pool, email)).await
+    traced(
+        "generate_digest",
+        task_id,
+        attempt,
+        generate_digest(job, pool, email),
+    )
+    .await
 }
 
 async fn generate_digest(
@@ -270,7 +294,11 @@ async fn run_tick(pool: Data<PgPool>) -> Result<(), BoxDynError> {
         tracing::info!(count = due.len(), "tick: dispatching due connections");
         let mut storage: PostgresStorage<PollConnectionJob> = PostgresStorage::new(&pool);
         for row in due {
-            storage.push(PollConnectionJob { connection_id: row.id }).await?;
+            storage
+                .push(PollConnectionJob {
+                    connection_id: row.id,
+                })
+                .await?;
         }
     }
 
@@ -289,9 +317,11 @@ async fn run_tick(pool: Data<PgPool>) -> Result<(), BoxDynError> {
         for s in subs {
             // window_end = next_run_at boundary; once-per-window-ever key.
             let key = format!("digest:{}:{}", s.id, s.next_run_at.timestamp());
-            let task = TaskBuilder::new(GenerateDigestJob { subscriber_id: s.id })
-                .with_idempotency_key(key)
-                .build();
+            let task = TaskBuilder::new(GenerateDigestJob {
+                subscriber_id: s.id,
+            })
+            .with_idempotency_key(key)
+            .build();
             match storage.push_task(task).await {
                 Ok(()) => {}
                 Err(e) if is_duplicate_enqueue(&e) => {
@@ -302,7 +332,31 @@ async fn run_tick(pool: Data<PgPool>) -> Result<(), BoxDynError> {
         }
     }
 
+    // Publish gauge snapshots for Prometheus. These are cheap aggregates already computed for
+    // `debug status`; refreshing them once per tick keeps the DB read off the metrics scrape path.
+    // A gather failure must not fail the tick.
+    match bulletin_store::status::gather(&pool).await {
+        Ok(report) => publish_gauges(&report),
+        Err(e) => tracing::warn!(error = %e, "status gather for metrics failed"),
+    }
+
     Ok(())
+}
+
+/// Mirrors the `debug status` aggregates into Prometheus gauges: the "is anything stuck?"
+/// watchpoints (unbuilt events, build lag, due work, per-job-type queue depth). Set on the tick;
+/// the exporter renders the cached values on scrape.
+fn publish_gauges(r: &bulletin_store::status::StatusReport) {
+    metrics::gauge!("bulletin_connections_active").set(r.connections.active as f64);
+    metrics::gauge!("bulletin_events_unbuilt").set(r.events.unbuilt as f64);
+    metrics::gauge!("bulletin_build_lag_seconds").set(r.build.lag_secs as f64);
+    metrics::gauge!("bulletin_subscribers_due").set(r.subscribers.due_now as f64);
+    if let Some(queue) = &r.queue {
+        for q in queue {
+            metrics::gauge!("bulletin_queue_depth", "job_type" => q.job_type.clone())
+                .set(q.pending as f64);
+        }
+    }
 }
 
 // ── Monitor wiring ─────────────────────────────────────────────────────

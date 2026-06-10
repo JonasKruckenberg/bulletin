@@ -2,6 +2,7 @@
 name    = "bulletin-connectors"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [dev-dependencies]
 bulletin-core = { path = "../core" }

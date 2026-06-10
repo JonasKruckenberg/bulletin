@@ -51,7 +51,10 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, subscriber_id: Uuid) -> Res
     let candidates = candidates_in_window(pool, sub.last_run_at, window_end)
         .await
         .context("collect candidates")?;
-    let cfg = Selection { relevance_floor: 0.0, max_items: sub.max_items as usize };
+    let cfg = Selection {
+        relevance_floor: 0.0,
+        max_items: sub.max_items as usize,
+    };
     let decisions = select_explained(candidates, &cfg);
     log_selection(sub.id, &cfg, &decisions);
     let selected = selected_ids(&decisions);
@@ -64,17 +67,24 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, subscriber_id: Uuid) -> Res
         return Ok(DigestOutcome::AlreadyDelivered);
     }
 
-    let items = render_items(pool, digest.id).await.context("load render items")?;
+    let items = render_items(pool, digest.id)
+        .await
+        .context("load render items")?;
     if items.is_empty() {
         // Nothing to send, but advance so the subscriber isn't perpetually due.
-        mark_delivered(pool, digest.id, sub.id, window_end).await.context("mark delivered")?;
+        mark_delivered(pool, digest.id, sub.id, window_end)
+            .await
+            .context("mark delivered")?;
         return Ok(DigestOutcome::Empty);
     }
 
     let message = email::render(&email.from, &sub.email, window_end, &items)?;
     email.build_sender()?.send(message).await?;
-    mark_delivered(pool, digest.id, sub.id, window_end).await.context("mark delivered")?;
+    mark_delivered(pool, digest.id, sub.id, window_end)
+        .await
+        .context("mark delivered")?;
 
+    metrics::counter!("bulletin_digests_delivered_total").increment(1);
     Ok(DigestOutcome::Delivered { items: items.len() })
 }
 
@@ -136,7 +146,10 @@ pub async fn explain(pool: &PgPool, subscriber_id: Uuid) -> Result<Vec<ExplainRo
     let candidates = candidates_in_window(pool, sub.last_run_at, sub.next_run_at)
         .await
         .context("collect candidates")?;
-    let cfg = Selection { relevance_floor: 0.0, max_items: sub.max_items as usize };
+    let cfg = Selection {
+        relevance_floor: 0.0,
+        max_items: sub.max_items as usize,
+    };
     let decisions = select_explained(candidates, &cfg);
 
     let ids: Vec<Uuid> = decisions.iter().map(|d| d.cluster_id.as_uuid()).collect();

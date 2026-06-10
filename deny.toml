@@ -1,15 +1,22 @@
 [advisories]
-vulnerability = "deny"
-unmaintained  = "warn"
-yanked        = "deny"
-notice        = "warn"
+unmaintained = "all"
+yanked       = "deny"
 
 [licenses]
 allow = [
     "MIT",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
+    "0BSD",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
 ]
+# bulletin's own workspace crates declare no license field; they are an unpublished
+# application, not something we ship to crates.io, so skip license checks on them.
+private = { ignore = true }
 
 [bans]
 multiple-versions = "warn"
