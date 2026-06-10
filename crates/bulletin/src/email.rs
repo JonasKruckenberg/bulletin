@@ -13,13 +13,25 @@ use lettre::{
 #[derive(Clone, clap::Args)]
 pub struct EmailConfig {
     /// "file" (write .eml locally, no external service) or "smtp" (send via a relay).
-    #[arg(long = "email-transport", env = "BULLETIN_EMAIL_TRANSPORT", default_value = "file")]
+    #[arg(
+        long = "email-transport",
+        env = "BULLETIN_EMAIL_TRANSPORT",
+        default_value = "file"
+    )]
     pub transport: String,
     /// From address for digest emails.
-    #[arg(long = "email-from", env = "BULLETIN_EMAIL_FROM", default_value = "bulletin@localhost")]
+    #[arg(
+        long = "email-from",
+        env = "BULLETIN_EMAIL_FROM",
+        default_value = "bulletin@localhost"
+    )]
     pub from: String,
     /// Output directory for the file transport's `.eml` files.
-    #[arg(long = "email-file-dir", env = "BULLETIN_EMAIL_FILE_DIR", default_value = "./outbox")]
+    #[arg(
+        long = "email-file-dir",
+        env = "BULLETIN_EMAIL_FILE_DIR",
+        default_value = "./outbox"
+    )]
     pub file_dir: String,
     /// SMTP relay URL for the smtp transport, e.g. `smtp://user:pass@host:587`.
     #[arg(long = "smtp-url", env = "BULLETIN_SMTP_URL")]
@@ -61,7 +73,9 @@ impl Sender {
     pub async fn send(&self, message: Message) -> Result<()> {
         match self {
             Sender::File(t) => {
-                t.send(message).await.context("file transport write failed")?;
+                t.send(message)
+                    .await
+                    .context("file transport write failed")?;
             }
             Sender::Smtp(t) => {
                 t.send(message).await.context("smtp send failed")?;
@@ -99,8 +113,13 @@ pub fn render(
     }
 
     Message::builder()
-        .from(from.parse().with_context(|| format!("invalid from address: {from}"))?)
-        .to(to.parse().with_context(|| format!("invalid to address: {to}"))?)
+        .from(
+            from.parse()
+                .with_context(|| format!("invalid from address: {from}"))?,
+        )
+        .to(to
+            .parse()
+            .with_context(|| format!("invalid to address: {to}"))?)
         .subject(subject)
         .header(ContentType::TEXT_PLAIN)
         .body(body)

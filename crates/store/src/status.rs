@@ -125,10 +125,13 @@ async fn event_stats(pool: &PgPool) -> Result<EventStats, sqlx::Error> {
     .fetch_one(pool)
     .await?;
 
-    let by_source = sqlx::query("SELECT source, count(*) AS n FROM event GROUP BY source ORDER BY n DESC")
-        .try_map(|row: sqlx::postgres::PgRow| Ok((row.get::<String, _>("source"), row.get::<i64, _>("n"))))
-        .fetch_all(pool)
-        .await?;
+    let by_source =
+        sqlx::query("SELECT source, count(*) AS n FROM event GROUP BY source ORDER BY n DESC")
+            .try_map(|row: sqlx::postgres::PgRow| {
+                Ok((row.get::<String, _>("source"), row.get::<i64, _>("n")))
+            })
+            .fetch_all(pool)
+            .await?;
 
     Ok(EventStats {
         total: agg.get("total"),
@@ -146,14 +149,21 @@ async fn build_status(pool: &PgPool) -> Result<BuildStatus, sqlx::Error> {
     )
     .fetch_one(pool)
     .await?;
-    Ok(BuildStatus { built_through: row.get("built_through"), lag_secs: row.get("lag_secs") })
+    Ok(BuildStatus {
+        built_through: row.get("built_through"),
+        lag_secs: row.get("lag_secs"),
+    })
 }
 
 async fn cluster_stats(pool: &PgPool) -> Result<ClusterStats, sqlx::Error> {
-    let row = sqlx::query("SELECT count(*) AS total, max(updated_at) AS latest_updated FROM cluster")
-        .fetch_one(pool)
-        .await?;
-    Ok(ClusterStats { total: row.get("total"), latest_updated: row.get("latest_updated") })
+    let row =
+        sqlx::query("SELECT count(*) AS total, max(updated_at) AS latest_updated FROM cluster")
+            .fetch_one(pool)
+            .await?;
+    Ok(ClusterStats {
+        total: row.get("total"),
+        latest_updated: row.get("latest_updated"),
+    })
 }
 
 async fn subscriber_stats(pool: &PgPool) -> Result<SubscriberStats, sqlx::Error> {

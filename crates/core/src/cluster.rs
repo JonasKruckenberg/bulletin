@@ -39,7 +39,12 @@ pub fn rollup(events: &[Event]) -> Option<ClusterRollup> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{fingerprint::Fingerprint, id::Id, kind::{ContentKind, SourceKind}, scope::Scope};
+    use crate::{
+        fingerprint::Fingerprint,
+        id::Id,
+        kind::{ContentKind, SourceKind},
+        scope::Scope,
+    };
     use chrono::TimeZone;
     use proptest::prelude::*;
     use uuid::Uuid;

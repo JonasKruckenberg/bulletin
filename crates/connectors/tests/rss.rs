@@ -1,4 +1,4 @@
-use bulletin_connectors::rss::{RssConnection, RssItem, parse_feed};
+use bulletin_connectors::rss::{parse_feed, RssConnection, RssItem};
 use bulletin_core::{
     connector::Connection,
     kind::{ContentKind, SourceKind},
@@ -74,13 +74,22 @@ fn parse_atom_returns_items() {
 fn parse_atom_falls_back_to_updated_for_published() {
     let items = parse_feed(ATOM_XML.as_bytes()).unwrap();
     let published = items[0].published.expect("should have a timestamp");
-    assert_eq!(published.timestamp(), Utc.with_ymd_and_hms(2025, 6, 9, 10, 0, 0).unwrap().timestamp());
+    assert_eq!(
+        published.timestamp(),
+        Utc.with_ymd_and_hms(2025, 6, 9, 10, 0, 0)
+            .unwrap()
+            .timestamp()
+    );
 }
 
 #[test]
 fn to_events_maps_fields_correctly() {
     let conn = RssConnection::new("unused");
-    let builders = conn.to_events(item("https://example.com/post-1", "Hello World", Some("https://example.com/post-1")));
+    let builders = conn.to_events(item(
+        "https://example.com/post-1",
+        "Hello World",
+        Some("https://example.com/post-1"),
+    ));
 
     assert_eq!(builders.len(), 1);
     let ev = builders.into_iter().next().unwrap().finalize(Scope::Public);
@@ -98,8 +107,12 @@ fn to_events_maps_fields_correctly() {
 #[test]
 fn to_events_omits_link_when_absent() {
     let conn = RssConnection::new("unused");
-    let ev = conn.to_events(item("id-no-link", "No Link", None))
-        .into_iter().next().unwrap().finalize(Scope::Public);
+    let ev = conn
+        .to_events(item("id-no-link", "No Link", None))
+        .into_iter()
+        .next()
+        .unwrap()
+        .finalize(Scope::Public);
     assert!(ev.links.is_empty());
 }
 
@@ -107,14 +120,31 @@ fn to_events_omits_link_when_absent() {
 fn same_item_produces_same_fingerprint() {
     let conn = RssConnection::new("unused");
 
-    let fp1 = conn.to_events(item("https://example.com/post-1", "Hello World", Some("https://example.com/post-1")))
-        .into_iter().next().unwrap()
+    let fp1 = conn
+        .to_events(item(
+            "https://example.com/post-1",
+            "Hello World",
+            Some("https://example.com/post-1"),
+        ))
+        .into_iter()
+        .next()
+        .unwrap()
         .finalize(Scope::Public)
         .fingerprint;
-    let fp2 = conn.to_events(item("https://example.com/post-1", "Hello World", Some("https://example.com/post-1")))
-        .into_iter().next().unwrap()
+    let fp2 = conn
+        .to_events(item(
+            "https://example.com/post-1",
+            "Hello World",
+            Some("https://example.com/post-1"),
+        ))
+        .into_iter()
+        .next()
+        .unwrap()
         .finalize(Scope::Public)
         .fingerprint;
 
-    assert_eq!(fp1, fp2, "fingerprint must be stable across identical items");
+    assert_eq!(
+        fp1, fp2,
+        "fingerprint must be stable across identical items"
+    );
 }

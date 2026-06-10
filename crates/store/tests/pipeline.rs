@@ -58,7 +58,9 @@ async fn build_all(pool: &PgPool) {
     let (lo, hi) = build_bounds(pool).await.unwrap();
     let groups = dirty_public_groups(pool, lo, hi).await.unwrap();
     for (source, group_key) in &groups {
-        let events = list_public_group_events(pool, *source, group_key).await.unwrap();
+        let events = list_public_group_events(pool, *source, group_key)
+            .await
+            .unwrap();
         if let Some(r) = rollup(&events) {
             upsert_cluster(pool, *source, group_key, &r).await.unwrap();
         }
@@ -91,7 +93,9 @@ async fn build_groups_events_into_clusters() {
     assert_eq!(cluster_count(&pool).await, 3);
 
     // The shared cluster is represented by its latest event.
-    let shared = list_public_group_events(&pool, SourceKind::Rss, "shared").await.unwrap();
+    let shared = list_public_group_events(&pool, SourceKind::Rss, "shared")
+        .await
+        .unwrap();
     assert_eq!(rollup(&shared).unwrap().title, "Shared latest");
 
     let window_end = Utc::now() + Duration::hours(1);
@@ -99,7 +103,10 @@ async fn build_groups_events_into_clusters() {
     assert_eq!(candidates.len(), 3);
 
     // Pure selection caps and orders newest-first.
-    let cfg = Selection { relevance_floor: 0.0, max_items: 2 };
+    let cfg = Selection {
+        relevance_floor: 0.0,
+        max_items: 2,
+    };
     assert_eq!(select(candidates, &cfg).len(), 2);
 }
 
@@ -137,12 +144,18 @@ async fn digest_waits_for_public_build() {
 
     // Due by the clock, but its window has an unbuilt event → not yet selectable.
     let due = due_subscribers(&pool).await.unwrap();
-    assert!(due.iter().all(|s| s.id != sub_id), "subscriber must wait for build");
+    assert!(
+        due.iter().all(|s| s.id != sub_id),
+        "subscriber must wait for build"
+    );
 
     build_all(&pool).await;
 
     let due = due_subscribers(&pool).await.unwrap();
-    assert!(due.iter().any(|s| s.id == sub_id), "subscriber due once built");
+    assert!(
+        due.iter().any(|s| s.id == sub_id),
+        "subscriber due once built"
+    );
 }
 
 // The digest freezes its selection, delivers once, advances the subscriber watermark, and is
@@ -160,8 +173,13 @@ async fn digest_delivery_and_idempotency() {
     let window_end = sub.next_run_at;
     let window_start = window_end - Duration::days(1);
 
-    let candidates = candidates_in_window(&pool, sub.last_run_at, window_end).await.unwrap();
-    let cfg = Selection { relevance_floor: 0.0, max_items: sub.max_items as usize };
+    let candidates = candidates_in_window(&pool, sub.last_run_at, window_end)
+        .await
+        .unwrap();
+    let cfg = Selection {
+        relevance_floor: 0.0,
+        max_items: sub.max_items as usize,
+    };
     let selected = select(candidates, &cfg);
     assert_eq!(selected.len(), 2);
 
@@ -174,7 +192,9 @@ async fn digest_delivery_and_idempotency() {
     assert_eq!(items.len(), 2);
     assert_eq!(items[0].source, SourceKind::Rss);
 
-    mark_delivered(&pool, digest.id, sub_id, window_end).await.unwrap();
+    mark_delivered(&pool, digest.id, sub_id, window_end)
+        .await
+        .unwrap();
 
     // Re-creating the same window returns the same delivered row; items unchanged (no duplicates).
     let again = create_with_items(&pool, sub_id, window_start, window_end, &selected)

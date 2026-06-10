@@ -39,7 +39,10 @@ async fn insert_returns_event() {
     let (pool, _pg) = setup().await;
 
     let new_ev = rss("item-1", "Hello world").finalize(Scope::Public);
-    let event = insert_event(&pool, &new_ev).await.unwrap().expect("first insert should return event");
+    let event = insert_event(&pool, &new_ev)
+        .await
+        .unwrap()
+        .expect("first insert should return event");
 
     assert_eq!(event.source, SourceKind::Rss);
     assert_eq!(event.scope, Scope::Public);
@@ -70,7 +73,10 @@ async fn repoll_same_item_is_deduped() {
     .entities(vec!["Rust".into()])
     .finalize(Scope::Public);
 
-    assert_eq!(first.fingerprint, second.fingerprint, "same stable_id → same fingerprint");
+    assert_eq!(
+        first.fingerprint, second.fingerprint,
+        "same stable_id → same fingerprint"
+    );
     assert!(
         insert_event(&pool, &second).await.unwrap().is_none(),
         "re-poll of same item must not insert a new row",
@@ -82,8 +88,14 @@ async fn repoll_same_item_is_deduped() {
 async fn distinct_stable_ids_both_insert() {
     let (pool, _pg) = setup().await;
 
-    let ea = insert_event(&pool, &rss("item-a", "Item A").finalize(Scope::Public)).await.unwrap().expect("item-a should insert");
-    let eb = insert_event(&pool, &rss("item-b", "Item B").finalize(Scope::Public)).await.unwrap().expect("item-b should insert");
+    let ea = insert_event(&pool, &rss("item-a", "Item A").finalize(Scope::Public))
+        .await
+        .unwrap()
+        .expect("item-a should insert");
+    let eb = insert_event(&pool, &rss("item-b", "Item B").finalize(Scope::Public))
+        .await
+        .unwrap()
+        .expect("item-b should insert");
 
     assert_ne!(ea.id, eb.id);
     assert_ne!(ea.fingerprint, eb.fingerprint);

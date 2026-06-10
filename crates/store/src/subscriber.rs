@@ -28,13 +28,12 @@ pub async fn insert_subscriber(
     email: &str,
     interval_days: i32,
 ) -> Result<Uuid, sqlx::Error> {
-    let row = sqlx::query(
-        "INSERT INTO subscriber (email, interval_days) VALUES ($1, $2) RETURNING id",
-    )
-    .bind(email)
-    .bind(interval_days)
-    .fetch_one(pool)
-    .await?;
+    let row =
+        sqlx::query("INSERT INTO subscriber (email, interval_days) VALUES ($1, $2) RETURNING id")
+            .bind(email)
+            .bind(interval_days)
+            .fetch_one(pool)
+            .await?;
     Ok(row.get("id"))
 }
 

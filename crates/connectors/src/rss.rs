@@ -54,7 +54,12 @@ pub fn parse_feed(bytes: &[u8]) -> Result<Vec<RssItem>, SourceError> {
                     .pub_date()
                     .and_then(|s| DateTime::parse_from_rfc2822(s).ok())
                     .map(|dt| dt.with_timezone(&Utc));
-                RssItem { id, title, link, published }
+                RssItem {
+                    id,
+                    title,
+                    link,
+                    published,
+                }
             })
             .collect());
     }
@@ -74,7 +79,12 @@ pub fn parse_feed(bytes: &[u8]) -> Result<Vec<RssItem>, SourceError> {
                 .or_else(|| Some(entry.updated()))
                 .copied()
                 .map(|dt| dt.with_timezone(&Utc));
-            RssItem { id, title, link, published }
+            RssItem {
+                id,
+                title,
+                link,
+                published,
+            }
         })
         .collect())
 }
@@ -83,7 +93,10 @@ impl Connection for RssConnection {
     type Cursor = RssCursor;
     type Item = RssItem;
 
-    async fn poll(&self, cursor: Self::Cursor) -> Result<Batch<Self::Item, Self::Cursor>, SourceError> {
+    async fn poll(
+        &self,
+        cursor: Self::Cursor,
+    ) -> Result<Batch<Self::Item, Self::Cursor>, SourceError> {
         tracing::debug!(url = %self.feed_url, etag = ?cursor.etag, "fetching RSS feed");
 
         let mut req = self.client.get(&self.feed_url);
@@ -94,11 +107,17 @@ impl Connection for RssConnection {
             req = req.header(reqwest::header::IF_MODIFIED_SINCE, lm.as_str());
         }
 
-        let resp = req.send().await.map_err(|e| SourceError::Request(e.to_string()))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| SourceError::Request(e.to_string()))?;
 
         if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
             tracing::debug!(url = %self.feed_url, "feed not modified (304), skipping");
-            return Ok(Batch { items: vec![], cursor });
+            return Ok(Batch {
+                items: vec![],
+                cursor,
+            });
         }
 
         if !resp.status().is_success() {
@@ -116,14 +135,20 @@ impl Connection for RssConnection {
             .and_then(|v| v.to_str().ok())
             .map(String::from);
 
-        let bytes = resp.bytes().await.map_err(|e| SourceError::Request(e.to_string()))?;
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| SourceError::Request(e.to_string()))?;
         let items = parse_feed(bytes.as_ref())?;
 
         tracing::debug!(url = %self.feed_url, count = items.len(), "parsed feed items");
 
         Ok(Batch {
             items,
-            cursor: RssCursor { etag: new_etag, last_modified: new_lm },
+            cursor: RssCursor {
+                etag: new_etag,
+                last_modified: new_lm,
+            },
         })
     }
 

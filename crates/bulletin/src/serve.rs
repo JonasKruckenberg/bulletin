@@ -11,6 +11,8 @@ pub async fn start(addr: SocketAddr) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("failed to bind to {addr}"))?;
-    axum::serve(listener, app).await.context("HTTP server error")?;
+    axum::serve(listener, app)
+        .await
+        .context("HTTP server error")?;
     Ok(())
 }

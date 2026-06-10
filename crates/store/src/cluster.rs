@@ -136,7 +136,11 @@ pub async fn cluster_display(
             let source = SourceKind::try_from(source.as_str()).map_err(|_| {
                 sqlx::Error::Decode(format!("unknown source kind: {source}").into())
             })?;
-            Ok(ClusterDisplay { id: row.get("id"), source, title: row.get("title") })
+            Ok(ClusterDisplay {
+                id: row.get("id"),
+                source,
+                title: row.get("title"),
+            })
         })
         .fetch_all(executor)
         .await

@@ -1,7 +1,8 @@
 use bulletin_core::kind::SourceKind;
 use bulletin_store::{
-    connect, migrate,
+    connect,
     connection::{advance_cursor, due_connections, load_connection, record_failure},
+    migrate,
 };
 use serde_json::json;
 use testcontainers::{runners::AsyncRunner, ImageExt};
@@ -39,7 +40,10 @@ async fn load_connection_returns_row() {
     let (pool, _pg) = setup().await;
     let id = insert_rss(&pool, "https://example.com/feed.rss").await;
 
-    let row = load_connection(&pool, id).await.unwrap().expect("row should exist");
+    let row = load_connection(&pool, id)
+        .await
+        .unwrap()
+        .expect("row should exist");
 
     assert_eq!(row.id, id);
     assert_eq!(row.source, SourceKind::Rss);
@@ -111,7 +115,10 @@ async fn advance_cursor_resets_consecutive_failures() {
     advance_cursor(&pool, id, json!({})).await.unwrap();
 
     let row = load_connection(&pool, id).await.unwrap().unwrap();
-    assert_eq!(row.consecutive_failures, 0, "advance_cursor must clear failure count");
+    assert_eq!(
+        row.consecutive_failures, 0,
+        "advance_cursor must clear failure count"
+    );
 }
 
 #[tokio::test]
@@ -132,13 +139,24 @@ async fn record_failure_applies_exponential_backoff() {
     let id = insert_rss(&pool, "https://example.com/feed.rss").await;
 
     record_failure(&pool, id).await.unwrap();
-    let after_1 = load_connection(&pool, id).await.unwrap().unwrap().next_poll_at;
+    let after_1 = load_connection(&pool, id)
+        .await
+        .unwrap()
+        .unwrap()
+        .next_poll_at;
 
     record_failure(&pool, id).await.unwrap();
-    let after_2 = load_connection(&pool, id).await.unwrap().unwrap().next_poll_at;
+    let after_2 = load_connection(&pool, id)
+        .await
+        .unwrap()
+        .unwrap()
+        .next_poll_at;
 
     // Second failure should schedule further out than the first (doubling interval).
-    assert!(after_2 > after_1, "backoff should increase with each failure");
+    assert!(
+        after_2 > after_1,
+        "backoff should increase with each failure"
+    );
 }
 
 #[tokio::test]
@@ -149,7 +167,10 @@ async fn record_failure_flips_to_errored_at_fifth_failure() {
     for _ in 0..4 {
         record_failure(&pool, id).await.unwrap();
         let row = load_connection(&pool, id).await.unwrap().unwrap();
-        assert_eq!(row.status, "active", "status must remain active before 5 failures");
+        assert_eq!(
+            row.status, "active",
+            "status must remain active before 5 failures"
+        );
     }
 
     record_failure(&pool, id).await.unwrap();
@@ -170,5 +191,8 @@ async fn errored_connections_are_excluded_from_due_connections() {
     assert_eq!(row.status, "errored");
 
     let due = due_connections(&pool).await.unwrap();
-    assert!(due.is_empty(), "errored connections must not appear in due_connections");
+    assert!(
+        due.is_empty(),
+        "errored connections must not appear in due_connections"
+    );
 }

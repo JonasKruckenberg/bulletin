@@ -73,15 +73,17 @@ pub async fn create_with_items(
             row
         }
         // Already exists — its items are frozen from the original transaction.
-        None => sqlx::query(
-            "SELECT id, subscriber_id, window_start, window_end, delivered_at
+        None => {
+            sqlx::query(
+                "SELECT id, subscriber_id, window_start, window_end, delivered_at
              FROM digest WHERE subscriber_id = $1 AND window_end = $2",
-        )
-        .bind(subscriber_id)
-        .bind(window_end)
-        .try_map(row_to_digest)
-        .fetch_one(&mut *tx)
-        .await?,
+            )
+            .bind(subscriber_id)
+            .bind(window_end)
+            .try_map(row_to_digest)
+            .fetch_one(&mut *tx)
+            .await?
+        }
     };
 
     tx.commit().await?;

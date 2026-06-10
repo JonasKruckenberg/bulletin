@@ -1,10 +1,11 @@
-use axum::{Router, routing::get};
+use axum::{routing::get, Router};
 use bulletin_connectors::rss::{RssConnection, RssCursor};
 use bulletin_core::{connector::Connection, scope::Scope};
 use bulletin_store::{
-    connect, migrate,
+    connect,
     connection::{advance_cursor, load_connection},
     event::insert_event,
+    migrate,
 };
 use serde_json::json;
 use testcontainers::{runners::AsyncRunner, ImageExt};
@@ -85,12 +86,19 @@ async fn run_poll_cycle(pool: &sqlx::PgPool, connection_id: uuid::Uuid) -> usize
 
     // Events committed before cursor advance — crash-safety invariant.
     for item in batch.items {
-        let ev = conn.to_events(item).into_iter().next().unwrap().finalize(Scope::Public);
+        let ev = conn
+            .to_events(item)
+            .into_iter()
+            .next()
+            .unwrap()
+            .finalize(Scope::Public);
         insert_event(pool, &ev).await.unwrap();
     }
 
     let new_cursor = serde_json::to_value(&batch.cursor).unwrap();
-    advance_cursor(pool, connection_id, new_cursor).await.unwrap();
+    advance_cursor(pool, connection_id, new_cursor)
+        .await
+        .unwrap();
 
     item_count
 }
@@ -126,7 +134,11 @@ async fn second_poll_deduplicates_events() {
     run_poll_cycle(&pool, id).await;
 
     // Feed hasn't changed; fingerprints match → no new rows inserted.
-    assert_eq!(event_count(&pool).await, 2, "re-poll must not duplicate events");
+    assert_eq!(
+        event_count(&pool).await,
+        2,
+        "re-poll must not duplicate events"
+    );
 }
 
 #[tokio::test]
@@ -139,7 +151,10 @@ async fn poll_advances_cursor_and_reschedules() {
 
     let row = load_connection(&pool, id).await.unwrap().unwrap();
     assert!(row.last_polled_at.is_some(), "last_polled_at should be set");
-    assert!(row.next_poll_at > chrono::Utc::now(), "next_poll_at should be in the future");
+    assert!(
+        row.next_poll_at > chrono::Utc::now(),
+        "next_poll_at should be in the future"
+    );
     assert_eq!(row.consecutive_failures, 0);
 }
 

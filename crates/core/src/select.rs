@@ -54,8 +54,9 @@ fn by_recency(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
 /// (selected by ascending position), then the near-misses (over-cap by ascending rank), then
 /// below-floor (input order) — i.e. read top-down to see exactly where the cut fell.
 pub fn select_explained(candidates: Vec<Candidate>, cfg: &Selection) -> Vec<Decision> {
-    let (mut eligible, ineligible): (Vec<Candidate>, Vec<Candidate>) =
-        candidates.into_iter().partition(|c| c.relevance >= cfg.relevance_floor);
+    let (mut eligible, ineligible): (Vec<Candidate>, Vec<Candidate>) = candidates
+        .into_iter()
+        .partition(|c| c.relevance >= cfg.relevance_floor);
     eligible.sort_by(by_recency);
 
     let decide = |c: Candidate, verdict: Verdict| Decision {
@@ -74,7 +75,11 @@ pub fn select_explained(candidates: Vec<Candidate>, cfg: &Selection) -> Vec<Deci
         };
         decisions.push(decide(c, verdict));
     }
-    decisions.extend(ineligible.into_iter().map(|c| decide(c, Verdict::BelowFloor)));
+    decisions.extend(
+        ineligible
+            .into_iter()
+            .map(|c| decide(c, Verdict::BelowFloor)),
+    );
     decisions
 }
 
@@ -105,15 +110,24 @@ mod tests {
     #[test]
     fn orders_newest_first_and_caps() {
         let cands = vec![cand(1, 100, 1.0), cand(2, 300, 1.0), cand(3, 200, 1.0)];
-        let cfg = Selection { relevance_floor: 0.0, max_items: 2 };
+        let cfg = Selection {
+            relevance_floor: 0.0,
+            max_items: 2,
+        };
         let out = select(cands, &cfg);
-        assert_eq!(out, vec![Id::new(Uuid::from_u128(2)), Id::new(Uuid::from_u128(3))]);
+        assert_eq!(
+            out,
+            vec![Id::new(Uuid::from_u128(2)), Id::new(Uuid::from_u128(3))]
+        );
     }
 
     #[test]
     fn gates_below_floor() {
         let cands = vec![cand(1, 100, 0.0), cand(2, 200, 1.0)];
-        let cfg = Selection { relevance_floor: 0.5, max_items: 10 };
+        let cfg = Selection {
+            relevance_floor: 0.5,
+            max_items: 10,
+        };
         let out = select(cands, &cfg);
         assert_eq!(out, vec![Id::new(Uuid::from_u128(2))]);
     }
@@ -121,8 +135,16 @@ mod tests {
     #[test]
     fn explains_every_candidate_with_a_verdict() {
         // newest→oldest: id2(300), id3(200), id1(100); id4 is below floor.
-        let cands = vec![cand(1, 100, 1.0), cand(2, 300, 1.0), cand(3, 200, 1.0), cand(4, 400, 0.0)];
-        let cfg = Selection { relevance_floor: 0.5, max_items: 2 };
+        let cands = vec![
+            cand(1, 100, 1.0),
+            cand(2, 300, 1.0),
+            cand(3, 200, 1.0),
+            cand(4, 400, 0.0),
+        ];
+        let cfg = Selection {
+            relevance_floor: 0.5,
+            max_items: 2,
+        };
         let out = select_explained(cands, &cfg);
 
         // Every candidate accounted for, render order first.

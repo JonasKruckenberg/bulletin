@@ -20,12 +20,17 @@ pub struct BuildStats {
 pub async fn run(pool: &PgPool) -> Result<Option<BuildStats>> {
     let mut tx = pool.begin().await.context("begin build txn")?;
 
-    if !cluster::try_build_lock(&mut *tx).await.context("acquire build lock")? {
+    if !cluster::try_build_lock(&mut *tx)
+        .await
+        .context("acquire build lock")?
+    {
         tracing::debug!("public build already in progress; skipping");
         return Ok(None);
     }
 
-    let (built_through, hwm) = cluster::build_bounds(&mut *tx).await.context("read build bounds")?;
+    let (built_through, hwm) = cluster::build_bounds(&mut *tx)
+        .await
+        .context("read build bounds")?;
     let groups = cluster::dirty_public_groups(&mut *tx, built_through, hwm)
         .await
         .context("find dirty groups")?;
@@ -41,8 +46,13 @@ pub async fn run(pool: &PgPool) -> Result<Option<BuildStats>> {
         }
     }
 
-    cluster::advance_build_watermark(&mut *tx, hwm).await.context("advance watermark")?;
+    cluster::advance_build_watermark(&mut *tx, hwm)
+        .await
+        .context("advance watermark")?;
     tx.commit().await.context("commit build txn")?;
 
-    Ok(Some(BuildStats { dirty_groups: groups.len(), built_through: hwm }))
+    Ok(Some(BuildStats {
+        dirty_groups: groups.len(),
+        built_through: hwm,
+    }))
 }

@@ -33,8 +33,7 @@ pub trait Connection: Send + Sync {
     fn poll(
         &self,
         cursor: Self::Cursor,
-    ) -> impl std::future::Future<Output = Result<Batch<Self::Item, Self::Cursor>, SourceError>>
-           + Send;
+    ) -> impl std::future::Future<Output = Result<Batch<Self::Item, Self::Cursor>, SourceError>> + Send;
 
     /// Pure normalization: source-specific item → connector-side event builders. Infra calls
     /// `finalize(scope)` on each builder to stamp the scope boundary and fingerprint.
