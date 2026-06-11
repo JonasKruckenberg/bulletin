@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    # Compile against sqlx's offline query cache. We have no compile-time-checked queries of our own
+    # (all queries are runtime `.bind`), but the apalis-postgres dependency does — and it ships its
+    # own `.sqlx` cache. Setting DATABASE_URL here would flip sqlx into online mode and make it
+    # re-verify apalis's queries against a database that has no `apalis` schema yet (that schema is
+    # created at runtime by PostgresStorage::setup), which fails the build. Tests spin up their own
+    # Postgres via testcontainers, so no service container or DATABASE_URL is needed.
+    env:
+      SQLX_OFFLINE: "true"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@v14
+
+      - uses: cachix/cachix-action@v15
+        with:
+          name: bulletin
+          authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+        continue-on-error: true
+
+      - run: nix develop --command cargo fmt --all --check
+
+      - run: nix develop --command cargo clippy --all-targets --all-features -- -D warnings
+
+      - run: nix develop --command cargo nextest run
+
+      - run: nix develop --command cargo deny check
+
+      # Build the deployable binary so cachix-action pushes it to the `bulletin` cache; the server
+      # then substitutes the prebuilt artifact instead of compiling on a `nixos-rebuild`.
+      - run: nix build .#bulletin

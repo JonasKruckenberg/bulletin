@@ -560,11 +560,38 @@ installation token; Slack: bot token, or 12h access + single-use refresh if rota
   runtime/task health (slow-poll detection). `tower-http` `TraceLayer` / `axum-otel` for HTTP
   spans. Sentry panic hook (`sentry` 0.48) for crash capture. Metrics facade choice **open**:
   `metrics`-rs vs `prometheus-client` (the latter if we want exemplars linking histograms↔traces).
-- **Domain/eval:** a span per event flowing end-to-end through the DAG; pipeline counters
-  (ingested, dedup-collapsed, clustered, linked, gated-out, delivered); and the **product KPIs**
-  derived from the feedback log — **story precision, false-positive rate** (§10.3 of product doc).
-  Reason records *are* decision-level observability — emit them as structured trace events too.
-  **KPI definitions deferred.**
+- **Domain/eval — the trace unit is one *job*, not an end-to-end per-event flow** *(DECIDED 2026-06)*.
+  The pipeline is **data-coupled, not control-coupled** (the tick is the sole enqueuer; stages are
+  joined by watermarks, not calls) and **many-to-many** (one `PublicBuild` feeds every digest that
+  window; one poll's events feed many clusters feed many digests). A trace is a *tree*; this DAG has
+  shared fan-in nodes, so a single "RSS-item → inbox" trace would lie about ownership. Therefore:
+  - **One trace per job execution** (`PollConnection` / `PublicBuild` / `GenerateDigest`); the value
+    is the **internal tree** — e.g. digest = `collect_candidates → select → create_with_items →
+    render → send_email → mark_delivered`, which separates *our* time from the external SMTP send.
+    Root span carries `task_id` (apalis ULID — stable id *and* enqueue clock), `attempt`, `wait_ms`
+    (enqueue→pickup) and `elapsed_ms`.
+  - **Cross-job causality = span *links* + correlation attributes, not parent-child.** Attributes
+    (`connection_id`, `subscriber_id`, `window_end`, `source`) join spans across independent traces;
+    links express many-to-many lineage (`GenerateDigest` → the `PublicBuild` it gated on → the polls
+    that inserted its events) without a false tree.
+  - **The one place real cross-queue propagation fits: webhooks (M2).** An inbound request causes
+    *one* `ProcessWebhook` job (1:1) → propagate W3C context (apalis `TracingContext`) from server
+    span into job span. The tick→job edge is 1:N and decoupled — do **not** propagate there.
+  - **Metrics are the primary signal; traces are secondary.** Daily-ops questions are gauge/
+    distributional — queue depth & oldest-pending, build lag, poll p99, delivery success rate, and
+    pipeline counters (ingested, dedup-collapsed, clustered, linked, gated-out, delivered). These come
+    from counters + the `debug status` aggregates promoted to gauges, **not** from traces. Traces are
+    for the per-job breakdown and the rare "this digest took 30 s — autopsy" case; don't build
+    elaborate cross-job trace stitching. **Product KPIs** (story precision, false-positive rate,
+    §10.3 product doc) derive from the feedback log.
+  - **Reason records** *are* decision-level observability — emit as structured span events (the M1
+    selection trace — `selection complete` + per-candidate `Verdict` — is the first instance).
+  - **M1 state → M5 wiring.** Instrumentation already emits **structured** `tracing` spans/events
+    (job spans + timing + selection trace), so M5 is a *wiring* change (add the OTel layer in
+    `main.rs`), not re-instrumentation. Field→metric conversion needs one step: either
+    `tracing-opentelemetry` `MetricsLayer` field-name conventions
+    (`histogram.`/`counter.`/`monotonic_counter.`) or a collector span-metrics processor.
+    **KPI definitions deferred.**
 
 ### Reliability  *(DECIDED)*
 - `panic = "unwind"` + a panic hook into telemetry; the apalis worker loop isolates a panicked
@@ -624,7 +651,7 @@ clippy/nextest/fmt) + `oxalica/rust-overlay` (pure eval, reads `rust-toolchain.t
 
 **v1 = RSS + GitHub + Slack** (Slack is the private-scope exemplar). **All paid/compliance-gated
 sources deferred.**
-- **RSS:** poll w/ conditional GET (ETag / Last-Modified); `feed-rs` parses (no HTTP — pair with
+- **RSS:** poll w/ conditional GET (ETag / Last-Modified); `rss`,`atom` parses (no HTTP — pair with
   the SSRF-guarded `reqwest`). Cursor = validators.
 - **GitHub:** use a **GitHub App** (15k req/hr/install, fine-grained perms) — not PATs. Webhooks
   primary + REST/GraphQL backfill.
@@ -660,7 +687,7 @@ sources deferred.**
 | HTTP client | reqwest (custom DNS resolver) | 0.13 |
 | Testing | proptest / insta / testcontainers(+modules) / turmoil / madsim / loom | 1.11 / 1.47 / 0.27(+0.15) / 0.7 / 0.2 / 0.7 |
 | Supply chain | cargo-deny (+cargo-audit) | 0.19 |
-| Feeds | feed-rs | — |
+| Feeds | rss/atom | — |
 | Rate limit | governor | — |
 | Nix | crane / oxalica rust-overlay / cargo-nextest | 0.23.4 |
 
@@ -691,8 +718,9 @@ Proposed sequence (next-up first):
 8. **Crate graph finalize** — names + granularity.
 9. **KPIs + eval harness** over the feedback log (story precision, FP rate).
 10. **Nix/CI scaffolding** — flake, devShell, checks (can run as a parallel track).
-11. **Observability specifics** — metrics facade (exemplars?), span/trace design through the DAG,
-    counter taxonomy.
+11. **Observability specifics** — span/trace design through the DAG **DECIDED** (per-job traces +
+    span links + metrics-primary; §6 Observability). **Still open:** metrics facade (`metrics`-rs vs
+    `prometheus-client`, exemplars?) and the counter/gauge taxonomy.
 12. **Time/scheduling** *(v1)* — timezone-aware `next_run_at` + DST; `chrono` vs `time`; injectable
     clock (load-bearing — §6 Reliability); `window_end` = scheduled boundary (product §9.3). Timezone
     correctness threaded through storage (UTC `timestamptz`), boundary math (subscriber tz), and

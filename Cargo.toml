@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/store",
+    "crates/connectors",
+    "crates/bulletin",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+tokio       = { version = "1", features = ["full"] }
+tracing     = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+metrics     = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
+uuid        = { version = "1", features = ["v7", "serde"] }
+chrono      = { version = "0.4", features = ["serde"] }
+sha2        = "0.10"
+ulid        = "1"  # read enqueue time from the apalis TaskId for job wait/run timing
+clap        = { version = "4", features = ["derive", "env"] }
+axum        = "0.7"
+tower-http  = { version = "0.5", features = ["trace"] }
+sqlx        = { version = "0.8", features = ["postgres", "uuid", "chrono", "runtime-tokio"] }
+cron        = "0.16"
+apalis          = { version = "=1.0.0-rc.9" }
+apalis-postgres = { version = "=1.0.0-rc.8" }
+apalis-cron     = { version = "=1.0.0-rc.8" }
+anyhow      = "1"
+proptest    = "1"
+reqwest          = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+rss              = "2"
+atom_syndication = "0.12"
+lettre           = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "file-transport", "tokio1", "tokio1-rustls-tls"] }
+testcontainers         = { version = "0.27" }
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
