@@ -25,7 +25,10 @@ let
   dbName = "bulletin";
 
   databaseUrl =
-    if cfg.database.createLocally then "postgres:///${dbName}?host=/run/postgresql" else cfg.database.url;
+    if cfg.database.createLocally then
+      "postgres:///${dbName}?host=/run/postgresql"
+    else
+      cfg.database.url;
 
   # CLI wrapper on PATH: presets DATABASE_URL + email env to the deployed values so operators run
   # `sudo -u bulletin bulletin debug …` (seeding, status, the digest-explain loop) without flags.
@@ -37,7 +40,8 @@ let
     exec ${lib.getExe cfg.package} "$@"
   '';
 
-  pgPackage = if cfg.database.createLocally then config.services.postgresql.package else pkgs.postgresql;
+  pgPackage =
+    if cfg.database.createLocally then config.services.postgresql.package else pkgs.postgresql_18;
 
   pgDeps = lib.optional cfg.database.createLocally "postgresql.target";
 
