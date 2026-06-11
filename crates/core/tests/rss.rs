@@ -1,9 +1,6 @@
-use bulletin_connectors::rss::{parse_feed, RssConnection, RssItem};
-use bulletin_core::{
-    connector::Connection,
-    kind::{ContentKind, SourceKind},
-    scope::Scope,
-};
+use bulletin_core::ingest::rss::{parse_feed, RssConnection, RssItem};
+use bulletin_core::ingest::Connection;
+use bulletin_core::{kind::SourceKind, scope::Scope};
 use chrono::{TimeZone, Utc};
 
 const RSS_XML: &str = r#"<?xml version="1.0"?>
@@ -96,7 +93,6 @@ fn to_events_maps_fields_correctly() {
 
     assert_eq!(ev.source, SourceKind::Rss);
     assert_eq!(ev.title, "Hello World");
-    assert_eq!(ev.content_kind, ContentKind::Longform);
     assert_eq!(ev.body, None);
     assert_eq!(ev.links, vec!["https://example.com/post-1"]);
     assert_eq!(ev.group_key, "https://example.com/post-1");

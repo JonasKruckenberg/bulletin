@@ -1,14 +1,18 @@
+//! The clustering flow: drain the event log (via the build watermark cursor) and fold each
+//! dirtied within-source group into a representative `cluster` row. Consumer of the
+//! ingest→clustering seam, producer of the clustering→digest seam.
+
+pub mod store;
+
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use sqlx::PgPool;
 
-use crate::event::Event;
+use crate::common::event::Event;
 
-/// Marker for `Id<Cluster>`. A cluster is a within-source group of events sharing
-/// `(source, group_key)`; the persisted row lives in the store layer.
-pub struct Cluster;
-
-/// The recomputed rollup PublicBuild upserts onto a cluster row. M1 keeps only what the digest
+/// The recomputed rollup the build upserts onto a cluster row. M1 keeps only what the digest
 /// reads — the latest event's title/link and the group's recency. Richer rollups (counts,
-/// severity, entities) re-add in M3/M4, when something consumes them.
+/// severity, entities) re-add later, when something consumes them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterRollup {
     /// Representative title — the latest event's title.
@@ -36,22 +40,69 @@ pub fn rollup(events: &[Event]) -> Option<ClusterRollup> {
     })
 }
 
+pub struct BuildStats {
+    pub dirty_groups: usize,
+    pub built_through: DateTime<Utc>,
+}
+
+/// PublicBuild: drain new public events into clusters and advance the build watermark.
+///
+/// Runs in a single transaction holding a transaction-level advisory lock, so concurrent builds
+/// serialize (the loser returns `Ok(None)`) and the whole pass is atomic — a crash rolls back
+/// without advancing the watermark, leaving the events still due next tick. Processes the
+/// half-open ingest range `(built_through, now()]`: finds the groups it dirtied, recomputes each
+/// cluster's rollup over *all* its events, upserts, then advances to `now()`.
+pub async fn build(pool: &PgPool) -> Result<Option<BuildStats>> {
+    let mut tx = pool.begin().await.context("begin build txn")?;
+
+    if !store::try_build_lock(&mut *tx)
+        .await
+        .context("acquire build lock")?
+    {
+        tracing::debug!("public build already in progress; skipping");
+        return Ok(None);
+    }
+
+    let (built_through, hwm) = store::build_bounds(&mut *tx)
+        .await
+        .context("read build bounds")?;
+    let groups = store::dirty_public_groups(&mut *tx, built_through, hwm)
+        .await
+        .context("find dirty groups")?;
+
+    for (source, group_key) in &groups {
+        let events = store::list_public_group_events(&mut *tx, *source, group_key)
+            .await
+            .context("load group events")?;
+        if let Some(r) = rollup(&events) {
+            store::upsert_cluster(&mut *tx, *source, group_key, &r)
+                .await
+                .context("upsert cluster")?;
+        }
+    }
+
+    store::advance_build_watermark(&mut *tx, hwm)
+        .await
+        .context("advance watermark")?;
+    tx.commit().await.context("commit build txn")?;
+
+    Ok(Some(BuildStats {
+        dirty_groups: groups.len(),
+        built_through: hwm,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        fingerprint::Fingerprint,
-        id::Id,
-        kind::{ContentKind, SourceKind},
-        scope::Scope,
-    };
+    use crate::common::{fingerprint::Fingerprint, kind::SourceKind, scope::Scope};
     use chrono::TimeZone;
     use proptest::prelude::*;
     use uuid::Uuid;
 
     fn ev(secs: i64, title: &str) -> Event {
         Event {
-            id: Id::new(Uuid::nil()),
+            id: Uuid::nil(),
             fingerprint: Fingerprint([0u8; 32]),
             source: SourceKind::Rss,
             scope: Scope::Public,
@@ -61,7 +112,6 @@ mod tests {
             links: vec![format!("https://example.com/{title}")],
             group_key: "g".to_owned(),
             entities: Vec::new(),
-            content_kind: ContentKind::Longform,
             severity_hint: None,
             ingest_time: Utc.timestamp_opt(secs, 0).single().unwrap(),
             raw: None,

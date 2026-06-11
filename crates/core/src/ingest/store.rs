@@ -1,7 +1,13 @@
-use bulletin_core::kind::SourceKind;
+//! The ingest flow's persistence: the `connection` rows it polls + schedules, and appending
+//! normalized events to the **event log** (`event` table, fingerprint-deduped).
+
+use crate::common::event::{from_row, Event, NewEvent};
+use crate::common::{kind::SourceKind, scope::Scope};
 use chrono::{DateTime, Utc};
 use sqlx::{postgres::PgRow, PgPool, Row};
 use uuid::Uuid;
+
+// ── Connections ────────────────────────────────────────────────────────
 
 pub struct ConnectionRow {
     pub id: Uuid,
@@ -16,12 +22,9 @@ pub struct ConnectionRow {
 }
 
 fn row_to_connection(row: PgRow) -> Result<ConnectionRow, sqlx::Error> {
-    let source: String = row.get("source");
-    let source = SourceKind::try_from(source.as_str())
-        .map_err(|_| sqlx::Error::Decode(format!("unknown source kind: {source}").into()))?;
     Ok(ConnectionRow {
         id: row.get("id"),
-        source,
+        source: row.try_get("source")?,
         status: row.get("status"),
         config: row.get("config"),
         cursor: row.get("cursor"),
@@ -57,7 +60,7 @@ pub async fn insert_connection(
          VALUES ($1, $2, $3)
          RETURNING id",
     )
-    .bind(source.as_str())
+    .bind(source)
     .bind(config)
     .bind(poll_interval_secs)
     .fetch_one(pool)
@@ -140,4 +143,63 @@ pub async fn record_failure(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> 
     .execute(pool)
     .await?;
     Ok(())
+}
+
+// ── Event log (append) ───────────────────────────────────────────────────
+
+/// Appends `ev` to the event log, deduplicating on fingerprint.
+/// Returns `Some(event)` if inserted, `None` if the fingerprint already existed.
+pub async fn insert_event(pool: &PgPool, ev: &NewEvent) -> Result<Option<Event>, sqlx::Error> {
+    let (scope_kind, scope_subscriber_id) = match &ev.scope {
+        Scope::Public => ("public", None::<Uuid>),
+        Scope::Private(sub_id) => ("private", Some(*sub_id)),
+    };
+
+    // `content_kind` is a fixed 'longform' until later milestones model content kinds again;
+    // the column stays NOT NULL so the literal keeps the schema honest.
+    sqlx::query(
+        r#"
+        INSERT INTO event (
+            fingerprint, source, scope_kind, scope_subscriber_id,
+            event_time, title, body, links, group_key, entities,
+            content_kind, severity_hint, raw
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'longform', $11, $12)
+        ON CONFLICT (fingerprint) DO NOTHING
+        RETURNING
+            id, fingerprint, source, scope_kind, scope_subscriber_id,
+            event_time, title, body, links, group_key, entities,
+            severity_hint, ingest_time, raw
+        "#,
+    )
+    .bind(&ev.fingerprint.0[..])
+    .bind(ev.source)
+    .bind(scope_kind)
+    .bind(scope_subscriber_id)
+    .bind(ev.event_time)
+    .bind(&ev.title)
+    .bind(ev.body.as_deref())
+    .bind(&ev.links)
+    .bind(&ev.group_key)
+    .bind(&ev.entities)
+    .bind(ev.severity_hint)
+    .bind(ev.raw.as_deref())
+    .try_map(from_row)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Returns the most recent `limit` events ordered by ingest_time descending (debug dump).
+pub async fn list_events(pool: &PgPool, limit: i64) -> Result<Vec<Event>, sqlx::Error> {
+    sqlx::query(
+        "SELECT id, fingerprint, source, scope_kind, scope_subscriber_id,
+                event_time, title, body, links, group_key, entities,
+                severity_hint, ingest_time, raw
+         FROM event
+         ORDER BY ingest_time DESC
+         LIMIT $1",
+    )
+    .bind(limit)
+    .try_map(from_row)
+    .fetch_all(pool)
+    .await
 }

@@ -1,9 +1,5 @@
-use bulletin_core::{
-    event::EventBuilder,
-    kind::{ContentKind, SourceKind},
-    scope::Scope,
-};
-use bulletin_store::{connect, event::insert_event, migrate};
+use bulletin_core::ingest::store::insert_event;
+use bulletin_core::{connect, event::EventBuilder, kind::SourceKind, migrate, scope::Scope};
 use chrono::Utc;
 use testcontainers::{runners::AsyncRunner, ImageExt};
 use testcontainers_modules::postgres::Postgres;
@@ -28,7 +24,6 @@ fn rss(stable_id: &str, title: &str) -> EventBuilder {
         Utc::now(),
         title,
         format!("feed/{stable_id}"),
-        ContentKind::Longform,
     )
     .links(vec![format!("https://example.com/{stable_id}")])
 }
@@ -48,7 +43,6 @@ async fn insert_returns_event() {
     assert_eq!(event.scope, Scope::Public);
     assert_eq!(event.title, "Hello world");
     assert_eq!(event.links, vec!["https://example.com/item-1"]);
-    assert_eq!(event.content_kind, ContentKind::Longform);
     assert_eq!(event.fingerprint, new_ev.fingerprint);
 }
 
@@ -67,7 +61,6 @@ async fn repoll_same_item_is_deduped() {
         Utc::now(),
         "Edited title",
         "feed/item-1",
-        ContentKind::Announcement,
     )
     .body("body added on edit")
     .entities(vec!["Rust".into()])

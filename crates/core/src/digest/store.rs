@@ -1,10 +1,8 @@
-use bulletin_core::{cluster::Cluster, id::Id, kind::SourceKind};
+use crate::common::kind::SourceKind;
+use crate::digest::select::Candidate;
 use chrono::{DateTime, Utc};
-use sqlx::{postgres::PgRow, PgPool, Row};
+use sqlx::{postgres::PgRow, PgExecutor, PgPool, Row};
 use uuid::Uuid;
-
-/// Marker for `Id<Digest>`. The persisted row is `DigestRow`.
-pub struct Digest;
 
 pub struct DigestRow {
     pub id: Uuid,
@@ -32,6 +30,66 @@ pub struct RenderItem {
     pub last_event_time: DateTime<Utc>,
 }
 
+/// Clusters that received a new event (by ingest_time) in `(last_run, window_end]` — the
+/// digest's candidate set. Ordered newest-first; the pure `select()` applies the cap.
+/// `last_run = None` ⇒ unbounded lower edge.
+pub async fn candidates_in_window(
+    executor: impl PgExecutor<'_>,
+    last_run: Option<DateTime<Utc>>,
+    window_end: DateTime<Utc>,
+) -> Result<Vec<Candidate>, sqlx::Error> {
+    sqlx::query(
+        "SELECT c.id, c.last_event_time
+         FROM cluster c
+         WHERE EXISTS (
+             SELECT 1 FROM event e
+             WHERE e.scope_kind = 'public'
+               AND e.source = c.source
+               AND e.group_key = c.group_key
+               AND e.ingest_time > COALESCE($1, '-infinity'::timestamptz)
+               AND e.ingest_time <= $2
+         )
+         ORDER BY c.last_event_time DESC",
+    )
+    .bind(last_run)
+    .bind(window_end)
+    .try_map(|row: PgRow| {
+        Ok(Candidate {
+            cluster_id: row.get("id"),
+            last_event_time: row.get("last_event_time"),
+        })
+    })
+    .fetch_all(executor)
+    .await
+}
+
+/// Human-readable identity (source, title) of a cluster — the display half of a selection
+/// `Decision`, which carries only the id.
+pub struct ClusterDisplay {
+    pub id: Uuid,
+    pub source: SourceKind,
+    pub title: String,
+}
+
+/// Display fields for a set of clusters by id, for `debug digest-explain` to pair each
+/// selection verdict with a human-readable cluster. Order is unspecified — callers index by id.
+pub async fn cluster_display(
+    executor: impl PgExecutor<'_>,
+    ids: &[Uuid],
+) -> Result<Vec<ClusterDisplay>, sqlx::Error> {
+    sqlx::query("SELECT id, source, title FROM cluster WHERE id = ANY($1)")
+        .bind(ids)
+        .try_map(|row: PgRow| {
+            Ok(ClusterDisplay {
+                id: row.get("id"),
+                source: row.try_get("source")?,
+                title: row.get("title"),
+            })
+        })
+        .fetch_all(executor)
+        .await
+}
+
 /// Idempotently gets-or-creates the digest for `(subscriber, window_end)` with its selected
 /// clusters frozen as `digest_item` rows — digest and items commit together, so the digest is
 /// never observed without its selection. On a retry the row already exists; the unique window
@@ -41,7 +99,7 @@ pub async fn create_with_items(
     subscriber_id: Uuid,
     window_start: DateTime<Utc>,
     window_end: DateTime<Utc>,
-    cluster_ids: &[Id<Cluster>],
+    cluster_ids: &[Uuid],
 ) -> Result<DigestRow, sqlx::Error> {
     let mut tx = pool.begin().await?;
 
@@ -65,7 +123,7 @@ pub async fn create_with_items(
                     "INSERT INTO digest_item (digest_id, cluster_id, position) VALUES ($1, $2, $3)",
                 )
                 .bind(row.id)
-                .bind(cluster_id.as_uuid())
+                .bind(cluster_id)
                 .bind(position as i32)
                 .execute(&mut *tx)
                 .await?;
@@ -101,13 +159,10 @@ pub async fn render_items(pool: &PgPool, digest_id: Uuid) -> Result<Vec<RenderIt
     )
     .bind(digest_id)
     .try_map(|row: PgRow| {
-        let source: String = row.get("source");
-        let source = SourceKind::try_from(source.as_str())
-            .map_err(|_| sqlx::Error::Decode(format!("unknown source kind: {source}").into()))?;
         Ok(RenderItem {
             title: row.get("title"),
             link: row.get("link"),
-            source,
+            source: row.try_get("source")?,
             last_event_time: row.get("last_event_time"),
         })
     })
@@ -129,7 +184,7 @@ pub async fn mark_delivered(
         .bind(digest_id)
         .execute(&mut *tx)
         .await?;
-    crate::subscriber::advance_after_delivery(&mut *tx, subscriber_id, window_end).await?;
+    crate::digest::subscriber::advance_after_delivery(&mut *tx, subscriber_id, window_end).await?;
     tx.commit().await?;
     Ok(())
 }

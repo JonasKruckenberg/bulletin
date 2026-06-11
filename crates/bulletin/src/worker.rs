@@ -1,3 +1,7 @@
+//! The trigger layer: a cron tick (the sole enqueuer) plus three apalis workers that do nothing
+//! but call the corresponding `core` flow and translate its outcome into metrics. All durability/
+//! dedup lives in the flows' watermarks; apalis just schedules, retries, and distributes.
+
 use anyhow::{Context, Result};
 use apalis::prelude::*;
 use apalis_cron::{CronStream, Tick};
@@ -12,16 +16,14 @@ use tracing::Instrument;
 use ulid::Ulid;
 use uuid::Uuid;
 
-use bulletin_connectors::rss::RssConnection;
-use bulletin_core::{connector::Connection, kind::SourceKind, scope::Scope};
-use bulletin_store::{
-    cluster::unbuilt_public_events_exist,
-    connection::{advance_cursor, due_connections, load_connection, record_failure, ConnectionRow},
-    event::insert_event,
-    subscriber::due_subscribers,
-};
+use bulletin_core::cluster::store::unbuilt_public_events_exist;
+use bulletin_core::digest::subscriber::due_subscribers;
+use bulletin_core::digest::DigestOutcome;
+use bulletin_core::ingest::store::due_connections;
+use bulletin_core::ingest::PollOutcome;
 
-use crate::email::EmailConfig;
+use crate::metric;
+use crate::transport::EmailConfig;
 
 pub async fn setup_storage(pool: &PgPool) -> Result<()> {
     let mut m = PostgresStorage::<(), (), ()>::migrations();
@@ -51,8 +53,8 @@ pub struct GenerateDigestJob {
 /// Wraps a queued-job body in a stable span + timing. The apalis `TaskId` is a ULID, so it is
 /// both a stable correlation id (stamped on every log line for the task) and an embedded enqueue
 /// clock — `wait_ms` (enqueue → pickup) and `elapsed_ms` (run time) come for free, no backend
-/// peeking. A slow or backed-up pipeline then shows up directly as large wait/elapsed on the
-/// "job complete" line, and `attempt > 1` flags a retry.
+/// peeking. A slow or backed-up pipeline shows up directly as large wait/elapsed on the "job
+/// complete" line, and `attempt > 1` flags a retry.
 async fn traced(
     job: &'static str,
     task_id: TaskId<Ulid>,
@@ -67,10 +69,7 @@ async fn traced(
         let result = fut.await;
         let elapsed = started.elapsed();
         let elapsed_ms = elapsed.as_millis() as u64;
-        let outcome = if result.is_ok() { "ok" } else { "err" };
-        metrics::histogram!("bulletin_job_duration_seconds", "job" => job)
-            .record(elapsed.as_secs_f64());
-        metrics::counter!("bulletin_jobs_total", "job" => job, "outcome" => outcome).increment(1);
+        metric::job_finished(job, result.is_ok(), elapsed);
         match &result {
             Ok(()) => tracing::info!(wait_ms, elapsed_ms, "job complete"),
             Err(e) => tracing::warn!(wait_ms, elapsed_ms, error = %e, "job failed"),
@@ -81,180 +80,76 @@ async fn traced(
     .await
 }
 
-// ── PollConnection ─────────────────────────────────────────────────────
+// ── Job handlers: each is just `flow → metrics` ────────────────────────
 
-/// M1 dispatch: RSS only. Becomes a full enum when GitHub lands in M2.
-enum ConnDispatch {
-    Rss(RssConnection),
-}
-
-#[derive(Deserialize)]
-struct RssConfig {
-    url: String,
-}
-
-fn build_dispatch(row: &ConnectionRow) -> Result<ConnDispatch, Box<dyn std::error::Error>> {
-    match row.source {
-        SourceKind::Rss => {
-            let cfg: RssConfig = serde_json::from_value(row.config.clone())?;
-            Ok(ConnDispatch::Rss(RssConnection::new(cfg.url)))
-        }
-        _ => Err(format!("unsupported source {:?} in M1", row.source).into()),
-    }
-}
-
-async fn handle_poll_connection(
+async fn poll_connection(
     job: PollConnectionJob,
     task_id: TaskId<Ulid>,
     attempt: Attempt,
     pool: Data<PgPool>,
 ) -> Result<(), BoxDynError> {
-    traced(
-        "poll_connection",
-        task_id,
-        attempt,
-        poll_connection(job, pool),
-    )
+    traced("poll_connection", task_id, attempt, async move {
+        match bulletin_core::ingest::poll(&pool, job.connection_id).await {
+            Ok(PollOutcome::Polled {
+                source,
+                inserted,
+                deduplicated,
+            }) => metric::poll_result(source.as_str(), inserted, deduplicated),
+            Ok(PollOutcome::Failed { source }) => metric::poll_failed(source.as_str()),
+            Ok(PollOutcome::Skipped) => {}
+            Err(e) => return Err(format!("{e:#}").into()),
+        }
+        Ok(())
+    })
     .await
 }
 
-async fn poll_connection(job: PollConnectionJob, pool: Data<PgPool>) -> Result<(), BoxDynError> {
-    let conn_row = match load_connection(&pool, job.connection_id).await? {
-        Some(r) => r,
-        None => {
-            tracing::warn!(connection_id = %job.connection_id, "connection not found");
-            return Ok(());
-        }
-    };
-
-    if conn_row.status != "active" {
-        tracing::debug!(connection_id = %job.connection_id, status = %conn_row.status, "skipping non-active connection");
-        return Ok(());
-    }
-
-    let dispatch = match build_dispatch(&conn_row) {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::error!(connection_id = %job.connection_id, error = %e, "build_dispatch failed");
-            return Ok(());
-        }
-    };
-
-    // Cursor/creds erase to serde_json::Value at the arm boundary; typed within each arm.
-    let result = match dispatch {
-        ConnDispatch::Rss(conn) => {
-            let cursor = conn_row
-                .cursor
-                .clone()
-                .map(|v| serde_json::from_value(v).unwrap_or_default())
-                .unwrap_or_default();
-            conn.poll(cursor).await.map(|b| {
-                let builders = b
-                    .items
-                    .into_iter()
-                    .flat_map(|item| conn.to_events(item))
-                    .collect::<Vec<_>>();
-                let new_cursor =
-                    serde_json::to_value(&b.cursor).expect("RssCursor always serializes");
-                (builders, new_cursor)
-            })
-        }
-    };
-
-    match result {
-        Ok((builders, new_cursor)) => {
-            let total = builders.len();
-            let mut inserted = 0usize;
-            // Events committed before cursor advance — crash-safety invariant (arch §3).
-            for builder in builders {
-                let ev = builder.finalize(Scope::Public);
-                if insert_event(&pool, &ev).await?.is_some() {
-                    inserted += 1;
-                }
+async fn public_build(
+    _job: PublicBuildJob,
+    task_id: TaskId<Ulid>,
+    attempt: Attempt,
+    pool: Data<PgPool>,
+) -> Result<(), BoxDynError> {
+    traced("public_build", task_id, attempt, async move {
+        match bulletin_core::cluster::build(&pool).await {
+            Ok(Some(stats)) => {
+                tracing::info!(dirty_groups = stats.dirty_groups, "public build complete")
             }
-            let source = conn_row.source.as_str();
-            metrics::counter!("bulletin_events_ingested_total", "source" => source)
-                .increment(inserted as u64);
-            metrics::counter!("bulletin_events_deduplicated_total", "source" => source)
-                .increment((total - inserted) as u64);
-            tracing::info!(
-                connection_id = %conn_row.id,
-                source,
-                inserted,
-                deduplicated = total - inserted,
-                "poll complete"
-            );
-            advance_cursor(&pool, conn_row.id, new_cursor).await?;
+            Ok(None) => tracing::debug!("public build skipped (lock held by a concurrent build)"),
+            Err(e) => {
+                tracing::error!(error = %format!("{e:#}"), "public build failed");
+                return Err(format!("{e:#}").into());
+            }
         }
-        Err(e) => {
-            metrics::counter!("bulletin_poll_failures_total", "source" => conn_row.source.as_str())
-                .increment(1);
-            tracing::warn!(connection_id = %job.connection_id, error = %e, "poll failed");
-            record_failure(&pool, conn_row.id).await?;
-        }
-    }
-
-    Ok(())
-}
-
-// ── PublicBuild ────────────────────────────────────────────────────────
-
-async fn handle_public_build(
-    job: PublicBuildJob,
-    task_id: TaskId<Ulid>,
-    attempt: Attempt,
-    pool: Data<PgPool>,
-) -> Result<(), BoxDynError> {
-    traced("public_build", task_id, attempt, public_build(job, pool)).await
-}
-
-async fn public_build(_: PublicBuildJob, pool: Data<PgPool>) -> Result<(), BoxDynError> {
-    match crate::build::run(&pool).await {
-        Ok(Some(stats)) => {
-            tracing::info!(dirty_groups = stats.dirty_groups, "public build complete");
-        }
-        Ok(None) => tracing::debug!("public build skipped (lock held by a concurrent build)"),
-        Err(e) => {
-            tracing::error!(error = %format!("{e:#}"), "public build failed");
-            return Err(format!("{e:#}").into());
-        }
-    }
-    Ok(())
-}
-
-// ── GenerateDigest ─────────────────────────────────────────────────────
-
-async fn handle_generate_digest(
-    job: GenerateDigestJob,
-    task_id: TaskId<Ulid>,
-    attempt: Attempt,
-    pool: Data<PgPool>,
-    email: Data<EmailConfig>,
-) -> Result<(), BoxDynError> {
-    traced(
-        "generate_digest",
-        task_id,
-        attempt,
-        generate_digest(job, pool, email),
-    )
+        Ok(())
+    })
     .await
 }
 
 async fn generate_digest(
     job: GenerateDigestJob,
+    task_id: TaskId<Ulid>,
+    attempt: Attempt,
     pool: Data<PgPool>,
     email: Data<EmailConfig>,
 ) -> Result<(), BoxDynError> {
-    match crate::digest::run(&pool, &email, job.subscriber_id).await {
-        Ok(outcome) => {
-            tracing::info!(subscriber_id = %job.subscriber_id, ?outcome, "digest generated");
+    traced("generate_digest", task_id, attempt, async move {
+        let sender = email.build_sender().map_err(|e| format!("{e:#}"))?;
+        match bulletin_core::digest::generate(&pool, &sender, job.subscriber_id).await {
+            Ok(outcome) => {
+                if matches!(outcome, DigestOutcome::Delivered { .. }) {
+                    metric::digest_delivered();
+                }
+                tracing::info!(subscriber_id = %job.subscriber_id, ?outcome, "digest generated");
+            }
+            Err(e) => {
+                tracing::error!(subscriber_id = %job.subscriber_id, error = %format!("{e:#}"), "digest failed");
+                return Err(format!("{e:#}").into());
+            }
         }
-        Err(e) => {
-            tracing::error!(subscriber_id = %job.subscriber_id, error = %format!("{e:#}"), "digest failed");
-            return Err(format!("{e:#}").into());
-        }
-    }
-    Ok(())
+        Ok(())
+    })
+    .await
 }
 
 // ── Cron tick: the three due-sweeps ────────────────────────────────────
@@ -266,11 +161,10 @@ fn is_duplicate_enqueue(e: &TaskSinkError<sqlx::Error>) -> bool {
         if err.as_database_error().is_some_and(|db| db.is_unique_violation()))
 }
 
-/// The tick is the sole enqueuer. It reads three "what's due" conditions and pushes work;
-/// it advances no watermarks itself (the processing jobs do). The PublicBuild → GenerateDigest
-/// dependency is honored as a *data precondition* of the digest sweep (`due_subscribers` only
-/// returns a subscriber once every public event before its boundary is built), so no job needs
-/// to chain another.
+/// The tick is the sole enqueuer. It reads three "what's due" conditions and pushes work; it
+/// advances no watermarks itself (the flows do). The clustering → digest dependency is honored
+/// as a *data precondition* of the digest sweep (`due_subscribers` only returns a subscriber once
+/// every public event before its boundary is built), so no job needs to chain another.
 async fn handle_tick(_: Tick<Utc>, pool: Data<PgPool>) -> Result<(), BoxDynError> {
     let span = tracing::info_span!("tick");
     async move {
@@ -332,31 +226,14 @@ async fn run_tick(pool: Data<PgPool>) -> Result<(), BoxDynError> {
         }
     }
 
-    // Publish gauge snapshots for Prometheus. These are cheap aggregates already computed for
-    // `debug status`; refreshing them once per tick keeps the DB read off the metrics scrape path.
-    // A gather failure must not fail the tick.
-    match bulletin_store::status::gather(&pool).await {
-        Ok(report) => publish_gauges(&report),
+    // Refresh the Prometheus gauges from the same cheap aggregates `debug status` reads, once per
+    // tick — keeps the DB read off the scrape path. A gather failure must not fail the tick.
+    match bulletin_core::status::gather(&pool).await {
+        Ok(report) => metric::publish_gauges(&report),
         Err(e) => tracing::warn!(error = %e, "status gather for metrics failed"),
     }
 
     Ok(())
-}
-
-/// Mirrors the `debug status` aggregates into Prometheus gauges: the "is anything stuck?"
-/// watchpoints (unbuilt events, build lag, due work, per-job-type queue depth). Set on the tick;
-/// the exporter renders the cached values on scrape.
-fn publish_gauges(r: &bulletin_store::status::StatusReport) {
-    metrics::gauge!("bulletin_connections_active").set(r.connections.active as f64);
-    metrics::gauge!("bulletin_events_unbuilt").set(r.events.unbuilt as f64);
-    metrics::gauge!("bulletin_build_lag_seconds").set(r.build.lag_secs as f64);
-    metrics::gauge!("bulletin_subscribers_due").set(r.subscribers.due_now as f64);
-    if let Some(queue) = &r.queue {
-        for q in queue {
-            metrics::gauge!("bulletin_queue_depth", "job_type" => q.job_type.clone())
-                .set(q.pending as f64);
-        }
-    }
 }
 
 // ── Monitor wiring ─────────────────────────────────────────────────────
@@ -387,7 +264,7 @@ pub async fn start(pool: PgPool, email: EmailConfig) -> Result<()> {
             WorkerBuilder::new("bulletin-poll-connection")
                 .backend(storage)
                 .data(pool)
-                .build(handle_poll_connection)
+                .build(poll_connection)
         })
         .register(move |_| {
             let pool = pool_build.clone();
@@ -395,7 +272,7 @@ pub async fn start(pool: PgPool, email: EmailConfig) -> Result<()> {
             WorkerBuilder::new("bulletin-public-build")
                 .backend(storage)
                 .data(pool)
-                .build(handle_public_build)
+                .build(public_build)
         })
         .register(move |_| {
             let pool = pool_digest.clone();
@@ -405,7 +282,7 @@ pub async fn start(pool: PgPool, email: EmailConfig) -> Result<()> {
                 .backend(storage)
                 .data(pool)
                 .data(email)
-                .build(handle_generate_digest)
+                .build(generate_digest)
         })
         .run()
         .await

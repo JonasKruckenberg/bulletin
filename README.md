@@ -60,15 +60,26 @@ The defaults are dogfood-ready: it provisions a local PostgreSQL `bulletin` db +
 old instance running rather than starting a half-migrated binary.
 
 Options: `database.createLocally` / `database.url`, `http.addr`, `metrics.addr`,
-`log.format` / `log.level`, `email.transport` / `email.from` / `email.smtpUrlFile`,
+`log.format` / `log.level`, `email.transport` / `email.from` / `email.smtpSecretFile`,
 `openFirewall`.
 
-### Real email later (Mail Plus has no token SMTP)
+### Real email (Proton SMTP submission)
 
-Stay on `file` transport until you have a sending path. When you do, drop an agenix secret
-containing one line `BULLETIN_SMTP_URL=smtp://user:pass@host:587`, point `email.smtpUrlFile`
-at it (loaded via systemd `EnvironmentFile`, never in the Nix store), and set
-`email.transport = "smtp"`.
+The `file` transport is the default and needs no external service. For real delivery, Proton
+Mail Plus (and Unlimited) support SMTP submission with an SMTP token on a **custom-domain**
+address — no Proton Bridge process required. Generate a token at Settings → IMAP/SMTP → SMTP
+tokens, then drop an agenix secret containing:
+
+```
+BULLETIN_SMTP_HOST=smtp.protonmail.ch
+BULLETIN_SMTP_USERNAME=bulletin@your.domain
+BULLETIN_SMTP_PASSWORD=<the SMTP token>
+```
+
+Point `email.smtpSecretFile` at it (loaded via systemd `EnvironmentFile`, never in the Nix
+store), set `email.from` to the same custom-domain address, and set `email.transport = "smtp"`.
+The transport enforces TLS (STARTTLS on 587 by default, or `BULLETIN_SMTP_TLS=implicit` for
+465), so the token is never sent in cleartext.
 
 ## Build cache
 

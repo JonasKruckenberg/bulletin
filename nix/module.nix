@@ -5,8 +5,8 @@
 # Single `bulletin all` process (HTTP health server + background worker) plus a oneshot migration
 # unit that runs before it. Provisions a local PostgreSQL DB with unix-socket peer auth by default
 # (no passwords anywhere). Logs JSON to stdout → journald (for Alloy → Loki) and exposes a
-# Prometheus exporter. The optional SMTP credential is fed via systemd `EnvironmentFile`, so a
-# secret (e.g. an agenix file `BULLETIN_SMTP_URL=…`) never lands in the Nix store.
+# Prometheus exporter. The optional SMTP credentials are fed via systemd `EnvironmentFile`, so the
+# secret (e.g. an agenix file with `BULLETIN_SMTP_PASSWORD=…`) never lands in the Nix store.
 self:
 {
   config,
@@ -152,15 +152,28 @@ in
         default = "bulletin@localhost";
         description = "From address for digest emails.";
       };
-      smtpUrlFile = lib.mkOption {
+      smtpSecretFile = lib.mkOption {
         type = lib.types.nullOr lib.types.path;
         default = null;
         example = "/run/agenix/bulletin-smtp";
         description = ''
-          Path to a root-readable env file (e.g. an agenix secret) containing a single line
-          `BULLETIN_SMTP_URL=smtp://user:pass@host:587`. Loaded via systemd `EnvironmentFile`
-          (read as root before the service drops to the bulletin user), so it never enters the
-          Nix store. Required when `email.transport = "smtp"`.
+          Path to a root-readable env file (e.g. an agenix secret) holding the SMTP credentials,
+          one `KEY=value` per line. Loaded via systemd `EnvironmentFile` (read as root before the
+          service drops to the bulletin user), so it never enters the Nix store. Required when
+          `email.transport = "smtp"`.
+
+          Recognized keys: `BULLETIN_SMTP_HOST`, `BULLETIN_SMTP_USERNAME`,
+          `BULLETIN_SMTP_PASSWORD` (required), and optionally `BULLETIN_SMTP_PORT` /
+          `BULLETIN_SMTP_TLS` (`starttls` | `implicit`). For a Proton custom domain on Mail Plus:
+
+          ```
+          BULLETIN_SMTP_HOST=smtp.protonmail.ch
+          BULLETIN_SMTP_USERNAME=bulletin@your.domain
+          BULLETIN_SMTP_PASSWORD=<SMTP token from Settings → IMAP/SMTP → SMTP tokens>
+          ```
+
+          (host/username may also be set non-secret via `email.from` and the service
+          `environment`; only `BULLETIN_SMTP_PASSWORD` truly needs to be a secret.)
         '';
       };
     };
@@ -179,8 +192,8 @@ in
         message = "services.bulletin: set database.url when database.createLocally = false.";
       }
       {
-        assertion = cfg.email.transport != "smtp" || cfg.email.smtpUrlFile != null;
-        message = ''services.bulletin: email.transport = "smtp" requires email.smtpUrlFile.'';
+        assertion = cfg.email.transport != "smtp" || cfg.email.smtpSecretFile != null;
+        message = ''services.bulletin: email.transport = "smtp" requires email.smtpSecretFile.'';
       }
     ];
 
@@ -268,8 +281,8 @@ in
           # Mark the unit failed if /health doesn't come up → deploy-rs (or any rollback) reverts.
           ExecStartPost = "${pkgs.curl}/bin/curl --fail --silent --max-time 5 --retry 15 --retry-delay 1 --retry-connrefused http://${cfg.http.addr}/health";
         }
-        // lib.optionalAttrs (cfg.email.smtpUrlFile != null) {
-          EnvironmentFile = [ cfg.email.smtpUrlFile ];
+        // lib.optionalAttrs (cfg.email.smtpSecretFile != null) {
+          EnvironmentFile = [ cfg.email.smtpSecretFile ];
         };
     };
   };

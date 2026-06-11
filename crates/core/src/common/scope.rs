@@ -1,10 +1,8 @@
-use crate::id::Id;
 use serde::{Deserialize, Serialize};
-
-pub struct Subscriber;
+use uuid::Uuid;
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Scope {
     Public,
-    Private(Id<Subscriber>),
+    Private(Uuid),
 }
