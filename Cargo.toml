@@ -2,8 +2,6 @@
 resolver = "2"
 members = [
     "crates/core",
-    "crates/store",
-    "crates/connectors",
     "crates/bulletin",
 ]
 
@@ -25,7 +23,6 @@ sha2        = "0.10"
 ulid        = "1"  # read enqueue time from the apalis TaskId for job wait/run timing
 clap        = { version = "4", features = ["derive", "env"] }
 axum        = "0.7"
-tower-http  = { version = "0.5", features = ["trace"] }
 sqlx        = { version = "0.8", features = ["postgres", "uuid", "chrono", "runtime-tokio"] }
 cron        = "0.16"
 apalis          = { version = "=1.0.0-rc.9" }

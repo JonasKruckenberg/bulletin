@@ -1,8 +1,5 @@
-use bulletin_core::{
-    connector::{Batch, Connection, SourceError},
-    event::EventBuilder,
-    kind::{ContentKind, SourceKind},
-};
+use crate::common::{event::EventBuilder, kind::SourceKind};
+use crate::ingest::{Batch, Connection, SourceError};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::io::BufReader;
@@ -163,7 +160,6 @@ impl Connection for RssConnection {
             event_time,
             item.title,
             item.id, // group_key = stable_id: each article is its own cluster
-            ContentKind::Longform,
         )
         .links(links)]
     }

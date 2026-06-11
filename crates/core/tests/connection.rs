@@ -1,9 +1,8 @@
-use bulletin_core::kind::SourceKind;
-use bulletin_store::{
-    connect,
-    connection::{advance_cursor, due_connections, load_connection, record_failure},
-    migrate,
+use bulletin_core::ingest::store::{
+    advance_cursor, due_connections, load_connection, record_failure,
 };
+use bulletin_core::kind::SourceKind;
+use bulletin_core::{connect, migrate};
 use serde_json::json;
 use testcontainers::{runners::AsyncRunner, ImageExt};
 use testcontainers_modules::postgres::Postgres;

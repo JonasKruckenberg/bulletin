@@ -1,8 +1,11 @@
-use bulletin_core::{
-    cluster::{Cluster, ClusterRollup},
-    id::Id,
+//! The PublicBuild store contract: the build watermark, the dirty-group scan, and the cluster
+//! upsert. Durable state is the events; the `cluster` rows and `build_watermark` are a rebuildable
+//! cache this advances.
+
+use crate::cluster::ClusterRollup;
+use crate::common::{
+    event::{from_row, Event},
     kind::SourceKind,
-    select::Candidate,
 };
 use chrono::{DateTime, Utc};
 use sqlx::{postgres::PgRow, PgExecutor, Row};
@@ -48,12 +51,7 @@ pub async fn dirty_public_groups(
     )
     .bind(lo)
     .bind(hi)
-    .try_map(|row: PgRow| {
-        let source: String = row.get("source");
-        let source = SourceKind::try_from(source.as_str())
-            .map_err(|_| sqlx::Error::Decode(format!("unknown source kind: {source}").into()))?;
-        Ok((source, row.get::<String, _>("group_key")))
-    })
+    .try_map(|row: PgRow| Ok((row.try_get("source")?, row.get::<String, _>("group_key"))))
     .fetch_all(executor)
     .await
 }
@@ -65,7 +63,7 @@ pub async fn upsert_cluster(
     source: SourceKind,
     group_key: &str,
     r: &ClusterRollup,
-) -> Result<Id<Cluster>, sqlx::Error> {
+) -> Result<Uuid, sqlx::Error> {
     let row = sqlx::query(
         "INSERT INTO cluster (source, group_key, title, link, last_event_time, updated_at)
          VALUES ($1, $2, $3, $4, $5, now())
@@ -76,14 +74,14 @@ pub async fn upsert_cluster(
             updated_at = now()
          RETURNING id",
     )
-    .bind(source.as_str())
+    .bind(source)
     .bind(group_key)
     .bind(&r.title)
     .bind(r.link.as_deref())
     .bind(r.last_event_time)
     .fetch_one(executor)
     .await?;
-    Ok(Id::new(row.get("id")))
+    Ok(row.get("id"))
 }
 
 /// Advances the build watermark to `hwm` (monotonic via GREATEST).
@@ -115,67 +113,25 @@ pub async fn unbuilt_public_events_exist(
     Ok(row.get("dirty"))
 }
 
-/// Human-readable identity (source, title) of a cluster — the display half of a selection
-/// `Decision`, which carries only the id.
-pub struct ClusterDisplay {
-    pub id: Uuid,
-    pub source: SourceKind,
-    pub title: String,
-}
-
-/// Display fields for a set of clusters by id, for `debug digest-explain` to pair each
-/// selection verdict with a human-readable cluster. Order is unspecified — callers index by id.
-pub async fn cluster_display(
+/// Loads every public event in one within-source group `(source, group_key)`, ordered by
+/// `(event_time, id)` so the pure `rollup` is deterministic. The build's drain-read over the
+/// event log — called once per dirty group.
+pub async fn list_public_group_events(
     executor: impl PgExecutor<'_>,
-    ids: &[Uuid],
-) -> Result<Vec<ClusterDisplay>, sqlx::Error> {
-    sqlx::query("SELECT id, source, title FROM cluster WHERE id = ANY($1)")
-        .bind(ids)
-        .try_map(|row: PgRow| {
-            let source: String = row.get("source");
-            let source = SourceKind::try_from(source.as_str()).map_err(|_| {
-                sqlx::Error::Decode(format!("unknown source kind: {source}").into())
-            })?;
-            Ok(ClusterDisplay {
-                id: row.get("id"),
-                source,
-                title: row.get("title"),
-            })
-        })
-        .fetch_all(executor)
-        .await
-}
-
-/// Clusters that received a new event (by ingest_time) in `(last_run, window_end]` — the
-/// digest's candidate set. Carries the M1 relevance stub (1.0). Ordered newest-first; the pure
-/// `select()` applies the floor and cap. `last_run = None` ⇒ unbounded lower edge.
-pub async fn candidates_in_window(
-    executor: impl PgExecutor<'_>,
-    last_run: Option<DateTime<Utc>>,
-    window_end: DateTime<Utc>,
-) -> Result<Vec<Candidate>, sqlx::Error> {
+    source: SourceKind,
+    group_key: &str,
+) -> Result<Vec<Event>, sqlx::Error> {
     sqlx::query(
-        "SELECT c.id, c.last_event_time
-         FROM cluster c
-         WHERE EXISTS (
-             SELECT 1 FROM event e
-             WHERE e.scope_kind = 'public'
-               AND e.source = c.source
-               AND e.group_key = c.group_key
-               AND e.ingest_time > COALESCE($1, '-infinity'::timestamptz)
-               AND e.ingest_time <= $2
-         )
-         ORDER BY c.last_event_time DESC",
+        "SELECT id, fingerprint, source, scope_kind, scope_subscriber_id,
+                event_time, title, body, links, group_key, entities,
+                severity_hint, ingest_time, raw
+         FROM event
+         WHERE scope_kind = 'public' AND source = $1 AND group_key = $2
+         ORDER BY event_time, id",
     )
-    .bind(last_run)
-    .bind(window_end)
-    .try_map(|row: PgRow| {
-        Ok(Candidate {
-            cluster_id: Id::new(row.get("id")),
-            last_event_time: row.get("last_event_time"),
-            relevance: 1.0, // M1 stub — M4 fills this in
-        })
-    })
+    .bind(source)
+    .bind(group_key)
+    .try_map(from_row)
     .fetch_all(executor)
     .await
 }

@@ -2,23 +2,18 @@
 //! candidate-window query, the PublicBuild → GenerateDigest dependency gate, and the digest
 //! delivery lifecycle. Mirrors the orchestration in the `bulletin` binary against a real Postgres.
 
-use bulletin_core::{
-    cluster::rollup,
-    event::EventBuilder,
-    kind::{ContentKind, SourceKind},
-    scope::Scope,
-    select::{select, Selection},
+use bulletin_core::cluster::store::{
+    advance_build_watermark, build_bounds, dirty_public_groups, list_public_group_events,
+    upsert_cluster,
 };
-use bulletin_store::{
-    cluster::{
-        advance_build_watermark, build_bounds, candidates_in_window, dirty_public_groups,
-        upsert_cluster,
-    },
-    connect,
-    digest::{create_with_items, mark_delivered, render_items},
-    event::{insert_event, list_public_group_events},
-    migrate,
-    subscriber::{due_subscribers, insert_subscriber, load_subscriber},
+use bulletin_core::digest::select::{select, Verdict};
+use bulletin_core::digest::store::{
+    candidates_in_window, create_with_items, mark_delivered, render_items,
+};
+use bulletin_core::digest::subscriber::{due_subscribers, insert_subscriber, load_subscriber};
+use bulletin_core::ingest::store::insert_event;
+use bulletin_core::{
+    cluster::rollup, connect, event::EventBuilder, kind::SourceKind, migrate, scope::Scope,
 };
 use chrono::{Duration, TimeZone, Utc};
 use sqlx::{PgPool, Row};
@@ -46,7 +41,6 @@ async fn insert_public(pool: &PgPool, stable_id: &str, group_key: &str, title: &
         Utc.timestamp_opt(secs, 0).single().unwrap(),
         title,
         group_key,
-        ContentKind::Longform,
     )
     .links(vec![format!("https://example.com/{stable_id}")])
     .finalize(Scope::Public);
@@ -103,11 +97,11 @@ async fn build_groups_events_into_clusters() {
     assert_eq!(candidates.len(), 3);
 
     // Pure selection caps and orders newest-first.
-    let cfg = Selection {
-        relevance_floor: 0.0,
-        max_items: 2,
-    };
-    assert_eq!(select(candidates, &cfg).len(), 2);
+    let selected = select(candidates, 2)
+        .into_iter()
+        .filter(|d| matches!(d.verdict, Verdict::Selected { .. }))
+        .count();
+    assert_eq!(selected, 2);
 }
 
 // Re-building a dirtied group upserts the same cluster row in place, never a duplicate.
@@ -176,11 +170,11 @@ async fn digest_delivery_and_idempotency() {
     let candidates = candidates_in_window(&pool, sub.last_run_at, window_end)
         .await
         .unwrap();
-    let cfg = Selection {
-        relevance_floor: 0.0,
-        max_items: sub.max_items as usize,
-    };
-    let selected = select(candidates, &cfg);
+    let selected: Vec<_> = select(candidates, sub.max_items as usize)
+        .into_iter()
+        .filter(|d| matches!(d.verdict, Verdict::Selected { .. }))
+        .map(|d| d.cluster_id)
+        .collect();
     assert_eq!(selected.len(), 2);
 
     let digest = create_with_items(&pool, sub_id, window_start, window_end, &selected)
