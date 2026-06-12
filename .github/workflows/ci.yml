@@ -21,11 +21,16 @@ jobs:
 
       - uses: DeterminateSystems/nix-installer-action@v14
 
-      - uses: cachix/cachix-action@v15
+      - uses: nix-community/cache-nix-action@v7
         with:
-          name: bulletin
-          authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
-        continue-on-error: true
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 5G
+          purge: true
+          purge-prefixes: nix-${{ runner.os }}-
+          purge-last-accessed: P7D
+
+      - uses: Swatinem/rust-cache@v2
 
       - run: nix develop --command cargo fmt --all --check
 

@@ -210,6 +210,7 @@ in
 
     services.postgresql = lib.mkIf cfg.database.createLocally {
       enable = true;
+      package = lib.mkDefault pkgs.postgresql_18;
       ensureDatabases = [ dbName ];
       ensureUsers = [
         {
