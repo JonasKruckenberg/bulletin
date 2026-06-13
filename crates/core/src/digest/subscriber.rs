@@ -171,6 +171,16 @@ pub async fn list_subscribers(pool: &PgPool) -> Result<Vec<SubscriberRow>, sqlx:
     .await
 }
 
+/// Deletes a subscriber by id, returning whether a row was removed. Their digests cascade
+/// (digest.subscriber_id is ON DELETE CASCADE), so this also clears their digest history.
+pub async fn delete_subscriber(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM subscriber WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 pub async fn load_subscriber(
     pool: &PgPool,
     id: Uuid,
