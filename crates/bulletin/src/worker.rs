@@ -51,13 +51,15 @@ pub struct GenerateDigestJob {
 
 /// A verified webhook delivery, taken off the HTTP edge for off-request-path processing. Carries the
 /// raw body plus the two header values the body itself doesn't hold: the activity `event_type` and
-/// the `delivery_id` (also the enqueue idempotency key — GitHub retries on a non-2xx).
+/// the `delivery_id` (also the enqueue idempotency key — GitHub retries on a non-2xx). `body` is the
+/// JSON text, not `Vec<u8>`: apalis stores job args as JSON, where a byte vec balloons into an
+/// integer array — and a verified GitHub delivery is UTF-8 JSON anyway.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessWebhookJob {
     pub source: SourceKind,
     pub event_type: String,
     pub delivery_id: String,
-    pub raw_body: Vec<u8>,
+    pub body: String,
 }
 
 // ── Job instrumentation ────────────────────────────────────────────────
@@ -110,7 +112,7 @@ async fn poll_connection(
                 source,
                 inserted,
                 deduplicated,
-            }) => metric::poll_result(source.as_str(), inserted, deduplicated),
+            }) => metric::ingest_result(source.as_str(), "poll", inserted, deduplicated),
             Ok(PollOutcome::Failed { source }) => metric::poll_failed(source.as_str()),
             Ok(PollOutcome::Skipped) => {}
             Err(e) => return Err(format!("{e:#}").into()),
@@ -121,8 +123,9 @@ async fn poll_connection(
 }
 
 /// Process one verified webhook delivery: resolve our connection, normalize, append (or apply a
-/// lifecycle status change). Reuses `poll_result` for the ingest counters — a webhook-ingested event
-/// is "events ingested for this source" just as a polled one is.
+/// lifecycle status change). The ingest counters carry `intake = "webhook"` so the realtime path is
+/// distinguishable from the poll backstop — the health signal behind M2's "drop the webhook, the
+/// poll still recovers it" guarantee.
 async fn process_webhook(
     job: ProcessWebhookJob,
     task_id: TaskId<Ulid>,
@@ -135,7 +138,7 @@ async fn process_webhook(
             job.source,
             &job.event_type,
             &job.delivery_id,
-            &job.raw_body,
+            job.body.as_bytes(),
         )
         .await
         {
@@ -143,7 +146,7 @@ async fn process_webhook(
                 source,
                 inserted,
                 deduplicated,
-            }) => metric::poll_result(source.as_str(), inserted, deduplicated),
+            }) => metric::ingest_result(source.as_str(), "webhook", inserted, deduplicated),
             Ok(WebhookOutcome::Lifecycle { .. })
             | Ok(WebhookOutcome::Unrouted { .. })
             | Ok(WebhookOutcome::Skipped) => {}

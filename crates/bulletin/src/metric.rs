@@ -59,11 +59,19 @@ pub fn job_retried(job: &'static str) {
     metrics::counter!("bulletin_job_retries_total", "job" => job).increment(1);
 }
 
-/// One connection poll: how many events were newly ingested vs collapsed as duplicates.
-pub fn poll_result(source: &'static str, inserted: usize, deduplicated: usize) {
-    metrics::counter!("bulletin_events_ingested_total", "source" => source)
+/// One ingest pass: how many events were newly appended vs collapsed as duplicates, labelled by
+/// `intake` ("poll" | "webhook") so the realtime path and the reconciliation backstop are
+/// distinguishable — a webhook path that's gone quiet (everything arriving via "poll") is the signal
+/// behind M2's "drop the webhook, the poll still recovers it" guarantee.
+pub fn ingest_result(
+    source: &'static str,
+    intake: &'static str,
+    inserted: usize,
+    deduplicated: usize,
+) {
+    metrics::counter!("bulletin_events_ingested_total", "source" => source, "intake" => intake)
         .increment(inserted as u64);
-    metrics::counter!("bulletin_events_deduplicated_total", "source" => source)
+    metrics::counter!("bulletin_events_deduplicated_total", "source" => source, "intake" => intake)
         .increment(deduplicated as u64);
 }
 
