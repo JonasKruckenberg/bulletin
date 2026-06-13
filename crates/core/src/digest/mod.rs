@@ -2,6 +2,7 @@
 //! cache, select by recency, freeze the selection, render, and deliver — advancing the subscriber's
 //! schedule on delivery. A pure read of the materialization side's snapshot (design §3.0, §9.4).
 
+mod greeting;
 mod render;
 pub mod select;
 pub mod store;
@@ -136,12 +137,20 @@ pub async fn generate(
         return Ok(DigestOutcome::Empty);
     }
 
+    // A warm lead keyed to the subscriber's local time-of-day and cadence; seeded from the digest's
+    // identity so a re-render of this same window yields the same line.
+    let greeting = greeting::greeting(
+        sub.digest_time,
+        sub.recurrence,
+        greeting::seed_for(sub.id, window_end),
+    );
     let message = render::render(
         mailer.from(),
         &sub.email,
         window_end,
         &sub.timezone,
         &items,
+        &greeting,
         content,
     )?;
     mailer.send(message).await?;
@@ -180,12 +189,21 @@ pub async fn dispatch_now(
         return Ok(DigestOutcome::Empty);
     }
     // The rendered date header uses now() — this digest isn't tied to a scheduled boundary.
+    let now = Utc::now();
+    // The greeting still reflects the subscriber's *preferred* local time-of-day and cadence, so a
+    // preview reads like the real thing regardless of when the dispatch is run.
+    let greeting = greeting::greeting(
+        sub.digest_time,
+        sub.recurrence,
+        greeting::seed_for(sub.id, now),
+    );
     let message = render::render(
         mailer.from(),
         &sub.email,
-        Utc::now(),
+        now,
         &sub.timezone,
         &items,
+        &greeting,
         content,
     )?;
     mailer.send(message).await?;

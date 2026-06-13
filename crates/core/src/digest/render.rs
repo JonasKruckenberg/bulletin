@@ -18,11 +18,12 @@ pub trait Mailer {
     fn send(&self, message: Message) -> impl std::future::Future<Output = Result<()>> + Send;
 }
 
-/// The configurable, non-item content of a digest email — everything that isn't the item list.
-/// Lets the caller supply the brand, masthead title, and footer (e.g. from config) instead of
-/// baking them into the renderer, so the same layout can be re-skinned without touching this
-/// module. The `summary` / `item_*` fields are stand-ins for reference-design sections the data
-/// model doesn't feed yet; their defaults are lorem-ipsum and they're HTML-marked for removal.
+/// The configurable, non-item content of a digest email — everything that isn't the item list or
+/// the per-digest greeting. Lets the caller supply the brand, masthead title, and footer (e.g. from
+/// config) instead of baking them into the renderer, so the same layout can be re-skinned without
+/// touching this module. The `summary` / `item_*` fields are stand-ins for reference-design
+/// sections the data model doesn't feed yet; their defaults are lorem-ipsum and they're HTML-marked
+/// for removal.
 #[derive(Clone, Copy)]
 pub struct DigestContent<'a> {
     /// Small-caps brand label at the very top, and the subject-line prefix (e.g. "Bulletin").
@@ -31,7 +32,8 @@ pub struct DigestContent<'a> {
     pub title: &'a str,
     /// Footer note rendered beneath the items.
     pub footer: &'a str,
-    /// The "big picture" lead under the masthead. **Placeholder** until the digest produces one.
+    /// The "big picture" summary that follows the greeting in the lead. **Placeholder** until the
+    /// digest produces one.
     pub summary: &'a str,
     /// Per-item category label (e.g. "Geopolitics/Diplomacy"). **Placeholder** until items carry one.
     pub item_category: &'a str,
@@ -69,6 +71,7 @@ pub(crate) fn render(
     window_end: DateTime<Utc>,
     timezone: &str,
     items: &[RenderItem],
+    greeting: &str,
     content: &DigestContent<'_>,
 ) -> Result<Message> {
     let plural = if items.len() == 1 { "" } else { "s" };
@@ -78,8 +81,8 @@ pub(crate) fn render(
     // they actually receive it. An unparseable name can't reach here (the DB rejects it on
     // signup/update), but fall back to UTC rather than panic if one ever does.
     let tz: Tz = timezone.parse().unwrap_or(Tz::UTC);
-    let plain = render_plain(window_end, tz, items);
-    let html = render_html(window_end, tz, items, content);
+    let plain = render_plain(window_end, tz, greeting, items);
+    let html = render_html(window_end, tz, greeting, items, content);
 
     Message::builder()
         .from(
@@ -128,9 +131,9 @@ pub(crate) fn render_empty(
 
 /// Plaintext fallback: a numbered list of items (title, link, source, time). Kept deliberately
 /// plain — this is what HTML-averse clients and screen-reader-friendly setups fall back to.
-fn render_plain(window_end: DateTime<Utc>, tz: Tz, items: &[RenderItem]) -> String {
+fn render_plain(window_end: DateTime<Utc>, tz: Tz, greeting: &str, items: &[RenderItem]) -> String {
     let mut body = format!(
-        "Your digest for the window ending {}\n\n",
+        "{greeting}\n\nYour digest for the window ending {}\n\n",
         window_end.with_timezone(&tz).format("%Y-%m-%d %H:%M %Z")
     );
     for (i, item) in items.iter().enumerate() {
@@ -176,11 +179,12 @@ const SERIF: &str = "Georgia, 'Times New Roman', serif";
 const SANS: &str = "'Helvetica Neue', Helvetica, Arial, sans-serif";
 
 /// HTML view: a centered editorial card on warm paper — a small-caps brand label, a serif
-/// masthead, a `── date ──` rule, a "big picture" lead, then the selected items as a ruled list
-/// (a terracotta number, the headline link, a category, a summary, and a source · time caption),
-/// closed by a rule and footer.
+/// masthead, a `── date ──` rule, a short time-of-day greeting lead, then the selected items as a
+/// ruled list (a terracotta number, the headline link, a category, a summary, and a source · time
+/// caption), closed by a rule and footer.
 ///
-/// Sections the data model doesn't feed yet (the lead, per-item category/summary) render
+/// The greeting stands in for the reference design's "big picture" summary until the digest
+/// produces a real one. Per-item sections the data model doesn't feed yet (category/summary) render
 /// parametric lorem-ipsum placeholders wrapped in `<!-- PLACEHOLDER … -->`; the source · time
 /// caption is debug-only and wrapped in `<!-- DEBUG … -->` — both are easy to grep out later.
 ///
@@ -190,6 +194,7 @@ const SANS: &str = "'Helvetica Neue', Helvetica, Arial, sans-serif";
 fn render_html(
     window_end: DateTime<Utc>,
     tz: Tz,
+    greeting: &str,
     items: &[RenderItem],
     content: &DigestContent<'_>,
 ) -> String {
@@ -199,6 +204,7 @@ fn render_html(
     let preheader = format!("{count} new item{plural} in your digest");
     let brand = escape(content.brand);
     let title = escape(content.title);
+    let greeting = escape(greeting);
     let summary = escape(content.summary);
     let footer = escape(content.footer);
 
@@ -237,10 +243,9 @@ fn render_html(
 <div style="font-family:{SANS};font-size:12px;font-weight:600;letter-spacing:0.12em;text-transform:uppercase;color:{INK_MUTED};text-align:center;">{brand}</div>
 <h1 style="margin:18px 0 30px 0;font-family:{SERIF};font-size:34px;font-weight:700;line-height:1.25;color:{INK};text-align:center;">{title}</h1>
 {date_rule}
-<!-- PLACEHOLDER: "big picture" lead — remove or replace once the digest produces a real summary -->
 <div style="font-family:{SERIF};font-size:15px;font-style:italic;font-weight:700;color:{ACCENT};margin:34px 0 12px 0;">The big picture</div>
-<div style="font-family:{SERIF};font-size:17px;line-height:1.75;color:{INK_BODY};margin:0;">{summary}</div>
-<!-- /PLACEHOLDER -->
+<!-- Lead: a time-of-day greeting (real) opens the paragraph, then the "big picture" summary. -->
+<div style="font-family:{SERIF};font-size:17px;line-height:1.75;color:{INK_BODY};margin:0;"><strong style="color:{INK};font-weight:700;">{greeting}</strong> <!-- PLACEHOLDER: "big picture" summary — remove or replace once the digest produces a real one -->{summary}<!-- /PLACEHOLDER --></div>
 <div style="font-family:{SERIF};font-size:15px;font-style:italic;font-weight:700;color:{ACCENT};margin:40px 0 0 0;">In this digest &middot; {count} item{plural}</div>
 </td>
 </tr>
@@ -439,6 +444,7 @@ mod tests {
         let html = render_html(
             Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
             Tz::UTC,
+            "Good morning — here's your daily digest.",
             &items,
             &DigestContent::default(),
         );
@@ -463,6 +469,7 @@ mod tests {
         let html = render_html(
             Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
             Tz::UTC,
+            "Good morning — here's your daily digest.",
             &items,
             &DigestContent::default(),
         );
@@ -491,15 +498,24 @@ mod tests {
         let html = render_html(
             Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
             Tz::UTC,
+            "GREETING_TEXT",
             &items,
             &content,
         );
 
+        // The greeting opens the lead as real (non-placeholder) content, ahead of the summary.
+        assert!(html.contains("GREETING_TEXT"));
+        let greeting_at = html.find("GREETING_TEXT").unwrap();
+        let summary_at = html.find("BIG_PICTURE_TEXT").unwrap();
+        assert!(
+            greeting_at < summary_at,
+            "greeting must precede the summary"
+        );
         // Parametric placeholder content renders...
         assert!(html.contains("BIG_PICTURE_TEXT"));
         assert!(html.contains("CAT_TEXT"));
         assert!(html.contains("ITEM_SUMMARY_TEXT"));
-        // ...inside grep-able markers for later removal/replacement.
+        // ...inside grep-able markers for later removal/replacement (summary + category + item).
         assert_eq!(html.matches("<!-- PLACEHOLDER:").count(), 3);
         assert!(html.contains("<!-- DEBUG: source + timestamp"));
         assert!(html.contains("<!-- /DEBUG -->"));
@@ -517,6 +533,7 @@ mod tests {
         let html = render_html(
             Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
             Tz::UTC,
+            "Good morning — here's your daily digest.",
             &items,
             &content,
         );
@@ -533,9 +550,12 @@ mod tests {
         let plain = render_plain(
             Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
             Tz::UTC,
+            "Good morning — here's your daily digest.",
             &items,
         );
 
+        // The greeting opens the plaintext fallback, ahead of the item list.
+        assert!(plain.starts_with("Good morning — here's your daily digest."));
         assert!(plain.contains("1. Hello"));
         assert!(plain.contains("https://example.com"));
         assert!(plain.contains("rss ·"));
