@@ -34,6 +34,9 @@ pub enum DigestOutcome {
     Empty,
     /// Already delivered for this window (idempotent re-run).
     AlreadyDelivered,
+    /// The boundary moved into the future between enqueue and run — a preference change deferred
+    /// this send. Nothing delivered; the next tick fires it at the corrected boundary.
+    NotYetDue,
 }
 
 /// Loads a subscriber and runs the pure selection over its current window — the shared front
@@ -71,6 +74,14 @@ pub async fn generate(
     content: &DigestContent<'_>,
 ) -> Result<DigestOutcome> {
     let (sub, decisions) = plan(pool, subscriber_id).await?;
+
+    // A preference change (timezone/digest_time) can push next_run_at into the future after this
+    // job was enqueued for the old, due boundary. Don't deliver early: bail and let the next tick
+    // fire it at the corrected boundary. This is what makes update_preferences safe mid-flight.
+    if sub.next_run_at > Utc::now() {
+        return Ok(DigestOutcome::NotYetDue);
+    }
+
     let window_end = sub.next_run_at;
     let window_start = sub
         .last_run_at
@@ -98,7 +109,14 @@ pub async fn generate(
         return Ok(DigestOutcome::Empty);
     }
 
-    let message = render::render(mailer.from(), &sub.email, window_end, &items, content)?;
+    let message = render::render(
+        mailer.from(),
+        &sub.email,
+        window_end,
+        &sub.timezone,
+        &items,
+        content,
+    )?;
     mailer.send(message).await?;
     mark_delivered(pool, digest.id, sub.id, window_end)
         .await

@@ -10,15 +10,45 @@ use bulletin_core::digest::select::{select, Verdict};
 use bulletin_core::digest::store::{
     candidates_in_window, create_with_items, mark_delivered, render_items,
 };
-use bulletin_core::digest::subscriber::{due_subscribers, insert_subscriber, load_subscriber};
+use bulletin_core::digest::subscriber::{
+    due_subscribers, insert_subscriber, load_subscriber, update_preferences,
+};
 use bulletin_core::ingest::store::insert_event;
 use bulletin_core::{
     cluster::rollup, connect, event::EventBuilder, kind::SourceKind, migrate, scope::Scope,
 };
-use chrono::{Duration, TimeZone, Utc};
+use chrono::{Duration, NaiveTime, TimeZone, Utc};
 use sqlx::{PgPool, Row};
 use testcontainers::{runners::AsyncRunner, ImageExt};
 use testcontainers_modules::postgres::Postgres;
+use uuid::Uuid;
+
+/// 09:00 — the default local digest time, spelled out for test readability.
+fn nine_am() -> NaiveTime {
+    NaiveTime::from_hms_opt(9, 0, 0).unwrap()
+}
+
+/// Force a freshly-inserted subscriber due *now*. Signup schedules the first digest at the next
+/// local digest time (in the future); delivery-path tests want it immediately due.
+async fn force_due(pool: &PgPool, id: Uuid) {
+    sqlx::query("UPDATE subscriber SET next_run_at = now() WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// The next_run_at's local time-of-day in `tz`, read back through Postgres (avoids a chrono-tz
+/// test dependency) — used to assert a digest landed at the chosen wall-clock hour.
+async fn local_run_time(pool: &PgPool, id: Uuid, tz: &str) -> NaiveTime {
+    sqlx::query("SELECT (next_run_at AT TIME ZONE $2)::time AS lt FROM subscriber WHERE id = $1")
+        .bind(id)
+        .bind(tz)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .get("lt")
+}
 
 async fn setup() -> (PgPool, testcontainers::ContainerAsync<Postgres>) {
     let pg = Postgres::default()
@@ -134,7 +164,10 @@ async fn digest_waits_for_public_build() {
     let (pool, _pg) = setup().await;
 
     insert_public(&pool, "a", "a", "Pre-existing", 100).await;
-    let sub_id = insert_subscriber(&pool, "me@example.com", 1).await.unwrap();
+    let sub_id = insert_subscriber(&pool, "me@example.com", 1, "UTC", nine_am())
+        .await
+        .unwrap();
+    force_due(&pool, sub_id).await;
 
     // Due by the clock, but its window has an unbuilt event → not yet selectable.
     let due = due_subscribers(&pool).await.unwrap();
@@ -160,7 +193,10 @@ async fn digest_delivery_and_idempotency() {
 
     insert_public(&pool, "a", "a", "Article A", 100).await;
     insert_public(&pool, "b", "b", "Article B", 200).await;
-    let sub_id = insert_subscriber(&pool, "me@example.com", 1).await.unwrap();
+    let sub_id = insert_subscriber(&pool, "me@example.com", 1, "UTC", nine_am())
+        .await
+        .unwrap();
+    force_due(&pool, sub_id).await;
     build_all(&pool).await;
 
     let sub = load_subscriber(&pool, sub_id).await.unwrap().unwrap();
@@ -198,8 +234,89 @@ async fn digest_delivery_and_idempotency() {
     assert!(again.delivered_at.is_some());
     assert_eq!(render_items(&pool, again.id).await.unwrap().len(), 2);
 
-    // Watermark advanced one interval; the just-delivered boundary is now last_run_at.
+    // Watermark advanced one cadence; the just-delivered boundary is now last_run_at, and
+    // next_run_at snapped to the next 09:00 UTC slot strictly after it (DST-safe wall-clock grid,
+    // not a blind +24h).
     let sub = load_subscriber(&pool, sub_id).await.unwrap().unwrap();
     assert_eq!(sub.last_run_at, Some(window_end));
-    assert_eq!(sub.next_run_at, window_end + Duration::days(1));
+    assert!(sub.next_run_at > window_end);
+    assert!(sub.next_run_at <= window_end + Duration::days(1));
+    assert_eq!(local_run_time(&pool, sub_id, "UTC").await, nine_am());
+}
+
+// Signup schedules the first digest at the next occurrence of the local digest time in the
+// subscriber's own zone — in the future, at the chosen wall-clock hour (not "due immediately").
+#[tokio::test]
+async fn insert_schedules_next_local_digest_time() {
+    let (pool, _pg) = setup().await;
+
+    let id = insert_subscriber(
+        &pool,
+        "ny@example.com",
+        1,
+        "America/New_York",
+        NaiveTime::from_hms_opt(7, 30, 0).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let sub = load_subscriber(&pool, id).await.unwrap().unwrap();
+    assert!(sub.next_run_at > Utc::now(), "first digest is in the future");
+    assert_eq!(
+        local_run_time(&pool, id, "America/New_York").await,
+        NaiveTime::from_hms_opt(7, 30, 0).unwrap(),
+        "lands at the chosen local time-of-day"
+    );
+}
+
+// Updating timezone/digest time reschedules to the next earliest occurrence WITHOUT losing the
+// pending window: last_run_at (the selection lower bound) is untouched, so every event since the
+// last delivery still falls in the next digest — the window only reshapes.
+#[tokio::test]
+async fn update_preferences_snaps_without_losing_window() {
+    let (pool, _pg) = setup().await;
+
+    let id = insert_subscriber(&pool, "t@example.com", 7, "UTC", nine_am())
+        .await
+        .unwrap();
+
+    // A prior delivery establishes a window lower bound that must survive the reschedule.
+    let last = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+    sqlx::query("UPDATE subscriber SET last_run_at = $2 WHERE id = $1")
+        .bind(id)
+        .bind(last)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let changed = update_preferences(
+        &pool,
+        id,
+        "America/New_York",
+        NaiveTime::from_hms_opt(7, 30, 0).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(changed);
+
+    let sub = load_subscriber(&pool, id).await.unwrap().unwrap();
+    // The window lower bound is preserved — nothing lost, nothing replayed.
+    assert_eq!(sub.last_run_at, Some(last));
+    assert_eq!(sub.timezone, "America/New_York");
+    assert_eq!(sub.digest_time, NaiveTime::from_hms_opt(7, 30, 0).unwrap());
+    // Snapped to a future 07:30 New_York slot.
+    assert!(sub.next_run_at > Utc::now());
+    assert!(sub.next_run_at <= Utc::now() + Duration::days(1));
+    assert_eq!(
+        local_run_time(&pool, id, "America/New_York").await,
+        NaiveTime::from_hms_opt(7, 30, 0).unwrap()
+    );
+}
+
+// An unknown IANA zone is rejected by the database rather than silently mis-scheduling.
+#[tokio::test]
+async fn insert_rejects_unknown_timezone() {
+    let (pool, _pg) = setup().await;
+    let err = insert_subscriber(&pool, "bad@example.com", 1, "Mars/Phobos", nine_am()).await;
+    assert!(err.is_err(), "unknown timezone must be rejected");
 }

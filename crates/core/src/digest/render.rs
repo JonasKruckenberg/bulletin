@@ -4,6 +4,7 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 use lettre::{message::MultiPart, Message};
 
 use crate::digest::store::RenderItem;
@@ -66,14 +67,19 @@ pub(crate) fn render(
     from: &str,
     to: &str,
     window_end: DateTime<Utc>,
+    timezone: &str,
     items: &[RenderItem],
     content: &DigestContent<'_>,
 ) -> Result<Message> {
     let plural = if items.len() == 1 { "" } else { "s" };
     let subject = format!("{}: {} new item{plural}", content.brand, items.len());
 
-    let plain = render_plain(window_end, items);
-    let html = render_html(window_end, items, content);
+    // Dates and times are shown in the subscriber's own zone so the masthead date matches when
+    // they actually receive it. An unparseable name can't reach here (the DB rejects it on
+    // signup/update), but fall back to UTC rather than panic if one ever does.
+    let tz: Tz = timezone.parse().unwrap_or(Tz::UTC);
+    let plain = render_plain(window_end, tz, items);
+    let html = render_html(window_end, tz, items, content);
 
     Message::builder()
         .from(
@@ -90,10 +96,10 @@ pub(crate) fn render(
 
 /// Plaintext fallback: a numbered list of items (title, link, source, time). Kept deliberately
 /// plain — this is what HTML-averse clients and screen-reader-friendly setups fall back to.
-fn render_plain(window_end: DateTime<Utc>, items: &[RenderItem]) -> String {
+fn render_plain(window_end: DateTime<Utc>, tz: Tz, items: &[RenderItem]) -> String {
     let mut body = format!(
         "Your digest for the window ending {}\n\n",
-        window_end.format("%Y-%m-%d %H:%M UTC")
+        window_end.with_timezone(&tz).format("%Y-%m-%d %H:%M %Z")
     );
     for (i, item) in items.iter().enumerate() {
         body.push_str(&format!("{}. {}\n", i + 1, item.title));
@@ -103,7 +109,7 @@ fn render_plain(window_end: DateTime<Utc>, items: &[RenderItem]) -> String {
         body.push_str(&format!(
             "   {} · {}\n\n",
             item.source.as_str(),
-            item.last_event_time.format("%Y-%m-%d %H:%M UTC")
+            item.last_event_time.with_timezone(&tz).format("%Y-%m-%d %H:%M %Z")
         ));
     }
     body
@@ -139,12 +145,13 @@ const SANS: &str = "'Helvetica Neue', Helvetica, Arial, sans-serif";
 /// feed-supplied text is HTML-escaped, since it's interpolated into markup.
 fn render_html(
     window_end: DateTime<Utc>,
+    tz: Tz,
     items: &[RenderItem],
     content: &DigestContent<'_>,
 ) -> String {
     let count = items.len();
     let plural = if count == 1 { "" } else { "s" };
-    let date = window_end.format("%A, %B %-d, %Y");
+    let date = window_end.with_timezone(&tz).format("%A, %B %-d, %Y");
     let preheader = format!("{count} new item{plural} in your digest");
     let brand = escape(content.brand);
     let title = escape(content.title);
@@ -162,7 +169,7 @@ fn render_html(
         if i > 0 {
             rows.push_str(&divider);
         }
-        rows.push_str(&render_item_row(item, &category, &item_summary));
+        rows.push_str(&render_item_row(item, tz, &category, &item_summary));
     }
 
     format!(
@@ -246,7 +253,7 @@ fn date_rule(date: &str) -> String {
 /// summary, and the source · time caption. `category` and `item_summary` are pre-escaped
 /// placeholders; the source · time caption is debug-only and marked for later removal. Items are
 /// separated by [`soft_divider`], not a per-item rule.
-fn render_item_row(item: &RenderItem, category: &str, item_summary: &str) -> String {
+fn render_item_row(item: &RenderItem, tz: Tz, category: &str, item_summary: &str) -> String {
     let title = escape(&item.title);
     let headline = match &item.link {
         Some(link) => format!(
@@ -259,7 +266,10 @@ fn render_item_row(item: &RenderItem, category: &str, item_summary: &str) -> Str
     };
 
     let source = escape(item.source.as_str());
-    let time = item.last_event_time.format("%b %-d, %H:%M UTC");
+    let time = item
+        .last_event_time
+        .with_timezone(&tz)
+        .format("%b %-d, %H:%M %Z");
 
     format!(
         r#"<tr>
@@ -327,6 +337,7 @@ mod tests {
         ];
         let html = render_html(
             Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
+            Tz::UTC,
             &items,
             &DigestContent::default(),
         );
@@ -350,6 +361,7 @@ mod tests {
         )];
         let html = render_html(
             Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
+            Tz::UTC,
             &items,
             &DigestContent::default(),
         );
@@ -377,6 +389,7 @@ mod tests {
         };
         let html = render_html(
             Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
+            Tz::UTC,
             &items,
             &content,
         );
@@ -402,6 +415,7 @@ mod tests {
         };
         let html = render_html(
             Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
+            Tz::UTC,
             &items,
             &content,
         );
@@ -415,7 +429,7 @@ mod tests {
     #[test]
     fn plain_fallback_is_unchanged_shape() {
         let items = vec![item("Hello", Some("https://example.com"), SourceKind::Rss)];
-        let plain = render_plain(Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(), &items);
+        let plain = render_plain(Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(), Tz::UTC, &items);
 
         assert!(plain.contains("1. Hello"));
         assert!(plain.contains("https://example.com"));

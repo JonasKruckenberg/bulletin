@@ -31,13 +31,19 @@ pub enum DebugCommand {
         #[arg(long, default_value = "20")]
         limit: i64,
     },
-    /// Seed a subscriber (first digest is due immediately)
+    /// Seed a subscriber (first digest fires at the next local digest time)
     SubscriberAdd {
         #[arg(long)]
         email: String,
         /// Digest cadence in days (1 = daily, 7 = weekly)
         #[arg(long, default_value_t = 1)]
         interval_days: i32,
+        /// IANA timezone the digest time is interpreted in, e.g. America/New_York
+        #[arg(long, default_value = "UTC")]
+        timezone: String,
+        /// Local time-of-day to deliver, HH:MM (24-hour)
+        #[arg(long, default_value = "09:00")]
+        digest_time: String,
     },
     /// List subscribers
     SubscriberList,
@@ -115,11 +121,17 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> R
         DebugCommand::SubscriberAdd {
             email,
             interval_days,
+            timezone,
+            digest_time,
         } => {
             if interval_days < 1 {
                 anyhow::bail!("--interval-days must be >= 1");
             }
-            let id = digest::subscriber::insert_subscriber(pool, &email, interval_days).await?;
+            let digest_time = chrono::NaiveTime::parse_from_str(&digest_time, "%H:%M")
+                .context("--digest-time must be HH:MM (24-hour)")?;
+            let id =
+                digest::subscriber::insert_subscriber(pool, &email, interval_days, &timezone, digest_time)
+                    .await?;
             println!("{id}");
         }
         DebugCommand::SubscriberList => {
@@ -129,10 +141,12 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> R
             }
             for s in rows {
                 println!(
-                    "{}\t{}\tevery {}d\tmax={}\tnext={}\tlast={}",
+                    "{}\t{}\tevery {}d\t{} {}\tmax={}\tnext={}\tlast={}",
                     s.id,
                     s.email,
                     s.interval_days,
+                    s.digest_time.format("%H:%M"),
+                    s.timezone,
                     s.max_items,
                     s.next_run_at.format("%Y-%m-%dT%H:%M:%SZ"),
                     s.last_run_at
