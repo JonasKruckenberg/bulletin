@@ -3,7 +3,7 @@
 //! flow can deliver without knowing about clap, the filesystem, or SMTP.
 
 use anyhow::{Context, Result};
-use bulletin_core::digest::Mailer;
+use bulletin_core::digest::{DigestContent, Mailer};
 use lettre::{
     transport::smtp::authentication::Credentials, AsyncFileTransport, AsyncSmtpTransport,
     AsyncTransport, Message, Tokio1Executor,
@@ -63,6 +63,27 @@ pub struct EmailConfig {
         default_value = "starttls"
     )]
     pub smtp_tls: SmtpTls,
+    /// Small-caps brand label at the top of the digest email.
+    #[arg(
+        long = "email-brand",
+        env = "BULLETIN_EMAIL_BRAND",
+        default_value = "Bulletin"
+    )]
+    pub brand: String,
+    /// Serif masthead title beneath the brand label.
+    #[arg(
+        long = "email-title",
+        env = "BULLETIN_EMAIL_TITLE",
+        default_value = "Your Digest"
+    )]
+    pub title: String,
+    /// Footer note beneath the items.
+    #[arg(
+        long = "email-footer",
+        env = "BULLETIN_EMAIL_FOOTER",
+        default_value = "You're receiving this digest from Bulletin, gathered from the sources you subscribed to."
+    )]
+    pub footer: String,
 }
 
 /// How the SMTP connection is secured. Both require TLS (lettre `Tls::Required` / `Tls::Wrapper`),
@@ -106,6 +127,18 @@ impl EmailConfig {
             from: self.from.clone(),
             transport,
         })
+    }
+
+    /// The digest's configurable chrome, borrowed as the core renderer wants it. The branding
+    /// (brand/title/footer) comes from the flags above; the still-placeholder `summary` / `item_*`
+    /// fields keep their `DigestContent` defaults until the data model feeds them.
+    pub fn content(&self) -> DigestContent<'_> {
+        DigestContent {
+            brand: &self.brand,
+            title: &self.title,
+            footer: &self.footer,
+            ..DigestContent::default()
+        }
     }
 
     /// Builds an authenticated, TLS-enforced SMTP transport from the explicit host/port/creds

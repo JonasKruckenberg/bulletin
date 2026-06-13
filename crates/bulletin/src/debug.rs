@@ -151,7 +151,7 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> R
         },
         DebugCommand::DigestRun { subscriber } => {
             let sender = email.build_sender()?;
-            let outcome = digest::generate(pool, &sender, subscriber).await?;
+            let outcome = digest::generate(pool, &sender, subscriber, &email.content()).await?;
             println!("{outcome:?}");
         }
         DebugCommand::DigestList { limit } => {

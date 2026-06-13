@@ -7,7 +7,7 @@ pub mod select;
 pub mod store;
 pub mod subscriber;
 
-pub use render::Mailer;
+pub use render::{DigestContent, Mailer};
 
 use std::collections::HashMap;
 
@@ -68,6 +68,7 @@ pub async fn generate(
     pool: &PgPool,
     mailer: &impl Mailer,
     subscriber_id: Uuid,
+    content: &DigestContent<'_>,
 ) -> Result<DigestOutcome> {
     let (sub, decisions) = plan(pool, subscriber_id).await?;
     let window_end = sub.next_run_at;
@@ -97,7 +98,7 @@ pub async fn generate(
         return Ok(DigestOutcome::Empty);
     }
 
-    let message = render::render(mailer.from(), &sub.email, window_end, &items)?;
+    let message = render::render(mailer.from(), &sub.email, window_end, &items, content)?;
     mailer.send(message).await?;
     mark_delivered(pool, digest.id, sub.id, window_end)
         .await
