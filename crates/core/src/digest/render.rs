@@ -94,6 +94,38 @@ pub(crate) fn render(
         .context("building digest email")
 }
 
+/// Renders the "nothing to report" digest: the same editorial card, but a cheerful *you're all
+/// caught up* note where the items would go. Sent when a subscriber's window turns up empty —
+/// rare enough that going silent reads as a broken pipeline, so we send a happy little nudge
+/// instead. Same `multipart/alternative` shape and chrome (`content`) as [`render`].
+pub(crate) fn render_empty(
+    from: &str,
+    to: &str,
+    window_end: DateTime<Utc>,
+    timezone: &str,
+    content: &DigestContent<'_>,
+) -> Result<Message> {
+    let subject = format!("{}: you're all caught up", content.brand);
+
+    // Show the window date in the subscriber's own zone, like the item digest does. An
+    // unparseable name can't reach here (the DB rejects it on signup/update); fall back to UTC.
+    let tz: Tz = timezone.parse().unwrap_or(Tz::UTC);
+    let plain = render_empty_plain(window_end, tz);
+    let html = render_empty_html(window_end, tz, content);
+
+    Message::builder()
+        .from(
+            from.parse()
+                .with_context(|| format!("invalid from address: {from}"))?,
+        )
+        .to(to
+            .parse()
+            .with_context(|| format!("invalid to address: {to}"))?)
+        .subject(subject)
+        .multipart(MultiPart::alternative_plain_html(plain, html))
+        .context("building empty digest email")
+}
+
 /// Plaintext fallback: a numbered list of items (title, link, source, time). Kept deliberately
 /// plain — this is what HTML-averse clients and screen-reader-friendly setups fall back to.
 fn render_plain(window_end: DateTime<Utc>, tz: Tz, items: &[RenderItem]) -> String {
@@ -115,6 +147,16 @@ fn render_plain(window_end: DateTime<Utc>, tz: Tz, items: &[RenderItem]) -> Stri
         ));
     }
     body
+}
+
+/// Plaintext fallback for the empty digest: the cheerful counterpart to [`render_plain`].
+fn render_empty_plain(window_end: DateTime<Utc>, tz: Tz) -> String {
+    format!(
+        "You're all caught up!\n\n\
+         No new items in the window ending {}.\n\
+         Nothing needed your attention this time — enjoy the quiet. \u{2728}\n",
+        window_end.with_timezone(&tz).format("%Y-%m-%d %H:%M %Z")
+    )
 }
 
 // --- The editorial palette & type, lifted from the reference digest design. -------------------
@@ -216,6 +258,63 @@ fn render_html(
 "#,
         date_rule = date_rule(&date.to_string()),
         soft_divider = divider,
+    )
+}
+
+/// HTML view of the empty digest: the same warm card, brand label, serif masthead and `── date ──`
+/// rule as [`render_html`], but where the items would be there's a centered, happy *all caught up*
+/// note — a big sparkle, a serif headline, and a reassuring line. No placeholder/debug sections,
+/// since there are no items to stand in for. Same table-based, all-inline-CSS, escape-everything
+/// shape.
+fn render_empty_html(window_end: DateTime<Utc>, tz: Tz, content: &DigestContent<'_>) -> String {
+    let date = window_end.with_timezone(&tz).format("%A, %B %-d, %Y");
+    let preheader = "Nothing new — you're all caught up";
+    let brand = escape(content.brand);
+    let title = escape(content.title);
+    let footer = escape(content.footer);
+
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<meta name="supported-color-schemes" content="light">
+<title>Bulletin digest</title>
+</head>
+<body style="margin:0;padding:0;background-color:{BG};-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%;">
+<div style="display:none;max-height:0;overflow:hidden;opacity:0;mso-hide:all;">{preheader}</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:{BG};">
+<tr>
+<td align="center" style="padding:36px 12px;">
+<table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="width:600px;max-width:100%;background-color:{SURFACE};border:1px solid {BORDER};border-radius:4px;">
+<tr>
+<td style="padding:52px 52px 0 52px;">
+<div style="font-family:{SANS};font-size:12px;font-weight:600;letter-spacing:0.12em;text-transform:uppercase;color:{INK_MUTED};text-align:center;">{brand}</div>
+<h1 style="margin:18px 0 30px 0;font-family:{SERIF};font-size:34px;font-weight:700;line-height:1.25;color:{INK};text-align:center;">{title}</h1>
+{date_rule}
+<div style="text-align:center;padding:46px 8px 18px 8px;">
+<div style="font-size:52px;line-height:1;" aria-hidden="true">&#x2728;</div>
+<div style="margin:24px 0 0 0;font-family:{SERIF};font-size:28px;font-weight:700;line-height:1.3;color:{ACCENT};">You're all caught up</div>
+<div style="margin:14px auto 0 auto;max-width:360px;font-family:{SERIF};font-size:17px;font-style:italic;line-height:1.7;color:{INK_BODY};">No new notifications this time — nothing needed your attention in this window. Sit back and enjoy the calm.</div>
+</div>
+</td>
+</tr>
+{soft_divider}<tr>
+<td style="padding:30px 52px 52px 52px;">
+<div style="font-family:{SANS};font-size:12px;line-height:1.7;color:{INK_MUTED};text-align:center;">{footer}</div>
+</td>
+</tr>
+</table>
+</td>
+</tr>
+</table>
+</body>
+</html>
+"#,
+        date_rule = date_rule(&date.to_string()),
+        soft_divider = soft_divider(),
     )
 }
 
@@ -440,5 +539,38 @@ mod tests {
         assert!(plain.contains("1. Hello"));
         assert!(plain.contains("https://example.com"));
         assert!(plain.contains("rss ·"));
+    }
+
+    #[test]
+    fn empty_html_is_caught_up_and_carries_chrome() {
+        let content = DigestContent {
+            brand: "ACME",
+            title: "Weekly Roundup",
+            footer: "Sent by ACME.",
+            ..DigestContent::default()
+        };
+        let html = render_empty_html(
+            Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
+            Tz::UTC,
+            &content,
+        );
+
+        // The cheerful "all caught up" copy is present...
+        assert!(html.contains("You're all caught up"));
+        // ...alongside the same caller-supplied chrome the real digest carries.
+        assert!(html.contains("ACME"));
+        assert!(html.contains("Weekly Roundup"));
+        assert!(html.contains("Sent by ACME."));
+        // No item-shaped placeholder/debug sections, since there are no items to stand in for.
+        assert!(!html.contains("<!-- PLACEHOLDER:"));
+        assert!(!html.contains("<!-- DEBUG:"));
+    }
+
+    #[test]
+    fn empty_plain_is_caught_up() {
+        let plain = render_empty_plain(Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(), Tz::UTC);
+
+        assert!(plain.contains("You're all caught up"));
+        assert!(plain.contains("2026-06-13 09:00 UTC"));
     }
 }
