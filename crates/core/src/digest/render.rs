@@ -109,7 +109,9 @@ fn render_plain(window_end: DateTime<Utc>, tz: Tz, items: &[RenderItem]) -> Stri
         body.push_str(&format!(
             "   {} · {}\n\n",
             item.source.as_str(),
-            item.last_event_time.with_timezone(&tz).format("%Y-%m-%d %H:%M %Z")
+            item.last_event_time
+                .with_timezone(&tz)
+                .format("%Y-%m-%d %H:%M %Z")
         ));
     }
     body
@@ -429,7 +431,11 @@ mod tests {
     #[test]
     fn plain_fallback_is_unchanged_shape() {
         let items = vec![item("Hello", Some("https://example.com"), SourceKind::Rss)];
-        let plain = render_plain(Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(), Tz::UTC, &items);
+        let plain = render_plain(
+            Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
+            Tz::UTC,
+            &items,
+        );
 
         assert!(plain.contains("1. Hello"));
         assert!(plain.contains("https://example.com"));

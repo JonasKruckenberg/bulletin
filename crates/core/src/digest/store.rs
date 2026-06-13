@@ -187,7 +187,10 @@ pub async fn render_items_for_clusters(
     .await?
     .into_iter()
     .collect();
-    Ok(cluster_ids.iter().filter_map(|id| by_id.remove(id)).collect())
+    Ok(cluster_ids
+        .iter()
+        .filter_map(|id| by_id.remove(id))
+        .collect())
 }
 
 /// Marks the digest delivered and advances the subscriber's schedule in one transaction, so the

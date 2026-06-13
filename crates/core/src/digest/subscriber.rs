@@ -23,7 +23,9 @@ impl Recurrence {
             ("weekly", Some(d)) if (0..=6).contains(&d) => Ok(Recurrence::Weekly { weekday: d }),
             ("weekly", Some(_)) => Err("weekday must be 0..=6 (0 = Sunday)".into()),
             ("weekly", None) => Err("weekly requires a weekday 0..=6 (0 = Sunday)".into()),
-            (other, _) => Err(format!("unknown frequency '{other}' (expected daily or weekly)")),
+            (other, _) => Err(format!(
+                "unknown frequency '{other}' (expected daily or weekly)"
+            )),
         }
     }
 
@@ -159,11 +161,13 @@ pub async fn load_subscriber(
     pool: &PgPool,
     id: Uuid,
 ) -> Result<Option<SubscriberRow>, sqlx::Error> {
-    sqlx::query(&format!("SELECT {SELECT_COLS} FROM subscriber WHERE id = $1"))
-        .bind(id)
-        .try_map(row_to_subscriber)
-        .fetch_optional(pool)
-        .await
+    sqlx::query(&format!(
+        "SELECT {SELECT_COLS} FROM subscriber WHERE id = $1"
+    ))
+    .bind(id)
+    .try_map(row_to_subscriber)
+    .fetch_optional(pool)
+    .await
 }
 
 /// Subscribers whose digest is due: the boundary has passed (`next_run_at <= now()`). There is no

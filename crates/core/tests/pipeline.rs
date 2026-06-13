@@ -12,8 +12,8 @@ use bulletin_core::digest::store::{
     candidates_in_lookback, create_with_items, mark_delivered, render_items,
 };
 use bulletin_core::digest::subscriber::{
-    advance_after_delivery, due_subscribers, insert_subscriber, load_subscriber, update_preferences,
-    Recurrence,
+    advance_after_delivery, due_subscribers, insert_subscriber, load_subscriber,
+    update_preferences, Recurrence,
 };
 use bulletin_core::ingest::store::insert_event;
 use bulletin_core::{
@@ -179,7 +179,10 @@ async fn no_build_gate_unbuilt_events_ride_next_fire() {
     );
     // ...but the unbuilt event is not yet a candidate.
     assert!(
-        candidates_in_lookback(&pool, None, 30).await.unwrap().is_empty(),
+        candidates_in_lookback(&pool, None, 30)
+            .await
+            .unwrap()
+            .is_empty(),
         "unbuilt event is not a candidate"
     );
 
@@ -268,7 +271,10 @@ async fn insert_schedules_next_local_digest_time() {
     .unwrap();
 
     let sub = load_subscriber(&pool, id).await.unwrap().unwrap();
-    assert!(sub.next_run_at > Utc::now(), "first digest is in the future");
+    assert!(
+        sub.next_run_at > Utc::now(),
+        "first digest is in the future"
+    );
     assert_eq!(
         local_run_time(&pool, id, "America/New_York").await,
         NaiveTime::from_hms_opt(7, 30, 0).unwrap(),
@@ -325,8 +331,14 @@ async fn update_preferences_snaps_without_losing_window() {
 #[tokio::test]
 async fn insert_rejects_unknown_timezone() {
     let (pool, _pg) = setup().await;
-    let err =
-        insert_subscriber(&pool, "bad@example.com", Recurrence::Daily, "Mars/Phobos", nine_am()).await;
+    let err = insert_subscriber(
+        &pool,
+        "bad@example.com",
+        Recurrence::Daily,
+        "Mars/Phobos",
+        nine_am(),
+    )
+    .await;
     assert!(err.is_err(), "unknown timezone must be rejected");
 }
 
@@ -383,9 +395,15 @@ async fn advance_coalesces_missed_boundaries() {
     .execute(&pool)
     .await
     .unwrap();
-    let overdue_boundary = load_subscriber(&pool, id).await.unwrap().unwrap().next_run_at;
+    let overdue_boundary = load_subscriber(&pool, id)
+        .await
+        .unwrap()
+        .unwrap()
+        .next_run_at;
 
-    advance_after_delivery(&pool, id, overdue_boundary).await.unwrap();
+    advance_after_delivery(&pool, id, overdue_boundary)
+        .await
+        .unwrap();
 
     let sub = load_subscriber(&pool, id).await.unwrap().unwrap();
     assert_eq!(sub.last_run_at, Some(overdue_boundary));

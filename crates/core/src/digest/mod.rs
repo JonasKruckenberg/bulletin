@@ -170,8 +170,14 @@ pub async fn dispatch_now(
         return Ok(DigestOutcome::Empty);
     }
     // The rendered date header uses now() — this digest isn't tied to a scheduled boundary.
-    let message =
-        render::render(mailer.from(), &sub.email, Utc::now(), &sub.timezone, &items, content)?;
+    let message = render::render(
+        mailer.from(),
+        &sub.email,
+        Utc::now(),
+        &sub.timezone,
+        &items,
+        content,
+    )?;
     mailer.send(message).await?;
     Ok(DigestOutcome::Delivered { items: items.len() })
 }

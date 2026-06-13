@@ -141,7 +141,11 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> R
             let digest_time = chrono::NaiveTime::parse_from_str(&digest_time, "%H:%M")
                 .context("--digest-time must be HH:MM (24-hour)")?;
             let id = digest::subscriber::insert_subscriber(
-                pool, &email, recurrence, &timezone, digest_time,
+                pool,
+                &email,
+                recurrence,
+                &timezone,
+                digest_time,
             )
             .await?;
             println!("{id}");
