@@ -88,11 +88,12 @@ Key properties:
   replica, no catch-up), but the `unique-jobs` feature makes each enqueue idempotent on a key we
   choose, so duplicate ticks across replicas are harmless. Run the cron inside `worker`; split a
   dedicated single `tick` role only as a later scale optimization.
-- **`PublicBuild` and `GenerateDigest` are decoupled** (not chained). Build materializes cluster
-  rollups on its own cadence; `GenerateDigest` reads the *latest materialized snapshot* at the
-  subscriber's scheduled instant. A not-yet-clustered event simply isn't a candidate that fire and
-  rides the next one — never lost (durable event log; the candidate floor reaches back to the last
-  delivery — product §9.4). **Linking is per-subscriber, inside `GenerateDigest`** — a story can fuse
+- **`PublicBuild` and `GenerateDigest` are decoupled** (not chained). `PublicBuild` materializes
+  shared cluster rollups on its own cadence (private-build is write-side too, but v1 runs it
+  just-in-time at the head of `GenerateDigest` — §5.3); `GenerateDigest` reads the *latest
+  materialized snapshot* at the subscriber's scheduled instant. A not-yet-clustered event simply
+  isn't a candidate that fire and rides the next one — never lost (durable event log; the
+  consideration floor reaches back to the last delivery — product §9.4). **Linking is per-subscriber, inside `GenerateDigest`** — a story can fuse
   public clusters with that subscriber's *own* private clusters (product §4), so it can't be a
   global precompute. Public clusters (grouping + rollups) are built once and amortized; only linking
   + scoring are per-subscriber. `PublicBuild` runs in a no-subscriber RLS context, `GenerateDigest`

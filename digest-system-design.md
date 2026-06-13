@@ -90,6 +90,15 @@ The functional layers above cross-cut a second, load-bearing decomposition that 
 
 The two sides share nothing but durable state: materialization *pushes* into it, projection *pulls a snapshot* on schedule. They never call each other (no job chaining) — which is what lets a digest fire on time regardless of how far materialization has caught up. **Stories live at the head of the read side** (§8.2, §9): a `story` is a per-subscriber **read-model** rebuilt at fire time from the snapshot, with stable forwarded ids. The shared-global / per-subscriber split (§11) is a *third*, orthogonal axis: materialization has both (public clusters shared, private per-subscriber), and the deferred *shared public-story cache* (§2, §6) is exactly the move of promoting the shareable slice of projection back into materialization.
 
+**The diagram, mapped to the split.** The read/write seam cuts *through* the Aggregation layer: `group → cluster rollups` is materialization (write); `link → gate → rank → classify` onward — and all of Generation — is projection (read). The labeled inter-layer arrows (`canonical events`, `clusters`) are the durable seam itself.
+
+**Data flow & the durable seam.** Exactly three durable artifacts carry data across the split, all in Postgres:
+1. the **event log** — appended by ingest; the trust boundary (§5, §9.3);
+2. the **cluster cache** (`cluster` rollups) — upserted by build, read by projection; the *entire* interface between the two sides;
+3. **`digest` + `digest_item`** — written by projection; the delivered record (the per-subscriber `story` read-model is rebuilt alongside it).
+
+Materialization only ever *appends to the log and upserts cluster rollups*. Projection only ever *reads a **consistent snapshot** of clusters* (a single MVCC read taken at the fire instant) *and writes its own `story`/`digest` rows*. Neither side reads the other's in-flight state, and there is no callback or join between them — the cluster cache is the whole contract.
+
 ### 3.1 Runtime topology
 
 Only two things run continuously: **Postgres** and a thin **webhook catcher**. Everything else is cron/queue-triggered batch. The catcher verifies the signature, **enqueues a `process_webhook` job** (raw payload inline), and returns 2xx in milliseconds — never processing inline, because webhook senders disable or back off slow endpoints.
@@ -101,7 +110,8 @@ MATERIALIZATION (write side · world's clock · best-effort · durable)
   ingest        drain process_webhook jobs + run due pollers → canonical events (deduped)   [TRUST BOUNDARY]
   public-build  group public events → public cluster rollups                ← global, shared
   private-build group a subscriber's private events → private cluster rollups ← per-subscriber
-        (each runs when there is unbuilt input; never blocks a digest)
+        (public-build runs as public events arrive; private-build is write-side too, but v1 runs it
+         just-in-time at the head of a fire — tech §2. Neither ever blocks projection.)
 
 PROJECTION (read side · subscriber's wall clock · punctual · pure over a snapshot)
   generate, for each subscriber DUE now (in their RLS context):
@@ -112,7 +122,7 @@ PROJECTION (read side · subscriber's wall clock · punctual · pure over a snap
 
 The job queue is apalis's Postgres-backed schema, drained with `SELECT … FOR UPDATE SKIP LOCKED` — no Kafka, no stream processor. (Queue/runtime mapping: technical architecture doc §2.)
 
-**`public-build` is shared; `private-build` and everything in projection are per-subscriber.** Build and generate are **decoupled**: a digest reads the *latest materialized snapshot*, not "clusters built in this tick." An event still being ingested or clustered when a digest fires simply isn't a candidate *that* fire and rides the next one — never lost, because the event log is durable and the candidate floor always reaches back to the last delivery (§9.4). **Linking is not a global precompute:** it runs per subscriber at generate-time, because a story can fuse public clusters with that subscriber's *own* private clusters (§4).
+**`public-build` is shared; `private-build` and everything in projection are per-subscriber.** Build and generate are **decoupled**: a digest reads the *latest materialized snapshot*, not "clusters built in this tick." An event still being ingested or clustered when a digest fires simply isn't a candidate *that* fire and rides the next one — never lost, because the event log is durable and the **consideration floor** always reaches back to the last delivery (§9.4). **Linking is not a global precompute:** it runs per subscriber at generate-time, because a story can fuse public clusters with that subscriber's *own* private clusters (§4). Note the best-effort gap is asymmetric: a subscriber's own *ingested* private events are always current in their digest (private-build runs just-in-time at the fire), so only **shared public** clustering — and any event not yet drained from the ingest queue — is what can lag.
 
 **Two independent clocks — the organizing principle (§3.0).** Materialization runs on the world's clock (per-connection poll cadence, minutes) so clusters are *fresh*; projection runs on each subscriber's cadence (daily/weekly, at their local time). Under load materialization falls *behind*, never *wrong*; the digest still fires on time, with best-effort-fresh contents. Polling frequency is never tied to the digest schedule.
 
@@ -373,9 +383,11 @@ v1 events are all **retrospective** (`event_time ≤ ingest_time`). The model is
 
 ## 9. Generation layer
 
-### 9.1 Scheduled DAG
+### 9.1 The read path (projection)
 
-See §3.0–§3.1. `public-build` (grouping + rollups for public clusters) is global/shared and runs on the **materialization clock** as public events arrive (decoupled from generate); everything from `private-build` through `deliver` is per-subscriber and runs inside the subscriber's isolation context (§12) when the subscriber's schedule fires, reading the latest materialized snapshot. **Linking runs per subscriber** inside `generate` (§8.2).
+See §3.0–§3.1. **Materialization** owns both builds — `public-build` (public clusters; no-subscriber RLS context; shared) and `private-build` (a subscriber's private clusters; that subscriber's RLS context) — each a write-side, recomputable cache over the event log. **Projection** is `generate`: at the subscriber's scheduled instant, in their isolation context (§12), it reads a consistent snapshot of `public ∪ own-private` clusters and runs link → gate → rank → classify → cap → render → deliver. **Linking runs per subscriber** inside `generate` (§8.2) — it can fuse public with own-private clusters, so it can't be precomputed globally.
+
+*Trigger latitude.* `private-build` is write-side, so whether it runs continuously (on private ingest) or **just-in-time at the head of a fire** is a scheduling choice, not an architectural one — v1 does the latter (tech §2), since private clusters are consumed only by their owner's digest. Either way projection's contract is unchanged: read the latest cluster snapshot.
 
 ### 9.2 Subscriber scheduling
 
