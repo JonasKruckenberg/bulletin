@@ -444,7 +444,7 @@ mod tests {
         let html = render_html(
             Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
             Tz::UTC,
-            "Good morning — here's your daily digest.",
+            "Good morning. Here's your daily digest.",
             &items,
             &DigestContent::default(),
         );
@@ -469,7 +469,7 @@ mod tests {
         let html = render_html(
             Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
             Tz::UTC,
-            "Good morning — here's your daily digest.",
+            "Good morning. Here's your daily digest.",
             &items,
             &DigestContent::default(),
         );
@@ -533,7 +533,7 @@ mod tests {
         let html = render_html(
             Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
             Tz::UTC,
-            "Good morning — here's your daily digest.",
+            "Good morning. Here's your daily digest.",
             &items,
             &content,
         );
@@ -550,12 +550,12 @@ mod tests {
         let plain = render_plain(
             Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
             Tz::UTC,
-            "Good morning — here's your daily digest.",
+            "Good morning. Here's your daily digest.",
             &items,
         );
 
         // The greeting opens the plaintext fallback, ahead of the item list.
-        assert!(plain.starts_with("Good morning — here's your daily digest."));
+        assert!(plain.starts_with("Good morning. Here's your daily digest."));
         assert!(plain.contains("1. Hello"));
         assert!(plain.contains("https://example.com"));
         assert!(plain.contains("rss ·"));

@@ -56,12 +56,20 @@ fn cadence_word(recurrence: Recurrence) -> &'static str {
 
 /// Interchangeable phrasings, each built from a `{salutation}` and the `{cadence}` word so every
 /// one works across all time-of-day × cadence combinations. Kept short and warm — one line, no
-/// analysis. Reword or add freely; the only contract is the two placeholders.
+/// analysis, and no em-dashes. Reword or add freely; the only contract is the two placeholders.
 const VARIANTS: &[&str] = &[
-    "{salutation} — here's your {cadence} digest.",
     "{salutation}. Here's your {cadence} digest.",
-    "{salutation} — your {cadence} digest is ready.",
-    "{salutation}. Here's what's new in your {cadence} digest.",
+    "{salutation}! Your {cadence} digest just landed.",
+    "{salutation}, your {cadence} digest is ready.",
+    "{salutation}! Here's what's new in your {cadence} digest.",
+    "{salutation}. Fresh off the press: your {cadence} digest.",
+    "{salutation}! Time for your {cadence} digest.",
+    "{salutation}. Your {cadence} digest, hot out of the oven.",
+    "{salutation}! Here's your {cadence} rundown.",
+    "{salutation}. Let's dive into your {cadence} digest.",
+    "{salutation}! Your {cadence} dose of the news has arrived.",
+    "{salutation}. Grab a coffee; your {cadence} digest is served.",
+    "{salutation}! The world's been busy. Here's your {cadence} digest.",
 ];
 
 /// Builds the greeting for one digest. `digest_time` is the subscriber's local delivery time (which
@@ -111,35 +119,39 @@ mod tests {
     #[test]
     fn cadence_word_matches_recurrence() {
         let nine = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
-        assert!(greeting(nine, Recurrence::Daily, 0).contains("daily digest"));
-        assert!(greeting(nine, Recurrence::Weekly { weekday: 2 }, 0).contains("weekly digest"));
+        // Every phrasing names the cadence (it's a required placeholder), regardless of wording.
+        for s in 0..VARIANTS.len() as u64 {
+            assert!(greeting(nine, Recurrence::Daily, s).contains("daily"));
+            assert!(greeting(nine, Recurrence::Weekly { weekday: 2 }, s).contains("weekly"));
+        }
     }
 
     #[test]
     fn seed_selects_among_all_variants() {
         let nine = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
-        // Walking the seed across the variant count must surface every phrasing, and every result
-        // is a non-empty single line.
+        // Walking the seed across the variant count must surface every distinct phrasing, and every
+        // result is a non-empty single line that opens with the salutation.
         let rendered: std::collections::HashSet<String> = (0..VARIANTS.len() as u64)
             .map(|s| greeting(nine, Recurrence::Daily, s))
             .collect();
         assert_eq!(rendered.len(), VARIANTS.len());
         for line in &rendered {
             assert!(line.starts_with("Good morning"));
-            assert!(line.contains("daily digest"));
+            assert!(line.contains("daily"));
             assert!(!line.contains('\n'));
         }
     }
 
     #[test]
-    fn no_template_placeholders_leak() {
-        // Every variant must consume both placeholders, or the rendered greeting would show a raw
-        // `{…}` token to the subscriber.
+    fn variants_are_well_formed() {
+        // Two contracts every variant must honour: consume both `{…}` placeholders (or the
+        // subscriber sees a raw token), and carry no em-dash (a deliberate house-style choice).
         let nine = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
         for s in 0..VARIANTS.len() as u64 {
             let line = greeting(nine, Recurrence::Weekly { weekday: 0 }, s);
             assert!(!line.contains('{'), "placeholder leaked: {line}");
             assert!(!line.contains('}'), "placeholder leaked: {line}");
+            assert!(!line.contains('—'), "em-dash in greeting: {line}");
         }
     }
 
