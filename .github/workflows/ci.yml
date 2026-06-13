@@ -7,6 +7,12 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # cache-nix-action manages the GitHub Actions cache via the cache REST API (prefix
+    # restore + purge), which needs `actions: write`. Without it the restore silently
+    # finds nothing ("Resource not accessible by integration") and every run starts cold.
+    permissions:
+      contents: read
+      actions: write
     # Compile against sqlx's offline query cache. We have no compile-time-checked queries of our own
     # (all queries are runtime `.bind`), but the apalis-postgres dependency does — and it ships its
     # own `.sqlx` cache. Setting DATABASE_URL here would flip sqlx into online mode and make it
@@ -17,13 +23,17 @@ jobs:
       SQLX_OFFLINE: "true"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: DeterminateSystems/nix-installer-action@v14
+      - uses: DeterminateSystems/nix-installer-action@v22
 
       - uses: nix-community/cache-nix-action@v7
         with:
-          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          # Key on everything that changes the build inputs: flake.lock (toolchain +
+          # crane), Cargo.lock (the deps-only layer crane caches) and the toolchain
+          # pin. A dep bump makes a fresh cache; source-only commits hit the prefix
+          # restore and reuse the warm store (devShell + crane cargoArtifacts).
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'Cargo.lock', 'rust-toolchain.toml') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-
           gc-max-store-size-linux: 5G
           purge: true
@@ -40,6 +50,7 @@ jobs:
 
       - run: nix develop --command cargo deny check
 
-      # Build the deployable binary so cachix-action pushes it to the `bulletin` cache; the server
-      # then substitutes the prebuilt artifact instead of compiling on a `nixos-rebuild`.
+      # Build the deployable binary (crane: deps come from the cached cargoArtifacts layer,
+      # so this only compiles the workspace crates on source-only changes). Restoring the
+      # warm Nix store above is what keeps that dependency layer from rebuilding each run.
       - run: nix build .#bulletin
