@@ -42,6 +42,7 @@ relevance/feedback (M4).
 | **GitHub event set** | **capture everything, classify in one legible place** | one `event_map` module; known types rich, unknown captured generically; add/reclassify by editing one file (per user) |
 | **Scope assignment** | adapter emits a structural `is_private` bool (from `repo.private`); **`finalize` owns the subscriber binding** and maps it to `Scope` | keeps design §12 risk-#1 invariant: an adapter can never name a subscriber or construct a `Scope` |
 | **Crate graph** | stays `core` + `bulletin` for all of M2 | design §4 says revisit at end of M2; `core` already isn't I/O-pure (uses `reqwest`). Reconsider a `connectors`/`store`/`support` split as a closing M2 note, don't act mid-milestone |
+| **GitHub event scope** | **timeline collaboration set only** (§11.2); **defer all non-timeline signals** — security alerts, CI/CD, org/admin, packages, projects, discussions — to a later milestone. **Keep installation-lifecycle** webhooks (control-plane, not a content signal) since `connection.status` depends on them (roadmap §M2) | user choice; §11 is the reference map for the milestone that adds the rest. `event_map` still captures unknown webhook types generically, so nothing breaks if one arrives |
 
 ---
 
@@ -368,16 +369,27 @@ enterprise-scoped security (`dependabot_alert`/`secret_scanning_alert` enterpris
 | Packages | user/org packages | `/orgs/{org}/packages` | Packages |
 | Discussions | GraphQL only (no REST list) | — | Discussions |
 
-### 11.5 Recommended M2 tiering (proposal — confirm before wiring)
+### 11.5 M2 tiering — DECIDED: "timeline only"
 
-- **Tier 1 (ingest in M2):** the timeline collaboration set (already poll-able, free) + **security
-  alerts** (`dependabot_alert`, `code_scanning_alert`, `secret_scanning_alert`, `security_advisory`)
-  via **webhook + paired REST reconciliation** + **installation lifecycle** → `connection.status`.
-  These are the "things that matter" core.
-- **Tier 2 (M2 if cheap, else next):** CI health — `workflow_run`/`check_suite` failures,
-  `deployment_status`, commit `status`. High value, but each needs a poll fetcher.
-- **Tier 3 (defer):** projects_v2, discussions, sponsors/marketplace, packages, admin/meta churn,
-  classic (deprecated) projects, branch-protection/ruleset config noise.
+**Decision (2026-06-13):** M2 ingests **only the timeline collaboration set** (§11.2 — the types the
+Phase-1 poll already reads, rich-mapped in `event_map`). **All non-timeline signals are deferred** to
+a later milestone: security alerts (Dependabot/code-scanning/secret-scanning/advisories), CI/CD
+(`workflow_run`/`check_*`/deployments/status), org/admin/meta, packages, projects_v2, discussions.
+So **no new REST reconciliation endpoints** and **no extra App permissions** are added in M2; the
+GitHub poll stays the `/events` walk built in Phase 1.
+
+**Phase 2 consequence — webhook subscriptions:** subscribe **only** the timeline-corresponding
+content events (`issues`, `issue_comment`, `pull_request`, `pull_request_review`,
+`pull_request_review_comment`, `pull_request_review_thread`, `push`, `release`, `commit_comment`,
+`create`, `delete`, `fork`, `gollum`, `member`, `public`, `watch`) **plus the installation-lifecycle
+events** (`installation`, `installation_repositories`, `installation_target`,
+`github_app_authorization`) — the latter are control-plane and drive `connection.status`, not digest
+content, so they stay despite "timeline only." Any other webhook type that arrives is still captured
+generically by `event_map` (harmless), but we don't subscribe to or reconcile it.
+
+**When the deferred signals land (future milestone):** for each, (1) subscribe its webhook type,
+(2) add its REST list endpoint (§11.4) to `GithubConnection::poll` for reconciliation parity, (3)
+request the App permission, (4) rich-map it in `event_map`. §11.3/§11.4 are the menu.
 
 **Scope mapping:** private-repo signals → `Private(owner)`; org/account-level meta → owner-private
 or treated as administrative; global advisories → `Public`. (`finalize` owns this, Phase 3.)
