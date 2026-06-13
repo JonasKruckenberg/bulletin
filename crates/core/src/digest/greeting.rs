@@ -66,15 +66,21 @@ const VARIANTS: &[&str] = &[
     "{salutation}! Time for your {cadence} digest.",
     "{salutation}. Let's dive into your {cadence} digest.",
     "{salutation}! Your {cadence} dose of the news has arrived.",
-    // Calm, meditational phrasings — the unhurried, breathe-easy tone the app is going for.
+    // Calm, meditational phrasings — the unhurried, breathe-easy tone the app is going for, with a
+    // little life and playfulness so they land warm rather than sleepy.
     "{salutation}. Take a breath; here's your {cadence} digest.",
     "{salutation}. Your {cadence} digest is ready whenever you are.",
     "{salutation}. Settle in with your {cadence} digest.",
     "{salutation}. Breathe easy; your {cadence} digest is here.",
     "{salutation}. Find a quiet moment for your {cadence} digest.",
     "{salutation}. Ease into your {cadence} digest.",
-    "{salutation}. No rush; your {cadence} digest will keep.",
     "{salutation}. When you're ready, your {cadence} digest is waiting.",
+    "{salutation}. Inhale, exhale, and ease into your {cadence} digest.",
+    "{salutation}. Drop your shoulders; your {cadence} digest is here.",
+    "{salutation}. Find your flow with your {cadence} digest.",
+    "{salutation}. Unwind a little; your {cadence} digest is ready.",
+    "{salutation}. Channel your inner calm; your {cadence} digest awaits.",
+    "{salutation}. Sink in and savor your {cadence} digest.",
 ];
 
 /// Builds the greeting for one digest. `digest_time` is the subscriber's local delivery time (which
