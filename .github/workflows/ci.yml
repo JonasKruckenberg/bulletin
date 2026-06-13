@@ -23,9 +23,9 @@ jobs:
       SQLX_OFFLINE: "true"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: DeterminateSystems/nix-installer-action@v14
+      - uses: DeterminateSystems/nix-installer-action@v22
 
       - uses: nix-community/cache-nix-action@v7
         with:
