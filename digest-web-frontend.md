@@ -46,10 +46,60 @@ or may not exist yet.
 | **S3** | **Feedback / control** | "Care more/less" on an entity; "wrong aggregation" (split/cannot-link); mute. Append-only log that tunes the *next* tick. | `POST` feedback endpoints, CSRF, IDOR re-check | **Not yet.** Feedback log + affinity/edge-constraint consumers are **M4**. |
 | **S4** | **Connections & connect flow** | List your connections + status (active/paused/revoked/errored); add one via the OAuth/app-install dance (`/connect/{source}` signed-`state` → callback binds provider-account→subscriber→scope). | `/connect/{source}` + callback (tech §3A), connection list read | **Backend partial.** `connection` rows + status exist (M2, hand-seeded); the *flow* is **M5**. |
 | **S5** | **Preferences / account** | Recurrence (daily/weekly, local `at_time`, weekday, tz), name, pause/resume, unsubscribe. | CRUD on `subscriber`/recurrence | **Backend partial.** Subscriber + recurrence land with M5 scheduling; `debug subscriber-rm` exists today. |
+| **S6** | **The "system working" dashboard** | A consumer-facing glass-box: a live, animated view of the pipeline doing its job for *you* — what it read, what it suppressed, what's next. Trust surface, not an operator console. | per-subscriber count reads (RLS) + global aggregates; SSE for live (§5a) | **Partial.** Counts derivable from existing rows now; the *delight* version wants M4 (suppression is meaningful once gating exists) + the F4 live channel. **Detailed in §10.** |
 
 **Phasing falls out of the dependency column, not out of taste:** S1 (read-only) is the keystone and can
 come forward the moment there's a digest worth viewing; S2 needs M3's `story` table; S3 needs M4's feedback
 consumers; S4/S5 are squarely M5 (they're the "other users can onboard" gate the roadmap already draws).
+
+---
+
+## 1a. Stepping back — the full UI inventory
+
+The six surfaces above are the *content*. A real product UI is more than its content screens — it's the
+connective tissue, the states, and the off-screen surfaces (emails, empty states, errors). Enumerated so
+nothing is discovered late:
+
+### Route / page map
+
+```
+/                         home → latest digest (or onboarding if none yet)         [S1]
+/d/{digest_id}            a specific digest (the deep-link target)                  [S1]
+/archive                  past digests (the back-catalogue; append-only, free)      [S1+]
+/s/{story_id}             story provenance / timeline / reasons                     [S2]
+/dashboard               the "system working" glass-box                            [S6]
+/settings                schedule · content · delivery · account (tabbed)          [S5/§7]
+/connections             list + status; add via connect flow                       [S4]
+/connect/{source}[/cb]   OAuth/app-install dance                                   [S4]
+/signin   /verify        magic-link request + token landing                       [§9]
+/signup                  onboarding flow (multi-step)                              [§9]
+/unsubscribe             one-click, token-authed (email-compliance)               [§7]
+/legal/{privacy,terms}   static                                                    [—]
+```
+
+### Cross-cutting concerns (apply to *every* surface, easy to forget)
+
+- **States, not just happy paths.** Each data surface needs **loading / empty / error / expired-link**
+  variants. The empty states are load-bearing here because of cold-start (no digest yet, no connections
+  yet) — see §9. The expired-deep-link state is its own screen ("this link's expired — sign in to see it").
+- **Transactional email is part of the UI.** Beyond the digest itself: **verify/magic-link**, **welcome**,
+  **connection-errored alert** ("your GitHub connection needs re-auth"), and the **digest notification**
+  itself. The email renderer (`render.rs`, `DigestContent`) already externalizes brand/masthead/footer — all
+  transactional mail should share that identity so email and web are one brand.
+- **Notifications & the entry seam.** Email is the only channel today; the deep-link is the entry. The
+  future app (§5a) adds push. Design the "there's something new" nudge as a channel-agnostic concept now.
+- **Responsive / mobile-web first.** The deep-link is opened on a phone, from a mail client, more often than
+  not. Mobile-web quality is also the cheapest rehearsal for the native app's layouts (§5a).
+- **Accessibility & localization.** a11y from the start (semantic HTML — Option A's server-rendered
+  hypermedia is a natural fit). The product is already timezone-aware end-to-end; UI copy/number/date
+  formatting should respect locale, not just tz.
+- **Session & account lifecycle.** Sign in / sign out / session expiry / "signed in on this device" — plus
+  the account-deletion path (GDPR cascade, design §13) and **data export**. These are legal-surface, not
+  optional, the moment there are users beyond you.
+- **Trust surfaces are the differentiator.** Reasons ("why you're seeing this"), provenance (S2), and the
+  dashboard (S6) are not decoration — they *are* the "earn trust" half (§0). Treat them as core, not polish.
+- **Frontend observability + perf budget.** No client-held private data (§5); server-render keeps payloads
+  small; basic real-user timing so the deep-link open is fast (it's opened from email, on mobile data).
 
 ---
 
@@ -257,7 +307,145 @@ app is an additive layer, never a fork.
 
 ---
 
-## 7. Security checklist (the deltas a web surface introduces)
+## 7. Settings, scoped
+
+Settings is where "control" (the second half of the thesis) lives outside the digest itself. Group it so
+each tab maps to a backend owner and a milestone — don't ship it as one flat form.
+
+| Group | Controls | Reads/writes | Default | Lands |
+|---|---|---|---|---|
+| **Schedule** | freq (daily/weekly), `at_time`, `on_weekday`, **timezone** (auto-detected, confirmable), pause/resume | `subscriber` recurrence → §9.2 boundary recompute | daily, 08:00, auto-tz | M5 (sched) |
+| **Content & relevance** | muted entities/topics, **boosted** ("care more") list, keyword subscriptions/filters, per-source on/off, digest size ("how much": Stories ~3–5 / Notes ~15–25 caps) | feedback log + config caps table (design §8.4) | sensible caps | M4 |
+| **Delivery** | email address (re-verify on change), channel (email now; push later), empty-digest behavior ("send 'all caught up'" vs stay silent), quiet hours (later) | `subscriber`; the empty-digest greeting already exists (`greeting.rs`) | email, send empty | M1→M5 |
+| **Connections** | list + status (active/paused/revoked/errored), add/pause/revoke per connection | `connection` rows (M2) + connect flow (M5) — overlaps S4 | — | M5 |
+| **Account** | name, timezone, **export my data**, **delete account** (GDPR cascade → `raw` + reasons, design §13), sign-out | `subscriber`; deletion is a real cascade, not a flag | — | M5 |
+
+**Design rules that matter here:**
+- **The timezone control is the live-update poster child (§5a).** "Auto" means the client reports device tz
+  and silently PATCHes it; "manual" pins it. Either way it flows through the *one* §9.2 boundary function
+  ("snap to next slot, lose nothing") — no setting touches scheduling math directly.
+- **Every preference change is "effective next digest," never retroactive.** Say so in the UI; it mirrors
+  the pipeline's tick model and sets honest expectations (same as feedback, §8).
+- **The "boosted/muted" lists in Content are the *persistent view* of the feedback log** (§8) — settings and
+  in-context feedback write the same append-only log; settings just renders + lets you undo it.
+- **Delete & export are legal surface**, not nice-to-haves, the moment users beyond you exist (design §13).
+
+---
+
+## 8. Feedback, scoped
+
+Feedback is the mechanism behind "earn trust through **control**." Design §10.3 gives two distinct loops;
+the UI must keep them distinct because they touch different machinery:
+
+| Gesture (in-context, on an item) | Means | Mechanism (design §10.3) | Effect timing |
+|---|---|---|---|
+| **Care more / less** (on an entity) | relevance affinity nudge | affinity weight update | next tick |
+| **Wrong aggregation** (split / "not the same as") | this story shouldn't fuse these | per-subscriber **cannot-link** edge constraint | that subscriber's next recompute |
+| **"These belong together"** (rarer) | force a fuse | per-subscriber **must-link** constraint | next recompute |
+| **Mute** (entity/topic/source) | never show this | hard-zero gate | next tick |
+| **Dismiss / "dealt with"** | hide this instance | engagement suppression (*deferred* — capture the gesture, act later) | — |
+
+**The non-negotiable UX truths:**
+- **Feedback is not instant and must not pretend to be.** It's an **append-only log** that tunes the *next*
+  tick — nothing mutates the digest you're looking at, and crucially nothing shared is mutated (constraints
+  are per-subscriber). The UI confirms "got it — we'll use this next time," never a fake live re-rank. This
+  is honest *and* matches the architecture (CQRS read side is immutable; §3).
+- **Feedback is the answer to a reason.** Each item shows "why you're seeing this" (the reason record); the
+  feedback control is the *response* to that explanation. Pair them visually — the why and the "that's
+  wrong" button live together. This why→correct loop *is* the trust mechanism (design §1/§10).
+- **It needs a persistent home + undo.** In-context gestures are fire-and-forget; Settings → Content (§7) is
+  where you *see* everything you've muted/boosted and reverse it. Same log, two entry points.
+- **Write-side hygiene:** these are state-changing `POST`s → CSRF + IDOR re-check under RLS (§11). The
+  feedback target is the **stable `story_id`/entity**, never a path-trusted id.
+
+---
+
+## 9. Signup & onboarding, scoped
+
+Onboarding is the highest-stakes flow — it's where a stranger decides if this is worth it, and it has a
+brutal **cold-start problem**: the first digest is empty until sources are connected *and* a tick has run.
+Design the flow around that, not around a generic "create account" form.
+
+**The flow (happy path):**
+```
+1. Enter email          → magic-link sent (email IS the identity; no password — §4)
+2. Click link / verify  → session minted; double opt-in satisfied (deliverability + anti-abuse)
+3. Name + timezone      → tz auto-detected from device, shown for confirm (feeds §9.2 scheduling)
+4. Schedule             → prefilled "daily, 8:00am your time" — one tap to accept
+5. Connect first source → the cold-start fix; two tiers of friction:
+      · RSS    → paste a feed URL (no auth)            ← the thin, self-host-friendly path
+      · GitHub → app-install OAuth dance (tech §3A)    ← heavier, M5
+6. Confirm              → "Your first digest arrives <local time>. Here's what we'll watch."
+```
+
+**The decisions/risks baked into this flow:**
+- **Email-first, password-never.** Email is already the only identity we hold and the delivery channel, so
+  magic-link/OTP is the whole auth story (§4) — no password store, no SSO dependency. Double opt-in is free
+  and buys deliverability + abuse resistance.
+- **Cold-start is the real design problem, not the form.** Between signup and the first tick the product has
+  *nothing to show*. Mitigations, pick per taste: (a) set the expectation explicitly ("first digest at
+  8am"); (b) offer a **"preview now"** that runs an immediate off-schedule generation over whatever's been
+  ingested so far; (c) a friendly empty state with the watch-list. The existing **"all caught up" empty
+  greeting** (`greeting.rs`) is the same muscle.
+- **Two onboarding tiers by source friction.** RSS-only onboarding (paste a URL) is the **thin path that
+  works today / for self-hosters** and needs no OAuth; GitHub/Slack pull in the M5 connect flow. The UI
+  should let someone reach a working digest on RSS alone before the OAuth surfaces exist.
+- **SSRF gate on the RSS URL field (§11).** The signup form is the *first place a non-you user supplies a
+  URL* — the M5 SSRF guard (resolve-then-pin, RFC1918 denylist) must gate it before public signup opens
+  (roadmap M5). Until then, onboarding is invite/self-host only.
+
+---
+
+## 10. The "system working" dashboard (S6)
+
+Your instinct here is good and it's **on-thesis, not a toy**: the product's whole pitch is "we read the
+firehose so you don't have to, and we'll *show you* we're doing it." A live, animated glass-box that makes
+the suppression *visible* is the most direct possible expression of "earn trust through transparency"
+(design §1). It's the difference between "trust the black box" and "watch the box work."
+
+**Crucial framing: this is NOT the operator dashboard.** A Prometheus/Grafana operator dashboard already
+exists (`metric.rs`, the shipped Grafana board, commit `bbedca4`) — that's for *you*, in ops, with global
+counters. S6 is **consumer-facing, per-subscriber, and emotional**: it answers "is this thing working *for
+me*, and is it earning its keep?" Different audience, different data source, different tone.
+
+**What it shows (grounded in data that exists / is coming):**
+
+| Element | The number | Source | Why it lands |
+|---|---|---|---|
+| **Hero: the suppression ratio** | "We read **1,240** things this week and surfaced **6**." | events-in-scope count vs `digest_item` count | This *is* the product thesis as a single stat. The money shot. (Meaningful once M4 gating exists.) |
+| **Pipeline stages, animated** | inbox → events → clusters → stories/notes → digest, with live counts flowing through | per-stage row counts (per-subscriber, RLS-scoped) | Makes the DAG legible — you *see* funnelling/fusing happen. |
+| **Next digest** | live countdown to `next_run_at`, in local tz | scheduler (§9.2) | Anticipation + reassurance it's scheduled. |
+| **Source freshness** | per-connection "last checked 4m ago", status dots | `connection.status` + cursor/poll time (M2) | Proves it's *live*, surfaces stale/errored connections. |
+| **Recent activity ticker** | "fused a GitHub PR + an advisory into one story (same CVE)" | reason records (§8/design §10.2) | Shows the *headline feature* (linking) actually happening. |
+
+**Data sourcing — the important constraint.** Per-subscriber numbers (your events, your clusters, your
+suppression ratio) are **read under RLS in the subscriber context** (§2), exactly like the digest view —
+this dashboard is just *another projection* over the same scoped rows, computed nowhere but the read path.
+Any genuinely global/aggregate stat ("Bulletin watched 3.2M public events this month") is a separate,
+non-scoped public aggregate and must be explicitly that — never per-subscriber data leaking into a global
+view. **It does not read Prometheus** (that's operator-global and not tenant-isolated).
+
+**Live + animated — how, and when.** The "live" part is the **SSE/WebSocket channel from §5a (F4)** — the
+dashboard is in fact the *first natural consumer* of that channel, and a fine reason to build a minimal
+version of it. The animation is client-side (counts ticking up, items flowing stage-to-stage); with Option
+A this is htmx + a little CSS/JS or a small island — it does **not** justify a SPA framework on its own.
+
+**Phasing (keep it from ballooning):**
+- **S6a — static snapshot** *(cheap, can ride alongside F1/M4):* render the hero stat + stage counts +
+  next-digest from a single scoped query on page load. No live channel. Already ~80% of the emotional value.
+- **S6b — live + animated** *(rides F4):* SSE pushes deltas; counts animate; the activity ticker streams.
+  Build only when the F4 channel exists for the app anyway — shared infrastructure, not a bespoke build.
+
+**Risks to name out loud:** (1) **scope creep** — a "delightful animated dashboard" is a bottomless time
+sink; cap it at the table above and resist turning it into analytics. (2) **honesty** — the suppression
+ratio must be *real* (in-scope events vs surfaced), never an inflated vanity number, or it corrodes the very
+trust it's meant to build. (3) **perf/privacy** — it's per-subscriber data; same RLS + no-client-private-
+data rules as every other read (§11). (4) **it's delight, not core** — sequence it behind the digest view,
+provenance, and feedback; it amplifies trust but doesn't *deliver* the digest.
+
+---
+
+## 11. Security checklist (the deltas a web surface introduces)
 
 - **RLS on the read path** — every read through `with_scope(session.subscriber)`; non-owner role, no
   `BYPASSRLS`, `FORCE RLS`. The view inherits the build path's isolation posture (design §12). *Primary.*
@@ -279,7 +467,7 @@ app is an additive layer, never a fork.
 
 ---
 
-## 8. Open decisions (for you)
+## 12. Open decisions (for you)
 
 1. **Pull F0 (read-only digest view) forward to sit alongside M3, or hold the entire frontend to M5?**
    Recommendation: pull F0 forward — it's small, it unblocks demoing M3/M4 as a product, and it forces the
@@ -296,3 +484,12 @@ app is an additive layer, never a fork.
    Option A keeps it small enough to start inside `serve` and split later.
 5. **Branding/theme ownership** — the email renderer already externalizes brand/masthead/footer
    (`DigestContent`, `render.rs`); the web view should share that config so email and web stay one identity.
+6. **The "system working" dashboard (§10) — static snapshot now, or hold for the live version?**
+   Recommendation: ship **S6a (static snapshot)** alongside M4 (it's ~one scoped query and captures most of
+   the value), and let **S6b (live/animated)** ride the F4 channel the app needs anyway. Cap its scope hard
+   — it's high-delight, high-creep.
+7. **Cold-start strategy for onboarding (§9)** — explicit-expectation only, or build a **"preview now"**
+   off-schedule generation so a new user sees a digest immediately? Recommendation: expectation-setting for
+   F0; add "preview now" if early users bounce on the empty first screen.
+8. **Settings information architecture (§7)** — confirm the five-tab split (Schedule · Content · Delivery ·
+   Connections · Account), and whether "timezone = auto" is the default (recommended) or opt-in.
