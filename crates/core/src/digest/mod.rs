@@ -20,6 +20,7 @@ use crate::common::kind::SourceKind;
 use crate::digest::select::{select, Decision, Verdict};
 use crate::digest::store::{
     candidates_in_lookback, cluster_display, create_with_items, mark_delivered, render_items,
+    render_items_for_clusters,
 };
 use crate::digest::subscriber::{load_subscriber, SubscriberRow};
 
@@ -128,6 +129,44 @@ pub async fn generate(
         .await
         .context("mark delivered")?;
 
+    Ok(DigestOutcome::Delivered { items: items.len() })
+}
+
+/// Ad-hoc dispatch: render and send a one-off digest for `subscriber_id` over the **last
+/// `lookback_days`**, *without* touching the subscriber's schedule or freezing a scheduled digest.
+/// It bypasses the due check and the `(subscriber, window_end)` freeze — purely a manual
+/// preview/send (the `debug digest-dispatch` command), so it never disturbs the subscriber's real
+/// cadence, `last_run_at`, or the de-dup history. Returns `Empty` if the lookback yields nothing.
+pub async fn dispatch_now(
+    pool: &PgPool,
+    mailer: &impl Mailer,
+    subscriber_id: Uuid,
+    lookback_days: i32,
+    content: &DigestContent<'_>,
+) -> Result<DigestOutcome> {
+    let sub = load_subscriber(pool, subscriber_id)
+        .await
+        .context("load subscriber")?
+        .ok_or_else(|| anyhow!("subscriber {subscriber_id} not found"))?;
+
+    // Explicit lookback floor = now − lookback_days (last_run_at is ignored — this is off-schedule).
+    let candidates = candidates_in_lookback(pool, None, lookback_days)
+        .await
+        .context("collect candidates")?;
+    let decisions = select(candidates, sub.max_items as usize);
+    log_selection(sub.id, sub.max_items as usize, &decisions);
+    let selected = selected_ids(&decisions);
+    if selected.is_empty() {
+        return Ok(DigestOutcome::Empty);
+    }
+
+    let items = render_items_for_clusters(pool, &selected)
+        .await
+        .context("load render items")?;
+    // The rendered date header uses now() — this digest isn't tied to a scheduled boundary.
+    let message =
+        render::render(mailer.from(), &sub.email, Utc::now(), &sub.timezone, &items, content)?;
+    mailer.send(message).await?;
     Ok(DigestOutcome::Delivered { items: items.len() })
 }
 

@@ -54,6 +54,14 @@ pub enum DebugCommand {
     BuildRun,
     /// Run GenerateDigest once for a subscriber, inline (select → render → deliver)
     DigestRun { subscriber: Uuid },
+    /// Dispatch a one-off digest NOW over the last N days, ignoring the subscriber's schedule.
+    /// Does not advance their watermark or freeze a scheduled digest — a manual preview/send.
+    DigestDispatch {
+        subscriber: Uuid,
+        /// Lookback window in days
+        #[arg(long, default_value_t = 7)]
+        lookback_days: i32,
+    },
     /// List recent digests with their state
     DigestList {
         #[arg(long, default_value = "20")]
@@ -186,6 +194,19 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> R
             let outcome = digest::generate(pool, &sender, subscriber, &email.content()).await?;
             println!("{outcome:?}");
         }
+        DebugCommand::DigestDispatch {
+            subscriber,
+            lookback_days,
+        } => {
+            if lookback_days < 1 {
+                anyhow::bail!("--lookback-days must be >= 1");
+            }
+            let sender = email.build_sender()?;
+            let outcome =
+                digest::dispatch_now(pool, &sender, subscriber, lookback_days, &email.content())
+                    .await?;
+            println!("{outcome:?}");
+        }
         DebugCommand::DigestList { limit } => {
             let rows = digest::store::list_digests(pool, limit).await?;
             if rows.is_empty() {
@@ -223,7 +244,7 @@ fn print_explain(rows: &[digest::ExplainRow]) {
     use bulletin_core::digest::select::Verdict;
 
     if rows.is_empty() {
-        println!("no candidate clusters in this subscriber's window");
+        println!("no candidate clusters in this subscriber's lookback");
         return;
     }
 
@@ -250,9 +271,10 @@ fn print_explain(rows: &[digest::ExplainRow]) {
     println!("\n{selected} selected · {over_cap} over cap");
 }
 
-/// Renders the `status` dashboard: each subsystem on its own line(s), with the watchpoints that
-/// usually explain "why is nothing happening?" (unbuilt events, build lag, due counts, queue
-/// backlog) called out inline.
+/// Renders the `status` dashboard: each subsystem on its own line(s). The watchpoints to scan are
+/// materialization freshness (unbuilt events, build lag, latest ingest), projection backlog
+/// (subscribers due now, pending digests), and queue depth. Build lag no longer gates digests —
+/// a due subscriber fires regardless; it just means very recent events may ride the next one.
 fn print_status(r: &StatusReport) {
     fn ts(t: Option<chrono::DateTime<chrono::Utc>>) -> String {
         t.map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
@@ -292,8 +314,10 @@ fn print_status(r: &StatusReport) {
 
     let s = &r.subscribers;
     println!(
-        "subscribers  {} total; {} due now; next run {}",
+        "subscribers  {} total ({} daily, {} weekly); {} due now; next run {}",
         s.total,
+        s.daily,
+        s.weekly,
         s.due_now,
         ts(s.next_run)
     );

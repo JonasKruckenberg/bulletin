@@ -52,7 +52,10 @@ pub struct ClusterStats {
 #[derive(Debug)]
 pub struct SubscriberStats {
     pub total: i64,
-    /// Subscribers whose `next_run_at` has passed (a digest is owed).
+    pub daily: i64,
+    pub weekly: i64,
+    /// Subscribers whose `next_run_at` has passed (a digest is owed). With the build gate gone,
+    /// this is exactly what the next tick will dispatch.
     pub due_now: i64,
     pub next_run: Option<DateTime<Utc>>,
 }
@@ -169,6 +172,8 @@ async fn cluster_stats(pool: &PgPool) -> Result<ClusterStats, sqlx::Error> {
 async fn subscriber_stats(pool: &PgPool) -> Result<SubscriberStats, sqlx::Error> {
     let row = sqlx::query(
         "SELECT count(*) AS total,
+                count(*) FILTER (WHERE freq = 'daily')  AS daily,
+                count(*) FILTER (WHERE freq = 'weekly') AS weekly,
                 count(*) FILTER (WHERE next_run_at <= now()) AS due_now,
                 min(next_run_at) AS next_run
          FROM subscriber",
@@ -177,6 +182,8 @@ async fn subscriber_stats(pool: &PgPool) -> Result<SubscriberStats, sqlx::Error>
     .await?;
     Ok(SubscriberStats {
         total: row.get("total"),
+        daily: row.get("daily"),
+        weekly: row.get("weekly"),
         due_now: row.get("due_now"),
         next_run: row.get("next_run"),
     })

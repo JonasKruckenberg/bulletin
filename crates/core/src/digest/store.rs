@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::common::kind::SourceKind;
 use crate::digest::select::Candidate;
 use chrono::{DateTime, Utc};
@@ -164,6 +166,35 @@ pub async fn render_items(pool: &PgPool, digest_id: Uuid) -> Result<Vec<RenderIt
     })
     .fetch_all(pool)
     .await
+}
+
+/// Render items for an explicit, ordered set of cluster ids — the ad-hoc dispatch path, whose
+/// selection isn't frozen into `digest_item` rows. Preserves the given order; silently skips ids
+/// with no matching cluster.
+pub async fn render_items_for_clusters(
+    pool: &PgPool,
+    cluster_ids: &[Uuid],
+) -> Result<Vec<RenderItem>, sqlx::Error> {
+    let mut by_id: HashMap<Uuid, RenderItem> = sqlx::query(
+        "SELECT id, title, link, source, last_event_time FROM cluster WHERE id = ANY($1)",
+    )
+    .bind(cluster_ids)
+    .try_map(|row: PgRow| {
+        Ok((
+            row.get::<Uuid, _>("id"),
+            RenderItem {
+                title: row.get("title"),
+                link: row.get("link"),
+                source: row.try_get("source")?,
+                last_event_time: row.get("last_event_time"),
+            },
+        ))
+    })
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .collect();
+    Ok(cluster_ids.iter().filter_map(|id| by_id.remove(id)).collect())
 }
 
 /// Marks the digest delivered and advances the subscriber's schedule in one transaction, so the
