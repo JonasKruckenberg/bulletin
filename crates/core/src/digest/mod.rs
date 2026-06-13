@@ -128,7 +128,7 @@ pub async fn generate(
             &sub.email,
             window_end,
             &sub.timezone,
-            greeting::salutation(sub.digest_time),
+            &greeting::salutation(sub.digest_time, sub.name.as_deref()),
             content,
         )?;
         mailer.send(message).await?;
@@ -144,6 +144,7 @@ pub async fn generate(
         sub.digest_time,
         sub.recurrence,
         greeting::seed_for(sub.id, window_end),
+        sub.name.as_deref(),
     );
     let message = render::render(
         mailer.from(),
@@ -197,6 +198,7 @@ pub async fn dispatch_now(
         sub.digest_time,
         sub.recurrence,
         greeting::seed_for(sub.id, now),
+        sub.name.as_deref(),
     );
     let message = render::render(
         mailer.from(),

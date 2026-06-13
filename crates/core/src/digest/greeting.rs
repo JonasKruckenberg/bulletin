@@ -11,14 +11,26 @@ use uuid::Uuid;
 
 use crate::digest::subscriber::Recurrence;
 
-/// Salutation for the subscriber's local delivery time — what the wall clock would say when the
-/// mail lands. Late nights and the small hours greet as "evening" (a 2am "good morning" reads odd).
-/// Shared with the empty-digest mail, which splices it onto its own "all caught up" copy.
-pub(crate) fn salutation(t: NaiveTime) -> &'static str {
+/// The bare time-of-day phrase for the subscriber's local delivery time — what the wall clock would
+/// say when the mail lands. Late nights and the small hours greet as "evening" (a 2am "good morning"
+/// reads odd).
+fn time_of_day(t: NaiveTime) -> &'static str {
     match t.hour() {
         5..=11 => "Good morning",
         12..=16 => "Good afternoon",
         _ => "Good evening",
+    }
+}
+
+/// Salutation for the subscriber's local delivery time, personalized with their `name` when we have
+/// one: "Good morning" → "Good morning, Alice". A blank/whitespace name is treated as absent (the
+/// store normalizes those to `None`, but we guard here too). Shared with the empty-digest mail,
+/// which splices it onto its own "all caught up" copy.
+pub(crate) fn salutation(t: NaiveTime, name: Option<&str>) -> String {
+    let base = time_of_day(t);
+    match name.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(name) => format!("{base}, {name}"),
+        None => base.to_string(),
     }
 }
 
@@ -57,11 +69,17 @@ const VARIANTS: &[&str] = &[
     "{salutation}. Channel your inner calm; your {cadence} digest awaits.",
 ];
 
-/// Builds the greeting for one digest: `digest_time` chooses the salutation, `recurrence` the
-/// cadence word, and `seed` the phrasing (pass [`seed_for`] for a stable-per-digest choice).
-pub(crate) fn greeting(digest_time: NaiveTime, recurrence: Recurrence, seed: u64) -> String {
+/// Builds the greeting for one digest: `digest_time` chooses the salutation, `name` personalizes it,
+/// `recurrence` the cadence word, and `seed` the phrasing (pass [`seed_for`] for a
+/// stable-per-digest choice).
+pub(crate) fn greeting(
+    digest_time: NaiveTime,
+    recurrence: Recurrence,
+    seed: u64,
+    name: Option<&str>,
+) -> String {
     VARIANTS[(seed % VARIANTS.len() as u64) as usize]
-        .replace("{salutation}", salutation(digest_time))
+        .replace("{salutation}", &salutation(digest_time, name))
         .replace("{cadence}", cadence_word(recurrence))
 }
 
@@ -80,7 +98,7 @@ mod tests {
 
     #[test]
     fn salutation_tracks_time_of_day() {
-        let at = |h| salutation(NaiveTime::from_hms_opt(h, 0, 0).unwrap());
+        let at = |h| salutation(NaiveTime::from_hms_opt(h, 0, 0).unwrap(), None);
         assert_eq!(at(5), "Good morning");
         assert_eq!(at(11), "Good morning");
         assert_eq!(at(12), "Good afternoon");
@@ -90,15 +108,39 @@ mod tests {
     }
 
     #[test]
+    fn salutation_personalizes_with_name() {
+        let nine = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+        assert_eq!(salutation(nine, Some("Alice")), "Good morning, Alice");
+        // A blank or whitespace name falls back to the bare salutation.
+        assert_eq!(salutation(nine, Some("")), "Good morning");
+        assert_eq!(salutation(nine, Some("  ")), "Good morning");
+        // Surrounding whitespace is trimmed.
+        assert_eq!(salutation(nine, Some("  Bob ")), "Good morning, Bob");
+    }
+
+    #[test]
+    fn greeting_threads_the_name_into_the_salutation() {
+        let nine = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+        for s in 0..VARIANTS.len() as u64 {
+            let line = greeting(nine, Recurrence::Daily, s, Some("Alice"));
+            assert!(
+                line.starts_with("Good morning, Alice"),
+                "name should open the greeting: {line}"
+            );
+            assert!(line.contains("daily"));
+        }
+    }
+
+    #[test]
     fn every_variant_is_well_formed() {
         let nine = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
         let mut seen = std::collections::HashSet::new();
         for s in 0..VARIANTS.len() as u64 {
-            let line = greeting(nine, Recurrence::Daily, s);
+            let line = greeting(nine, Recurrence::Daily, s, None);
             // Opens with the salutation, names the cadence, and is a single clean line...
             assert!(line.starts_with("Good morning"));
             assert!(line.contains("daily"));
-            assert!(greeting(nine, Recurrence::Weekly { weekday: 2 }, s).contains("weekly"));
+            assert!(greeting(nine, Recurrence::Weekly { weekday: 2 }, s, None).contains("weekly"));
             assert!(!line.contains('\n'));
             // ...with no leaked placeholder and no em-dash (a deliberate house-style choice).
             assert!(

@@ -166,9 +166,16 @@ async fn no_build_gate_unbuilt_events_ride_next_fire() {
     let (pool, _pg) = setup().await;
 
     insert_public(&pool, "a", "a", "Pre-existing", 100).await;
-    let sub_id = insert_subscriber(&pool, "me@example.com", Recurrence::Daily, "UTC", nine_am())
-        .await
-        .unwrap();
+    let sub_id = insert_subscriber(
+        &pool,
+        "me@example.com",
+        None,
+        Recurrence::Daily,
+        "UTC",
+        nine_am(),
+    )
+    .await
+    .unwrap();
     force_due(&pool, sub_id).await;
 
     // Due regardless of build state — no gate.
@@ -204,9 +211,16 @@ async fn digest_delivery_and_idempotency() {
 
     insert_public(&pool, "a", "a", "Article A", 100).await;
     insert_public(&pool, "b", "b", "Article B", 200).await;
-    let sub_id = insert_subscriber(&pool, "me@example.com", Recurrence::Daily, "UTC", nine_am())
-        .await
-        .unwrap();
+    let sub_id = insert_subscriber(
+        &pool,
+        "me@example.com",
+        None,
+        Recurrence::Daily,
+        "UTC",
+        nine_am(),
+    )
+    .await
+    .unwrap();
     force_due(&pool, sub_id).await;
     build_all(&pool).await;
 
@@ -263,6 +277,7 @@ async fn insert_schedules_next_local_digest_time() {
     let id = insert_subscriber(
         &pool,
         "ny@example.com",
+        None,
         Recurrence::Daily,
         "America/New_York",
         NaiveTime::from_hms_opt(7, 30, 0).unwrap(),
@@ -282,6 +297,59 @@ async fn insert_schedules_next_local_digest_time() {
     );
 }
 
+// An optional display name round-trips through signup, and a blank/whitespace one normalizes to
+// absent (NULL) rather than an empty string the greeting would awkwardly splice in.
+#[tokio::test]
+async fn insert_stores_optional_name() {
+    let (pool, _pg) = setup().await;
+
+    let named = insert_subscriber(
+        &pool,
+        "alice@example.com",
+        Some("  Alice  "),
+        Recurrence::Daily,
+        "UTC",
+        nine_am(),
+    )
+    .await
+    .unwrap();
+    // Stored trimmed.
+    assert_eq!(
+        load_subscriber(&pool, named).await.unwrap().unwrap().name,
+        Some("Alice".to_string())
+    );
+
+    let blank = insert_subscriber(
+        &pool,
+        "blank@example.com",
+        Some("   "),
+        Recurrence::Daily,
+        "UTC",
+        nine_am(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        load_subscriber(&pool, blank).await.unwrap().unwrap().name,
+        None
+    );
+
+    let none = insert_subscriber(
+        &pool,
+        "none@example.com",
+        None,
+        Recurrence::Daily,
+        "UTC",
+        nine_am(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        load_subscriber(&pool, none).await.unwrap().unwrap().name,
+        None
+    );
+}
+
 // Updating timezone/digest time reschedules to the next earliest occurrence WITHOUT losing the
 // pending window: last_run_at (the selection lower bound) is untouched, so every event since the
 // last delivery still falls in the next digest — the window only reshapes.
@@ -289,9 +357,16 @@ async fn insert_schedules_next_local_digest_time() {
 async fn update_preferences_snaps_without_losing_window() {
     let (pool, _pg) = setup().await;
 
-    let id = insert_subscriber(&pool, "t@example.com", Recurrence::Daily, "UTC", nine_am())
-        .await
-        .unwrap();
+    let id = insert_subscriber(
+        &pool,
+        "t@example.com",
+        None,
+        Recurrence::Daily,
+        "UTC",
+        nine_am(),
+    )
+    .await
+    .unwrap();
 
     // A prior delivery establishes a window lower bound that must survive the reschedule.
     let last = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
@@ -334,6 +409,7 @@ async fn insert_rejects_unknown_timezone() {
     let err = insert_subscriber(
         &pool,
         "bad@example.com",
+        None,
         Recurrence::Daily,
         "Mars/Phobos",
         nine_am(),
@@ -351,6 +427,7 @@ async fn weekly_schedules_on_chosen_weekday() {
     let id = insert_subscriber(
         &pool,
         "w@example.com",
+        None,
         Recurrence::Weekly { weekday: 2 },
         "UTC",
         NaiveTime::from_hms_opt(17, 0, 0).unwrap(),
@@ -382,9 +459,16 @@ async fn weekly_schedules_on_chosen_weekday() {
 async fn advance_coalesces_missed_boundaries() {
     let (pool, _pg) = setup().await;
 
-    let id = insert_subscriber(&pool, "c@example.com", Recurrence::Daily, "UTC", nine_am())
-        .await
-        .unwrap();
+    let id = insert_subscriber(
+        &pool,
+        "c@example.com",
+        None,
+        Recurrence::Daily,
+        "UTC",
+        nine_am(),
+    )
+    .await
+    .unwrap();
     // Pretend the worker was down: the boundary is days in the past.
     sqlx::query(
         "UPDATE subscriber

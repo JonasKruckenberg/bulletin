@@ -56,6 +56,9 @@ impl Recurrence {
 pub struct SubscriberRow {
     pub id: Uuid,
     pub email: String,
+    /// Optional display name used to personalize the digest greeting. `None` (or blank) falls back
+    /// to the bare time-of-day salutation.
+    pub name: Option<String>,
     pub recurrence: Recurrence,
     pub max_items: i32,
     pub timezone: String,
@@ -67,12 +70,13 @@ pub struct SubscriberRow {
 /// The column list every read shares — kept in one place so a schema add can't drift between
 /// `load`, `list`, and `due` (they must agree for selection to be consistent).
 const SELECT_COLS: &str =
-    "id, email, freq, on_weekday, max_items, timezone, digest_time, next_run_at, last_run_at";
+    "id, email, name, freq, on_weekday, max_items, timezone, digest_time, next_run_at, last_run_at";
 
 fn row_to_subscriber(row: PgRow) -> Result<SubscriberRow, sqlx::Error> {
     Ok(SubscriberRow {
         id: row.get("id"),
         email: row.get("email"),
+        name: row.get("name"),
         recurrence: Recurrence::from_columns(row.get("freq"), row.get("on_weekday"))?,
         max_items: row.get("max_items"),
         timezone: row.get("timezone"),
@@ -88,17 +92,19 @@ fn row_to_subscriber(row: PgRow) -> Result<SubscriberRow, sqlx::Error> {
 pub async fn insert_subscriber(
     pool: &PgPool,
     email: &str,
+    name: Option<&str>,
     recurrence: Recurrence,
     timezone: &str,
     digest_time: NaiveTime,
 ) -> Result<Uuid, sqlx::Error> {
     let (freq, on_weekday) = recurrence.columns();
     let row = sqlx::query(
-        "INSERT INTO subscriber (email, freq, on_weekday, timezone, digest_time, next_run_at)
-         VALUES ($1, $2, $3, $4, $5, next_run(now(), $4, $5, $2, $3))
+        "INSERT INTO subscriber (email, name, freq, on_weekday, timezone, digest_time, next_run_at)
+         VALUES ($1, $2, $3, $4, $5, $6, next_run(now(), $5, $6, $3, $4))
          RETURNING id",
     )
     .bind(email)
+    .bind(normalize_name(name))
     .bind(freq)
     .bind(on_weekday)
     .bind(timezone)
@@ -106,6 +112,14 @@ pub async fn insert_subscriber(
     .fetch_one(pool)
     .await?;
     Ok(row.get("id"))
+}
+
+/// Trims a supplied name and treats a blank one as absent, so a stray `--name ''` (or whitespace)
+/// is stored as `NULL` rather than an empty string the greeting would awkwardly splice in.
+fn normalize_name(name: Option<&str>) -> Option<String> {
+    name.map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
 }
 
 /// Re-points a subscriber onto a new recurrence (frequency / weekday / timezone / local time) and
