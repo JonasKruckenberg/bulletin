@@ -4,6 +4,11 @@
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-unstable";
 
+    # crane splits the build into a deps-only layer (keyed on Cargo.lock) and a thin
+    # workspace layer, so source-only changes reuse the cached dependency artifacts
+    # instead of recompiling the whole dependency graph on every commit.
+    crane.url = "github:ipetkov/crane";
+
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -14,6 +19,7 @@
     {
       self,
       nixpkgs,
+      crane,
       rust-overlay,
     }:
     let
@@ -62,29 +68,34 @@
         let
           # Build with the exact toolchain pinned in rust-toolchain.toml.
           rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-          rustPlatform = pkgs.makeRustPlatform {
-            cargo = rustToolchain;
-            rustc = rustToolchain;
+          craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
+
+          # No DB or `.sqlx` cache is needed at build time: all queries are runtime
+          # `.bind` and migrations embed via `sqlx::migrate!` (the `src` filter above
+          # keeps the `.sql` files). Tests need a live Postgres, so they run in the
+          # devShell (nextest), not the sandbox.
+          commonArgs = {
+            inherit src;
+            strictDeps = true;
+            doCheck = false;
           };
 
-          # `cargoLock.lockFile` vendors the whole workspace from the committed
-          # lockfile (no git deps → no cargoHash). No DB or `.sqlx` cache is needed
-          # at build time: all queries are runtime `.bind` and migrations embed via
-          # `sqlx::migrate!`. Tests need a live Postgres, so they run in the devShell
-          # (nextest), not the sandbox.
+          # Deps-only layer: keyed on Cargo.lock/Cargo.toml (crane dummies out the
+          # workspace sources), so source-only commits reuse this artifact instead of
+          # recompiling the whole dependency graph. Built once, cached in the Nix store.
+          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+
           mkBin =
             { pname, crate }:
-            rustPlatform.buildRustPackage {
-              inherit pname src;
-              version = "0.1.0";
-              cargoLock.lockFile = ./Cargo.lock;
-              cargoBuildFlags = [
-                "-p"
-                crate
-              ];
-              doCheck = false;
-              meta.mainProgram = pname;
-            };
+            craneLib.buildPackage (
+              commonArgs
+              // {
+                inherit pname cargoArtifacts;
+                version = "0.1.0";
+                cargoExtraArgs = "-p ${crate}";
+                meta.mainProgram = pname;
+              }
+            );
 
           bulletin = mkBin {
             pname = "bulletin";
