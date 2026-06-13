@@ -167,7 +167,10 @@ fn render_html(
 
     let mut rows = String::new();
     for (i, item) in items.iter().enumerate() {
-        rows.push_str(&render_item_row(i + 1, item, &category, &item_summary));
+        if i > 0 {
+            rows.push_str(&soft_divider());
+        }
+        rows.push_str(&render_item_row(item, &category, &item_summary));
     }
 
     format!(
@@ -198,8 +201,8 @@ fn render_html(
 <div style="font-family:{SERIF};font-size:15px;font-style:italic;font-weight:700;color:{ACCENT};margin:40px 0 0 0;">In this digest &middot; {count} item{plural}</div>
 </td>
 </tr>
-{rows}<tr>
-<td style="padding:40px 52px 52px 52px;border-top:1px solid {BORDER};">
+{rows}{soft_divider}<tr>
+<td style="padding:30px 52px 52px 52px;">
 <div style="font-family:{SANS};font-size:12px;line-height:1.7;color:{INK_MUTED};text-align:center;">{footer}</div>
 </td>
 </tr>
@@ -211,6 +214,24 @@ fn render_html(
 </html>
 "#,
         date_rule = date_rule(&date.to_string()),
+        soft_divider = soft_divider(),
+    )
+}
+
+/// A gentle separator between items: a short centered hairline rather than a full-width rule, so
+/// it marks a break without slicing the column edge to edge. Echoes the date-divider's hairlines.
+fn soft_divider() -> String {
+    format!(
+        r#"<tr>
+<td align="center" style="padding:6px 52px;">
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" align="center">
+<tr>
+<td width="44" height="1" style="width:44px;height:1px;line-height:1px;font-size:0;background-color:{BORDER};">&nbsp;</td>
+</tr>
+</table>
+</td>
+</tr>
+"#
     )
 }
 
@@ -229,11 +250,11 @@ fn date_rule(date: &str) -> String {
     )
 }
 
-/// One item: a terracotta number badge beside the headline (a link when the cluster has one),
-/// followed by a placeholder category + summary and the source · time caption, set off from the
-/// previous item by a hairline rule. `category` and `item_summary` are pre-escaped placeholders;
-/// the source · time caption is debug-only and marked for later removal.
-fn render_item_row(number: usize, item: &RenderItem, category: &str, item_summary: &str) -> String {
+/// One item: the headline (a link when the cluster has one), then a placeholder category and
+/// summary, and the source · time caption. `category` and `item_summary` are pre-escaped
+/// placeholders; the source · time caption is debug-only and marked for later removal. Items are
+/// separated by [`soft_divider`], not a per-item rule.
+fn render_item_row(item: &RenderItem, category: &str, item_summary: &str) -> String {
     let title = escape(&item.title);
     let headline = match &item.link {
         Some(link) => format!(
@@ -250,17 +271,7 @@ fn render_item_row(number: usize, item: &RenderItem, category: &str, item_summar
 
     format!(
         r#"<tr>
-<td style="padding:34px 52px;border-top:1px solid {BORDER};">
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
-<tr>
-<td valign="top" width="42" style="padding-top:4px;">
-<table role="presentation" cellpadding="0" cellspacing="0" border="0">
-<tr>
-<td width="26" height="26" align="center" valign="middle" style="width:26px;height:26px;border:1.5px solid {ACCENT};border-radius:50%;font-family:{SANS};font-size:11px;font-weight:700;color:{ACCENT};line-height:1;">{number}</td>
-</tr>
-</table>
-</td>
-<td valign="top">
+<td style="padding:30px 52px;">
 {headline}
 <!-- PLACEHOLDER: per-item category — remove or replace once items carry a category -->
 <div style="margin-top:9px;font-family:{SANS};font-size:12px;font-weight:500;letter-spacing:0.04em;color:{ACCENT};">{category}</div>
@@ -274,9 +285,6 @@ fn render_item_row(number: usize, item: &RenderItem, category: &str, item_summar
 <span style="color:{INK_MUTED};">&nbsp;&middot;&nbsp;{time}</span>
 </div>
 <!-- /DEBUG -->
-</td>
-</tr>
-</table>
 </td>
 </tr>
 "#
@@ -339,9 +347,6 @@ mod tests {
         // Source labels surface the kind.
         assert!(html.contains(">rss<"));
         assert!(html.contains(">github<"));
-        // The item numbers render.
-        assert!(html.contains(">1<"));
-        assert!(html.contains(">2<"));
     }
 
     #[test]
