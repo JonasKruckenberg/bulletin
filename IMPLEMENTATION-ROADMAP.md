@@ -1,8 +1,16 @@
 # Bulletin — Implementation Roadmap
 
 **Status:** Proposed build plan
-**Last updated:** 2026-06-08
+**Last updated:** 2026-06-13
 **Reads against:** `digest-system-design.md` (product + data model), `digest-technical-architecture.md` (Rust runtime), `digest-data-sources.md` (source backlog).
+
+> **Note (2026-06-13):** the design docs were revised to the **read/write split** (CQRS) — decoupled
+> materialization (best-effort, durable) vs projection (per-subscriber, punctual), **freshness-scored
+> lookback** selection over the durable log (no exactly-once window), **coalescing** catch-up, and
+> **daily/weekly** recurrence at a local time (monthly dropped). See `digest-system-design.md` §3.0,
+> §9.2–§9.4. The milestone *sequencing* below is unchanged; the M1 tick may stay a simple chained
+> build→generate and decouple later — the architecture permits both since generate just reads the
+> latest materialized snapshot.
 
 This is the *order of operations* for building Bulletin. The design docs already separate
 v1 from "deferred." This roadmap goes one step further: it is **aggressively scoped** — it
