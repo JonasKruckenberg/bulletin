@@ -36,7 +36,7 @@ pub enum DigestOutcome {
         #[allow(dead_code)]
         items: usize,
     },
-    /// Window had nothing to report; watermark advanced without sending.
+    /// Window had nothing to report; sent an "all caught up" note and advanced the watermark.
     Empty,
     /// Already delivered for this window (idempotent re-run).
     AlreadyDelivered,
@@ -119,7 +119,17 @@ pub async fn generate(
         .await
         .context("load render items")?;
     if items.is_empty() {
-        // Nothing to send, but advance so the subscriber isn't perpetually due.
+        // Empty windows are rare — going silent reads as a broken pipeline. Send a cheerful
+        // "you're all caught up" note instead, then advance the schedule so the subscriber
+        // isn't perpetually due.
+        let message = render::render_empty(
+            mailer.from(),
+            &sub.email,
+            window_end,
+            &sub.timezone,
+            content,
+        )?;
+        mailer.send(message).await?;
         mark_delivered(pool, digest.id, sub.id, snapshot_at)
             .await
             .context("mark delivered")?;
