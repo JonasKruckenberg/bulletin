@@ -26,7 +26,7 @@ pub trait Mailer {
 /// for removal.
 #[derive(Clone, Copy)]
 pub struct DigestContent<'a> {
-    /// Small-caps brand label at the very top, and the subject-line prefix (e.g. "Bulletin").
+    /// Small-caps brand label at the very top (e.g. "Bulletin").
     pub brand: &'a str,
     /// Serif masthead headline beneath the brand label (e.g. "Your Digest").
     pub title: &'a str,
@@ -63,8 +63,8 @@ impl Default for DigestContent<'_> {
 /// Renders a digest as a `multipart/alternative` email: an HTML view (a clean, editorial card of
 /// the selected items) with a plaintext fallback for clients that can't — or won't — render HTML.
 /// One cluster per item, in the frozen selection order. All the non-item chrome (brand, title,
-/// footer, and the brand-prefixed subject) comes from `content`, so callers fully parametrize
-/// what's shown.
+/// footer) comes from `content`, so callers fully parametrize what's shown; the subject line is the
+/// per-digest `greeting`, so the inbox preview matches the lead.
 pub(crate) fn render(
     from: &str,
     to: &str,
@@ -74,8 +74,9 @@ pub(crate) fn render(
     greeting: &str,
     content: &DigestContent<'_>,
 ) -> Result<Message> {
-    let plural = if items.len() == 1 { "" } else { "s" };
-    let subject = format!("{}: {} new item{plural}", content.brand, items.len());
+    // The greeting doubles as the subject line, so the inbox preview opens in the same warm,
+    // time-of-day voice as the digest's lead (and varies per window the same way).
+    let subject = greeting;
 
     // Dates and times are shown in the subscriber's own zone so the masthead date matches when
     // they actually receive it. An unparseable name can't reach here (the DB rejects it on
