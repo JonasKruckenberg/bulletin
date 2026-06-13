@@ -17,20 +17,73 @@ pub trait Mailer {
     fn send(&self, message: Message) -> impl std::future::Future<Output = Result<()>> + Send;
 }
 
+/// The configurable, non-item content of a digest email — everything that isn't the item list.
+/// Lets the caller supply the brand label, masthead title, footer note, and subject prefix (e.g.
+/// from config) instead of baking them into the renderer, so the same layout can be re-skinned
+/// without touching this module.
+#[derive(Clone, Copy)]
+pub struct DigestContent<'a> {
+    /// Small-caps brand label at the very top (e.g. "Bulletin").
+    pub brand: &'a str,
+    /// Serif masthead headline beneath the brand label (e.g. "Your Digest").
+    pub title: &'a str,
+    /// The "big picture" lead — an editorial summary of the whole digest, shown under the masthead.
+    /// The data model doesn't produce this yet, so it renders a parametric **placeholder** marked
+    /// in the HTML for later removal/replacement.
+    pub summary: &'a str,
+    /// Per-item category label (e.g. "Geopolitics/Diplomacy"). Not in the data model yet, so it
+    /// renders the same parametric **placeholder** under every headline, HTML-marked for removal.
+    pub item_category: &'a str,
+    /// Per-item summary/TL;DR. Not in the data model yet, so it renders the same parametric
+    /// **placeholder** under every headline, HTML-marked for removal.
+    pub item_summary: &'a str,
+    /// Footer note rendered beneath the items.
+    pub footer: &'a str,
+    /// Subject-line prefix; the renderer appends the item count
+    /// (e.g. "Bulletin" → "Bulletin: 3 new items").
+    pub subject_prefix: &'a str,
+}
+
+impl Default for DigestContent<'_> {
+    fn default() -> Self {
+        Self {
+            brand: "Bulletin",
+            title: "Your Digest",
+            // Lorem-ipsum stand-ins for sections the reference design has but our data model
+            // doesn't feed yet. Wrapped in `<!-- PLACEHOLDER … -->` markers in the rendered HTML.
+            summary: "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod \
+                      tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, \
+                      quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo.",
+            item_category: "Lorem / Ipsum",
+            item_summary: "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do \
+                           eiusmod tempor incididunt ut labore et dolore magna aliqua.",
+            footer: "You're receiving this digest from Bulletin, \
+                     gathered from the sources you subscribed to.",
+            subject_prefix: "Bulletin",
+        }
+    }
+}
+
 /// Renders a digest as a `multipart/alternative` email: an HTML view (a clean, editorial card of
 /// the selected items) with a plaintext fallback for clients that can't — or won't — render HTML.
-/// One cluster per item, in the frozen selection order.
+/// One cluster per item, in the frozen selection order. All the non-item chrome (brand, title,
+/// footer, subject) comes from `content`, so callers fully parametrize what's shown.
 pub(crate) fn render(
     from: &str,
     to: &str,
     window_end: DateTime<Utc>,
     items: &[RenderItem],
+    content: &DigestContent<'_>,
 ) -> Result<Message> {
     let plural = if items.len() == 1 { "" } else { "s" };
-    let subject = format!("Bulletin: {} new item{plural}", items.len());
+    let subject = format!(
+        "{}: {} new item{plural}",
+        content.subject_prefix,
+        items.len()
+    );
 
     let plain = render_plain(window_end, items);
-    let html = render_html(window_end, items);
+    let html = render_html(window_end, items, content);
 
     Message::builder()
         .from(
@@ -75,6 +128,7 @@ fn render_plain(window_end: DateTime<Utc>, items: &[RenderItem]) -> String {
 const BG: &str = "#fefbf3"; // warm cream backdrop
 const SURFACE: &str = "#fffdf8"; // the card, a touch lighter than the page
 const INK: &str = "#2c1810"; // headline ink
+const INK_BODY: &str = "#3d2e22"; // running body copy (summaries, lead)
 const INK_MUTED: &str = "#a0927b"; // captions, dates, footer
 const ACCENT: &str = "#d35327"; // terracotta — brand, numbers, source labels
 const BORDER: &str = "#ddd4c2"; // hairline rules between items
@@ -82,21 +136,38 @@ const SERIF: &str = "Georgia, 'Times New Roman', serif";
 const SANS: &str = "'Helvetica Neue', Helvetica, Arial, sans-serif";
 
 /// HTML view: a centered editorial card on warm paper — a small-caps brand label, a serif
-/// masthead, a `── date ──` rule, then the selected items as a ruled list (a terracotta number,
-/// the headline as a link, and a source · time caption), closed by a rule and footer.
+/// masthead, a `── date ──` rule, a "big picture" lead, then the selected items as a ruled list
+/// (a terracotta number, the headline link, a category, a summary, and a source · time caption),
+/// closed by a rule and footer.
+///
+/// Sections the data model doesn't feed yet (the lead, per-item category/summary) render
+/// parametric lorem-ipsum placeholders wrapped in `<!-- PLACEHOLDER … -->`; the source · time
+/// caption is debug-only and wrapped in `<!-- DEBUG … -->` — both are easy to grep out later.
 ///
 /// Table-based, all-inline-CSS, single column — the "bulletproof" shape that survives the
-/// patchwork of email clients. Every piece of feed-derived text (titles, links) is HTML-escaped,
-/// since it's untrusted.
-fn render_html(window_end: DateTime<Utc>, items: &[RenderItem]) -> String {
+/// patchwork of email clients. The chrome comes from `content`; every piece of caller- or
+/// feed-supplied text is HTML-escaped, since it's interpolated into markup.
+fn render_html(
+    window_end: DateTime<Utc>,
+    items: &[RenderItem],
+    content: &DigestContent<'_>,
+) -> String {
     let count = items.len();
     let plural = if count == 1 { "" } else { "s" };
     let date = window_end.format("%A, %B %-d, %Y");
     let preheader = format!("{count} new item{plural} in your digest");
+    let brand = escape(content.brand);
+    let title = escape(content.title);
+    let summary = escape(content.summary);
+    let footer = escape(content.footer);
+
+    // Per-item placeholders are identical across items today, so escape them once and reuse.
+    let category = escape(content.item_category);
+    let item_summary = escape(content.item_summary);
 
     let mut rows = String::new();
     for (i, item) in items.iter().enumerate() {
-        rows.push_str(&render_item_row(i + 1, item));
+        rows.push_str(&render_item_row(i + 1, item, &category, &item_summary));
     }
 
     format!(
@@ -113,19 +184,23 @@ fn render_html(window_end: DateTime<Utc>, items: &[RenderItem]) -> String {
 <div style="display:none;max-height:0;overflow:hidden;opacity:0;mso-hide:all;">{preheader}</div>
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:{BG};">
 <tr>
-<td align="center" style="padding:28px 12px;">
+<td align="center" style="padding:36px 12px;">
 <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="width:600px;max-width:100%;background-color:{SURFACE};border:1px solid {BORDER};border-radius:4px;">
 <tr>
-<td style="padding:40px 44px 0 44px;">
-<div style="font-family:{SANS};font-size:12px;font-weight:600;letter-spacing:0.12em;text-transform:uppercase;color:{INK_MUTED};text-align:center;">Bulletin</div>
-<h1 style="margin:14px 0 22px 0;font-family:{SERIF};font-size:34px;font-weight:700;line-height:1.2;color:{INK};text-align:center;">Your Digest</h1>
+<td style="padding:52px 52px 0 52px;">
+<div style="font-family:{SANS};font-size:12px;font-weight:600;letter-spacing:0.12em;text-transform:uppercase;color:{INK_MUTED};text-align:center;">{brand}</div>
+<h1 style="margin:18px 0 30px 0;font-family:{SERIF};font-size:34px;font-weight:700;line-height:1.25;color:{INK};text-align:center;">{title}</h1>
 {date_rule}
-<div style="font-family:{SERIF};font-size:15px;font-style:italic;font-weight:700;color:{ACCENT};margin:0 0 4px 0;">In this digest &middot; {count} item{plural}</div>
+<!-- PLACEHOLDER: "big picture" lead — remove or replace once the digest produces a real summary -->
+<div style="font-family:{SERIF};font-size:15px;font-style:italic;font-weight:700;color:{ACCENT};margin:34px 0 12px 0;">The big picture</div>
+<div style="font-family:{SERIF};font-size:17px;line-height:1.75;color:{INK_BODY};margin:0;">{summary}</div>
+<!-- /PLACEHOLDER -->
+<div style="font-family:{SERIF};font-size:15px;font-style:italic;font-weight:700;color:{ACCENT};margin:40px 0 0 0;">In this digest &middot; {count} item{plural}</div>
 </td>
 </tr>
 {rows}<tr>
-<td style="padding:28px 44px 40px 44px;border-top:1px solid {BORDER};">
-<div style="font-family:{SANS};font-size:12px;line-height:1.7;color:{INK_MUTED};text-align:center;">You&#39;re receiving this digest from Bulletin,<br>gathered from the sources you subscribed to.</div>
+<td style="padding:40px 52px 52px 52px;border-top:1px solid {BORDER};">
+<div style="font-family:{SANS};font-size:12px;line-height:1.7;color:{INK_MUTED};text-align:center;">{footer}</div>
 </td>
 </tr>
 </table>
@@ -154,17 +229,19 @@ fn date_rule(date: &str) -> String {
     )
 }
 
-/// One item: a terracotta number badge beside the headline (a link when the cluster has one) over
-/// a small source · time caption, set off from the previous item by a hairline rule.
-fn render_item_row(number: usize, item: &RenderItem) -> String {
+/// One item: a terracotta number badge beside the headline (a link when the cluster has one),
+/// followed by a placeholder category + summary and the source · time caption, set off from the
+/// previous item by a hairline rule. `category` and `item_summary` are pre-escaped placeholders;
+/// the source · time caption is debug-only and marked for later removal.
+fn render_item_row(number: usize, item: &RenderItem, category: &str, item_summary: &str) -> String {
     let title = escape(&item.title);
     let headline = match &item.link {
         Some(link) => format!(
-            r#"<a href="{}" style="font-family:{SERIF};font-size:20px;font-weight:700;line-height:1.3;color:{INK};text-decoration:none;">{title}</a>"#,
+            r#"<a href="{}" style="font-family:{SERIF};font-size:21px;font-weight:700;line-height:1.3;color:{INK};text-decoration:none;">{title}</a>"#,
             escape(link)
         ),
         None => format!(
-            r#"<span style="font-family:{SERIF};font-size:20px;font-weight:700;line-height:1.3;color:{INK};">{title}</span>"#
+            r#"<span style="font-family:{SERIF};font-size:21px;font-weight:700;line-height:1.3;color:{INK};">{title}</span>"#
         ),
     };
 
@@ -173,10 +250,10 @@ fn render_item_row(number: usize, item: &RenderItem) -> String {
 
     format!(
         r#"<tr>
-<td style="padding:20px 44px;border-top:1px solid {BORDER};">
+<td style="padding:34px 52px;border-top:1px solid {BORDER};">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
 <tr>
-<td valign="top" width="40" style="padding-top:3px;">
+<td valign="top" width="42" style="padding-top:4px;">
 <table role="presentation" cellpadding="0" cellspacing="0" border="0">
 <tr>
 <td width="26" height="26" align="center" valign="middle" style="width:26px;height:26px;border:1.5px solid {ACCENT};border-radius:50%;font-family:{SANS};font-size:11px;font-weight:700;color:{ACCENT};line-height:1;">{number}</td>
@@ -185,10 +262,18 @@ fn render_item_row(number: usize, item: &RenderItem) -> String {
 </td>
 <td valign="top">
 {headline}
-<div style="margin-top:7px;font-family:{SANS};font-size:12px;letter-spacing:0.02em;">
+<!-- PLACEHOLDER: per-item category — remove or replace once items carry a category -->
+<div style="margin-top:9px;font-family:{SANS};font-size:12px;font-weight:500;letter-spacing:0.04em;color:{ACCENT};">{category}</div>
+<!-- /PLACEHOLDER -->
+<!-- PLACEHOLDER: per-item summary — remove or replace once items carry a summary -->
+<div style="margin-top:12px;font-family:{SERIF};font-size:16px;font-style:italic;line-height:1.65;color:{INK_MUTED};">{item_summary}</div>
+<!-- /PLACEHOLDER -->
+<!-- DEBUG: source + timestamp — debugging info, remove before launch -->
+<div style="margin-top:14px;font-family:{SANS};font-size:12px;letter-spacing:0.02em;">
 <span style="font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:{ACCENT};">{source}</span>
 <span style="color:{INK_MUTED};">&nbsp;&middot;&nbsp;{time}</span>
 </div>
+<!-- /DEBUG -->
 </td>
 </tr>
 </table>
@@ -233,10 +318,18 @@ mod tests {
     #[test]
     fn html_includes_titles_and_links() {
         let items = vec![
-            item("Hello World", Some("https://example.com/a"), SourceKind::Rss),
+            item(
+                "Hello World",
+                Some("https://example.com/a"),
+                SourceKind::Rss,
+            ),
             item("No Link Here", None, SourceKind::Github),
         ];
-        let html = render_html(Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(), &items);
+        let html = render_html(
+            Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
+            &items,
+            &DigestContent::default(),
+        );
 
         assert!(html.contains("Hello World"));
         assert!(html.contains(r#"href="https://example.com/a""#));
@@ -258,7 +351,11 @@ mod tests {
             Some("https://example.com/?a=1&b=2\"></a>"),
             SourceKind::Rss,
         )];
-        let html = render_html(Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(), &items);
+        let html = render_html(
+            Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
+            &items,
+            &DigestContent::default(),
+        );
 
         // No raw injection survives.
         assert!(!html.contains("<script>"));
@@ -266,6 +363,56 @@ mod tests {
         // The attribute-breaking quote in the link is neutralised.
         assert!(!html.contains(r#"a=1&b=2"></a>"#));
         assert!(html.contains("&amp;b=2&quot;"));
+    }
+
+    #[test]
+    fn placeholder_and_debug_sections_are_marked() {
+        let items = vec![item(
+            "Headline",
+            Some("https://example.com"),
+            SourceKind::Rss,
+        )];
+        let content = DigestContent {
+            summary: "BIG_PICTURE_TEXT",
+            item_category: "CAT_TEXT",
+            item_summary: "ITEM_SUMMARY_TEXT",
+            ..DigestContent::default()
+        };
+        let html = render_html(
+            Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
+            &items,
+            &content,
+        );
+
+        // Parametric placeholder content renders...
+        assert!(html.contains("BIG_PICTURE_TEXT"));
+        assert!(html.contains("CAT_TEXT"));
+        assert!(html.contains("ITEM_SUMMARY_TEXT"));
+        // ...inside grep-able markers for later removal/replacement.
+        assert_eq!(html.matches("<!-- PLACEHOLDER:").count(), 3);
+        assert!(html.contains("<!-- DEBUG: source + timestamp"));
+        assert!(html.contains("<!-- /DEBUG -->"));
+    }
+
+    #[test]
+    fn parametric_chrome_overrides_defaults() {
+        let items = vec![item("Headline", None, SourceKind::Rss)];
+        let content = DigestContent {
+            brand: "ACME",
+            title: "Weekly Roundup",
+            footer: "Sent by ACME.",
+            ..DigestContent::default()
+        };
+        let html = render_html(
+            Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
+            &items,
+            &content,
+        );
+
+        assert!(html.contains("ACME"));
+        assert!(html.contains("Weekly Roundup"));
+        assert!(html.contains("Sent by ACME."));
+        assert!(!html.contains("Your Digest"));
     }
 
     #[test]

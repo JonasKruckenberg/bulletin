@@ -3,7 +3,7 @@
 //! flow can deliver without knowing about clap, the filesystem, or SMTP.
 
 use anyhow::{Context, Result};
-use bulletin_core::digest::Mailer;
+use bulletin_core::digest::{DigestContent, Mailer};
 use lettre::{
     transport::smtp::authentication::Credentials, AsyncFileTransport, AsyncSmtpTransport,
     AsyncTransport, Message, Tokio1Executor,
@@ -63,6 +63,55 @@ pub struct EmailConfig {
         default_value = "starttls"
     )]
     pub smtp_tls: SmtpTls,
+    /// Small-caps brand label at the top of the digest email.
+    #[arg(
+        long = "email-brand",
+        env = "BULLETIN_EMAIL_BRAND",
+        default_value = "Bulletin"
+    )]
+    pub brand: String,
+    /// Serif masthead title beneath the brand label.
+    #[arg(
+        long = "email-title",
+        env = "BULLETIN_EMAIL_TITLE",
+        default_value = "Your Digest"
+    )]
+    pub title: String,
+    /// "Big picture" lead under the masthead. Placeholder until the digest produces a real summary.
+    #[arg(
+        long = "email-summary",
+        env = "BULLETIN_EMAIL_SUMMARY",
+        default_value = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo."
+    )]
+    pub summary: String,
+    /// Per-item category label. Placeholder until items carry a category.
+    #[arg(
+        long = "email-item-category",
+        env = "BULLETIN_EMAIL_ITEM_CATEGORY",
+        default_value = "Lorem / Ipsum"
+    )]
+    pub item_category: String,
+    /// Per-item summary/TL;DR. Placeholder until items carry a summary.
+    #[arg(
+        long = "email-item-summary",
+        env = "BULLETIN_EMAIL_ITEM_SUMMARY",
+        default_value = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua."
+    )]
+    pub item_summary: String,
+    /// Footer note beneath the items.
+    #[arg(
+        long = "email-footer",
+        env = "BULLETIN_EMAIL_FOOTER",
+        default_value = "You're receiving this digest from Bulletin, gathered from the sources you subscribed to."
+    )]
+    pub footer: String,
+    /// Subject-line prefix; the item count is appended (e.g. "Bulletin" → "Bulletin: 3 new items").
+    #[arg(
+        long = "email-subject-prefix",
+        env = "BULLETIN_EMAIL_SUBJECT_PREFIX",
+        default_value = "Bulletin"
+    )]
+    pub subject_prefix: String,
 }
 
 /// How the SMTP connection is secured. Both require TLS (lettre `Tls::Required` / `Tls::Wrapper`),
@@ -106,6 +155,20 @@ impl EmailConfig {
             from: self.from.clone(),
             transport,
         })
+    }
+
+    /// The digest's configurable, non-item content (brand, title, footer, subject prefix), borrowed
+    /// as the core renderer wants it. The CLI flags / env vars above feed straight through here.
+    pub fn content(&self) -> DigestContent<'_> {
+        DigestContent {
+            brand: &self.brand,
+            title: &self.title,
+            summary: &self.summary,
+            item_category: &self.item_category,
+            item_summary: &self.item_summary,
+            footer: &self.footer,
+            subject_prefix: &self.subject_prefix,
+        }
     }
 
     /// Builds an authenticated, TLS-enforced SMTP transport from the explicit host/port/creds

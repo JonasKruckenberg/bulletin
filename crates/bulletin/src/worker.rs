@@ -135,7 +135,8 @@ async fn generate_digest(
 ) -> Result<(), BoxDynError> {
     traced("generate_digest", task_id, attempt, async move {
         let sender = email.build_sender().map_err(|e| format!("{e:#}"))?;
-        match bulletin_core::digest::generate(&pool, &sender, job.subscriber_id).await {
+        let content = email.content();
+        match bulletin_core::digest::generate(&pool, &sender, job.subscriber_id, &content).await {
             Ok(outcome) => {
                 if matches!(outcome, DigestOutcome::Delivered { .. }) {
                     metric::digest_delivered();
