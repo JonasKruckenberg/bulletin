@@ -156,7 +156,7 @@ The `bulletin` CLI is on PATH and presets `DATABASE_URL`, so run it as the servi
 
 ```sh
 sudo -u bulletin bulletin debug connection-add --source rss --config '{"url":"https://…/feed.xml"}'
-sudo -u bulletin bulletin debug subscriber-add  --email you@proton.me
+sudo -u bulletin bulletin debug subscriber-add  --email you@proton.me --name "Your Name"
 sudo -u bulletin bulletin debug status
 ```
 

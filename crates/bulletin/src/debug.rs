@@ -36,6 +36,9 @@ pub enum DebugCommand {
     SubscriberAdd {
         #[arg(long)]
         email: String,
+        /// Display name used to personalize the digest greeting (optional)
+        #[arg(long)]
+        name: Option<String>,
         /// Recurrence frequency: daily | weekly
         #[arg(long, default_value = "daily")]
         freq: String,
@@ -132,6 +135,7 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> R
         }
         DebugCommand::SubscriberAdd {
             email,
+            name,
             freq,
             weekday,
             timezone,
@@ -143,6 +147,7 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> R
             let id = digest::subscriber::insert_subscriber(
                 pool,
                 &email,
+                name.as_deref(),
                 recurrence,
                 &timezone,
                 digest_time,
@@ -157,9 +162,10 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> R
             }
             for s in rows {
                 println!(
-                    "{}\t{}\t{}\t{} {}\tmax={}\tnext={}\tlast={}",
+                    "{}\t{}\t{}\t{}\t{} {}\tmax={}\tnext={}\tlast={}",
                     s.id,
                     s.email,
+                    s.name.as_deref().unwrap_or("-"),
                     s.recurrence.label(),
                     s.digest_time.format("%H:%M"),
                     s.timezone,
