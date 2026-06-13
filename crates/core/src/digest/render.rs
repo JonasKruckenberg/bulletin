@@ -18,30 +18,24 @@ pub trait Mailer {
 }
 
 /// The configurable, non-item content of a digest email — everything that isn't the item list.
-/// Lets the caller supply the brand label, masthead title, footer note, and subject prefix (e.g.
-/// from config) instead of baking them into the renderer, so the same layout can be re-skinned
-/// without touching this module.
+/// Lets the caller supply the brand, masthead title, and footer (e.g. from config) instead of
+/// baking them into the renderer, so the same layout can be re-skinned without touching this
+/// module. The `summary` / `item_*` fields are stand-ins for reference-design sections the data
+/// model doesn't feed yet; their defaults are lorem-ipsum and they're HTML-marked for removal.
 #[derive(Clone, Copy)]
 pub struct DigestContent<'a> {
-    /// Small-caps brand label at the very top (e.g. "Bulletin").
+    /// Small-caps brand label at the very top, and the subject-line prefix (e.g. "Bulletin").
     pub brand: &'a str,
     /// Serif masthead headline beneath the brand label (e.g. "Your Digest").
     pub title: &'a str,
-    /// The "big picture" lead — an editorial summary of the whole digest, shown under the masthead.
-    /// The data model doesn't produce this yet, so it renders a parametric **placeholder** marked
-    /// in the HTML for later removal/replacement.
-    pub summary: &'a str,
-    /// Per-item category label (e.g. "Geopolitics/Diplomacy"). Not in the data model yet, so it
-    /// renders the same parametric **placeholder** under every headline, HTML-marked for removal.
-    pub item_category: &'a str,
-    /// Per-item summary/TL;DR. Not in the data model yet, so it renders the same parametric
-    /// **placeholder** under every headline, HTML-marked for removal.
-    pub item_summary: &'a str,
     /// Footer note rendered beneath the items.
     pub footer: &'a str,
-    /// Subject-line prefix; the renderer appends the item count
-    /// (e.g. "Bulletin" → "Bulletin: 3 new items").
-    pub subject_prefix: &'a str,
+    /// The "big picture" lead under the masthead. **Placeholder** until the digest produces one.
+    pub summary: &'a str,
+    /// Per-item category label (e.g. "Geopolitics/Diplomacy"). **Placeholder** until items carry one.
+    pub item_category: &'a str,
+    /// Per-item summary/TL;DR. **Placeholder** until items carry one.
+    pub item_summary: &'a str,
 }
 
 impl Default for DigestContent<'_> {
@@ -49,6 +43,8 @@ impl Default for DigestContent<'_> {
         Self {
             brand: "Bulletin",
             title: "Your Digest",
+            footer: "You're receiving this digest from Bulletin, \
+                     gathered from the sources you subscribed to.",
             // Lorem-ipsum stand-ins for sections the reference design has but our data model
             // doesn't feed yet. Wrapped in `<!-- PLACEHOLDER … -->` markers in the rendered HTML.
             summary: "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod \
@@ -57,9 +53,6 @@ impl Default for DigestContent<'_> {
             item_category: "Lorem / Ipsum",
             item_summary: "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do \
                            eiusmod tempor incididunt ut labore et dolore magna aliqua.",
-            footer: "You're receiving this digest from Bulletin, \
-                     gathered from the sources you subscribed to.",
-            subject_prefix: "Bulletin",
         }
     }
 }
@@ -67,7 +60,8 @@ impl Default for DigestContent<'_> {
 /// Renders a digest as a `multipart/alternative` email: an HTML view (a clean, editorial card of
 /// the selected items) with a plaintext fallback for clients that can't — or won't — render HTML.
 /// One cluster per item, in the frozen selection order. All the non-item chrome (brand, title,
-/// footer, subject) comes from `content`, so callers fully parametrize what's shown.
+/// footer, and the brand-prefixed subject) comes from `content`, so callers fully parametrize
+/// what's shown.
 pub(crate) fn render(
     from: &str,
     to: &str,
@@ -76,11 +70,7 @@ pub(crate) fn render(
     content: &DigestContent<'_>,
 ) -> Result<Message> {
     let plural = if items.len() == 1 { "" } else { "s" };
-    let subject = format!(
-        "{}: {} new item{plural}",
-        content.subject_prefix,
-        items.len()
-    );
+    let subject = format!("{}: {} new item{plural}", content.brand, items.len());
 
     let plain = render_plain(window_end, items);
     let html = render_html(window_end, items, content);
@@ -165,10 +155,12 @@ fn render_html(
     let category = escape(content.item_category);
     let item_summary = escape(content.item_summary);
 
+    // One divider, reused between every item and above the footer.
+    let divider = soft_divider();
     let mut rows = String::new();
     for (i, item) in items.iter().enumerate() {
         if i > 0 {
-            rows.push_str(&soft_divider());
+            rows.push_str(&divider);
         }
         rows.push_str(&render_item_row(item, &category, &item_summary));
     }
@@ -214,7 +206,7 @@ fn render_html(
 </html>
 "#,
         date_rule = date_rule(&date.to_string()),
-        soft_divider = soft_divider(),
+        soft_divider = divider,
     )
 }
 
