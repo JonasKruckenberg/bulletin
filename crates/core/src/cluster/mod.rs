@@ -95,7 +95,11 @@ pub async fn build(pool: &PgPool) -> Result<Option<BuildStats>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::{fingerprint::Fingerprint, kind::SourceKind, scope::Scope};
+    use crate::common::{
+        fingerprint::Fingerprint,
+        kind::{ContentKind, SourceKind},
+        scope::Scope,
+    };
     use chrono::TimeZone;
     use proptest::prelude::*;
     use uuid::Uuid;
@@ -111,6 +115,7 @@ mod tests {
             body: None,
             links: vec![format!("https://example.com/{title}")],
             group_key: "g".to_owned(),
+            content_kind: ContentKind::Longform,
             entities: Vec::new(),
             severity_hint: None,
             ingest_time: Utc.timestamp_opt(secs, 0).single().unwrap(),

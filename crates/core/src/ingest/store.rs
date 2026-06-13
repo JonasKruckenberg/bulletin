@@ -155,20 +155,18 @@ pub async fn insert_event(pool: &PgPool, ev: &NewEvent) -> Result<Option<Event>,
         Scope::Private(sub_id) => ("private", Some(*sub_id)),
     };
 
-    // `content_kind` is a fixed 'longform' until later milestones model content kinds again;
-    // the column stays NOT NULL so the literal keeps the schema honest.
     sqlx::query(
         r#"
         INSERT INTO event (
             fingerprint, source, scope_kind, scope_subscriber_id,
             event_time, title, body, links, group_key, entities,
             content_kind, severity_hint, raw
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'longform', $11, $12)
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
         ON CONFLICT (fingerprint) DO NOTHING
         RETURNING
             id, fingerprint, source, scope_kind, scope_subscriber_id,
             event_time, title, body, links, group_key, entities,
-            severity_hint, ingest_time, raw
+            content_kind, severity_hint, ingest_time, raw
         "#,
     )
     .bind(&ev.fingerprint.0[..])
@@ -181,6 +179,7 @@ pub async fn insert_event(pool: &PgPool, ev: &NewEvent) -> Result<Option<Event>,
     .bind(&ev.links)
     .bind(&ev.group_key)
     .bind(&ev.entities)
+    .bind(ev.content_kind)
     .bind(ev.severity_hint)
     .bind(ev.raw.as_deref())
     .try_map(from_row)
@@ -193,7 +192,7 @@ pub async fn list_events(pool: &PgPool, limit: i64) -> Result<Vec<Event>, sqlx::
     sqlx::query(
         "SELECT id, fingerprint, source, scope_kind, scope_subscriber_id,
                 event_time, title, body, links, group_key, entities,
-                severity_hint, ingest_time, raw
+                content_kind, severity_hint, ingest_time, raw
          FROM event
          ORDER BY ingest_time DESC
          LIMIT $1",

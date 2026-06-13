@@ -1,15 +1,18 @@
 //! The ingest flow: poll a connection's source, normalize items to events, and append them to
 //! the event log (`store::insert_event`). Producer side of the ingest→clustering seam.
 
+pub mod github;
 pub mod rss;
 pub mod store;
 
+use std::sync::Arc;
+
 use anyhow::Result;
-use serde::Deserialize;
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::common::{event::EventBuilder, kind::SourceKind, scope::Scope};
+use crate::ingest::github::token::TokenProvider;
 
 pub struct Batch<I, C> {
     pub items: Vec<I>,
@@ -50,10 +53,115 @@ pub trait Connection: Send + Sync {
     fn to_events(&self, item: Self::Item) -> Vec<EventBuilder>;
 }
 
-/// Connection config we know how to build a live connection from. M1: RSS only.
-#[derive(Deserialize)]
-struct RssConfig {
-    url: String,
+/// App-level connector context: the cross-tenant config/secrets a per-connection worker needs to
+/// come alive (design §5.4 — the `Connector` factory role). RSS needs nothing; GitHub needs its
+/// App credentials to mint installation tokens. Those secrets land with credential-at-rest in a
+/// later phase, so `github` is `None` for now and a GitHub connection polled without it is skipped
+/// with a clear log — the path exists, the secret doesn't yet ("plumbing now, secrets later").
+#[derive(Clone, Default)]
+pub struct ConnectorCtx {
+    pub github: Option<GithubCtx>,
+}
+
+/// What GitHub connections need at the app level: the REST base URL (overridable for tests) and a
+/// factory turning an `installation_id` into a token provider. The factory indirection keeps the
+/// real JWT→installation-token minting (which touches the App private key) behind the same seam a
+/// test's static token uses.
+#[derive(Clone)]
+pub struct GithubCtx {
+    pub base_url: String,
+    pub token_factory: Arc<dyn Fn(i64) -> Arc<dyn TokenProvider> + Send + Sync>,
+}
+
+/// Why a connection couldn't be built into a live worker — all non-fatal (the poll is skipped).
+#[derive(Debug)]
+pub enum BuildError {
+    /// The source isn't wired in this build (e.g. its app credentials aren't configured yet).
+    NotConfigured(SourceKind),
+    /// `connection.config` didn't match the source's expected shape.
+    BadConfig(String),
+    /// A source with no connector yet (Slack lands in M6).
+    Unsupported(SourceKind),
+}
+
+impl std::fmt::Display for BuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BuildError::NotConfigured(s) => {
+                write!(f, "{} not configured in this build", s.as_str())
+            }
+            BuildError::BadConfig(msg) => write!(f, "invalid connection config: {msg}"),
+            BuildError::Unsupported(s) => write!(f, "unsupported source: {}", s.as_str()),
+        }
+    }
+}
+
+/// Hand-written dispatch over the closed source set (design §5.1/§5.4): each arm holds a concrete
+/// `Connection`, the `poll → to_events` chain runs *inside* the typed arm, and only `core` types
+/// (the normalized builders + the JSON cursor) cross out. Adding a 4th source makes the compiler
+/// flag the missing arm. (RSS-only `RssConfig` parsing now lives in `build`.)
+pub enum ConnDispatch {
+    Rss(rss::RssConnection),
+    Github(github::GithubConnection),
+}
+
+impl ConnDispatch {
+    /// Build the live worker for a connection row from its `config` + the app context.
+    pub fn build(row: &store::ConnectionRow, ctx: &ConnectorCtx) -> Result<Self, BuildError> {
+        match row.source {
+            SourceKind::Rss => {
+                let cfg: rss::RssConfig = serde_json::from_value(row.config.clone())
+                    .map_err(|e| BuildError::BadConfig(e.to_string()))?;
+                Ok(ConnDispatch::Rss(rss::RssConnection::new(cfg.url)))
+            }
+            SourceKind::Github => {
+                let gh = ctx
+                    .github
+                    .as_ref()
+                    .ok_or(BuildError::NotConfigured(SourceKind::Github))?;
+                let cfg: github::GithubConfig = serde_json::from_value(row.config.clone())
+                    .map_err(|e| BuildError::BadConfig(e.to_string()))?;
+                let token = (gh.token_factory)(cfg.installation_id);
+                Ok(ConnDispatch::Github(
+                    github::GithubConnection::new(&gh.base_url, token).with_repos(cfg.repos),
+                ))
+            }
+            SourceKind::Slack => Err(BuildError::Unsupported(SourceKind::Slack)),
+        }
+    }
+
+    /// Poll using the persisted cursor JSON and normalize into connector-side builders, returning
+    /// the next cursor to persist. The cursor is erased to JSON here; `Item` never escapes the arm.
+    pub async fn poll_and_normalize(
+        &self,
+        cursor: Option<serde_json::Value>,
+    ) -> Result<(Vec<EventBuilder>, serde_json::Value), SourceError> {
+        match self {
+            ConnDispatch::Rss(c) => poll_inner(c, cursor).await,
+            ConnDispatch::Github(c) => poll_inner(c, cursor).await,
+        }
+    }
+}
+
+/// The shared, source-generic poll step: deserialize the opaque cursor (default on absent/garbage),
+/// poll, re-serialize the next cursor, and run the (pure) `to_events` normalization. Monomorphized
+/// per arm, so there's no boxing and `Self::Item`/`Self::Cursor` stay private to the connector.
+async fn poll_inner<C: Connection>(
+    conn: &C,
+    cursor: Option<serde_json::Value>,
+) -> Result<(Vec<EventBuilder>, serde_json::Value), SourceError> {
+    let cursor: C::Cursor = cursor
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    let batch = conn.poll(cursor).await?;
+    let next = serde_json::to_value(&batch.cursor)
+        .map_err(|e| SourceError::Parse(format!("cursor does not serialize: {e}")))?;
+    let builders = batch
+        .items
+        .into_iter()
+        .flat_map(|item| conn.to_events(item))
+        .collect();
+    Ok((builders, next))
 }
 
 /// What one `poll` did — the trigger layer turns this into metrics. `Failed` means the connector
@@ -73,7 +181,7 @@ pub enum PollOutcome {
 /// Ingest one connection: load it, fetch its source, append new events to the log, then advance
 /// the cursor (or back off on failure). Events commit before the cursor advances — the
 /// crash-safety invariant: a re-poll re-fetches, and fingerprint dedup collapses the overlap.
-pub async fn poll(pool: &PgPool, connection_id: Uuid) -> Result<PollOutcome> {
+pub async fn poll(pool: &PgPool, connection_id: Uuid, ctx: &ConnectorCtx) -> Result<PollOutcome> {
     let conn_row = match store::load_connection(pool, connection_id).await? {
         Some(r) => r,
         None => {
@@ -87,39 +195,22 @@ pub async fn poll(pool: &PgPool, connection_id: Uuid) -> Result<PollOutcome> {
     }
 
     let source = conn_row.source;
-    // M1: RSS only. GitHub/Slack land in later milestones.
-    let conn = match source {
-        SourceKind::Rss => match serde_json::from_value::<RssConfig>(conn_row.config.clone()) {
-            Ok(cfg) => rss::RssConnection::new(cfg.url),
-            Err(e) => {
-                tracing::error!(%connection_id, error = %e, "invalid RSS config");
-                return Ok(PollOutcome::Skipped);
-            }
-        },
-        other => {
-            tracing::error!(%connection_id, source = ?other, "unsupported source in M1");
+    let dispatch = match ConnDispatch::build(&conn_row, ctx) {
+        Ok(d) => d,
+        Err(e) => {
+            // Not fatal: a misconfigured or not-yet-wired source is skipped, not retried.
+            tracing::warn!(%connection_id, source = source.as_str(), error = %e, "cannot build connection; skipping");
             return Ok(PollOutcome::Skipped);
         }
     };
 
-    let cursor: rss::RssCursor = conn_row
-        .cursor
-        .clone()
-        .map(|v| serde_json::from_value(v).unwrap_or_default())
-        .unwrap_or_default();
-
-    match conn.poll(cursor).await {
-        Ok(batch) => {
-            let new_cursor =
-                serde_json::to_value(&batch.cursor).expect("RssCursor always serializes");
-            let builders: Vec<_> = batch
-                .items
-                .into_iter()
-                .flat_map(|item| conn.to_events(item))
-                .collect();
+    match dispatch.poll_and_normalize(conn_row.cursor.clone()).await {
+        Ok((builders, new_cursor)) => {
             let total = builders.len();
             let mut inserted = 0usize;
             for builder in builders {
+                // Scope is uniformly public until private scope becomes load-bearing (Phase 3);
+                // there it becomes per-event, derived by `finalize` from connection ownership.
                 if store::insert_event(pool, &builder.finalize(Scope::Public))
                     .await?
                     .is_some()

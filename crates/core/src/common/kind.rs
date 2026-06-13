@@ -30,10 +30,47 @@ impl TryFrom<&str> for SourceKind {
     }
 }
 
-/// `SourceKind` round-trips as its `as_str()` text in Postgres, so `.bind(source)` and
-/// `row.try_get::<SourceKind, _>("source")` work directly — no per-query decode boilerplate.
+/// Adapter-declared depth signal: how much material an event carries. **Ordered**
+/// (`Message < Announcement < Longform`) so a cluster's `content_depth` can be `max()` over its
+/// events and feed the later Story-vs-Note classification (design §5.1/§8.3). The connector sets it
+/// because source semantics live there — a GitHub release is an announcement, an RSS item is
+/// longform, a chat/comment is a message; deriving it downstream from body length would be a
+/// gameable heuristic (§7.1).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+pub enum ContentKind {
+    Message,
+    Announcement,
+    Longform,
+}
+
+impl ContentKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContentKind::Message => "message",
+            ContentKind::Announcement => "announcement",
+            ContentKind::Longform => "longform",
+        }
+    }
+}
+
+impl TryFrom<&str> for ContentKind {
+    type Error = &'static str;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        match s {
+            "message" => Ok(ContentKind::Message),
+            "announcement" => Ok(ContentKind::Announcement),
+            "longform" => Ok(ContentKind::Longform),
+            _ => Err("unknown content kind"),
+        }
+    }
+}
+
+/// `SourceKind`/`ContentKind` round-trip as their `as_str()` text in Postgres, so `.bind(kind)` and
+/// `row.try_get::<_, _>("col")` work directly — no per-query decode boilerplate. The macro stamps
+/// the same text-backed `Type`/`Encode`/`Decode` triple for each enum.
 mod sqlx_impls {
-    use super::SourceKind;
+    use super::{ContentKind, SourceKind};
     use sqlx::{
         encode::IsNull,
         error::BoxDynError,
@@ -41,25 +78,32 @@ mod sqlx_impls {
         Decode, Encode, Postgres, Type,
     };
 
-    impl Type<Postgres> for SourceKind {
-        fn type_info() -> PgTypeInfo {
-            <str as Type<Postgres>>::type_info()
-        }
-        fn compatible(ty: &PgTypeInfo) -> bool {
-            <str as Type<Postgres>>::compatible(ty)
-        }
+    macro_rules! text_enum_sqlx {
+        ($ty:ty, $what:literal) => {
+            impl Type<Postgres> for $ty {
+                fn type_info() -> PgTypeInfo {
+                    <str as Type<Postgres>>::type_info()
+                }
+                fn compatible(ty: &PgTypeInfo) -> bool {
+                    <str as Type<Postgres>>::compatible(ty)
+                }
+            }
+
+            impl Encode<'_, Postgres> for $ty {
+                fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> Result<IsNull, BoxDynError> {
+                    <&str as Encode<Postgres>>::encode_by_ref(&self.as_str(), buf)
+                }
+            }
+
+            impl<'r> Decode<'r, Postgres> for $ty {
+                fn decode(value: PgValueRef<'r>) -> Result<Self, BoxDynError> {
+                    let s = <&str as Decode<Postgres>>::decode(value)?;
+                    <$ty>::try_from(s).map_err(|_| format!("unknown {}: {s}", $what).into())
+                }
+            }
+        };
     }
 
-    impl Encode<'_, Postgres> for SourceKind {
-        fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> Result<IsNull, BoxDynError> {
-            <&str as Encode<Postgres>>::encode_by_ref(&self.as_str(), buf)
-        }
-    }
-
-    impl<'r> Decode<'r, Postgres> for SourceKind {
-        fn decode(value: PgValueRef<'r>) -> Result<Self, BoxDynError> {
-            let s = <&str as Decode<Postgres>>::decode(value)?;
-            SourceKind::try_from(s).map_err(|_| format!("unknown source kind: {s}").into())
-        }
-    }
+    text_enum_sqlx!(SourceKind, "source kind");
+    text_enum_sqlx!(ContentKind, "content kind");
 }

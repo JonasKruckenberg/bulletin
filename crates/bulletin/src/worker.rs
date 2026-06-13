@@ -20,7 +20,7 @@ use bulletin_core::cluster::store::unbuilt_public_events_exist;
 use bulletin_core::digest::subscriber::due_subscribers;
 use bulletin_core::digest::DigestOutcome;
 use bulletin_core::ingest::store::due_connections;
-use bulletin_core::ingest::PollOutcome;
+use bulletin_core::ingest::{ConnectorCtx, PollOutcome};
 
 use crate::metric;
 use crate::transport::EmailConfig;
@@ -87,9 +87,10 @@ async fn poll_connection(
     task_id: TaskId<Ulid>,
     attempt: Attempt,
     pool: Data<PgPool>,
+    ctx: Data<ConnectorCtx>,
 ) -> Result<(), BoxDynError> {
     traced("poll_connection", task_id, attempt, async move {
-        match bulletin_core::ingest::poll(&pool, job.connection_id).await {
+        match bulletin_core::ingest::poll(&pool, job.connection_id, &ctx).await {
             Ok(PollOutcome::Polled {
                 source,
                 inserted,
@@ -240,7 +241,7 @@ async fn run_tick(pool: Data<PgPool>) -> Result<(), BoxDynError> {
 
 // ── Monitor wiring ─────────────────────────────────────────────────────
 
-pub async fn start(pool: PgPool, email: EmailConfig) -> Result<()> {
+pub async fn start(pool: PgPool, email: EmailConfig, connectors: ConnectorCtx) -> Result<()> {
     setup_storage(&pool).await?;
 
     // One local-clock cron drives all three sweeps; duplicate ticks across replicas are
@@ -262,10 +263,12 @@ pub async fn start(pool: PgPool, email: EmailConfig) -> Result<()> {
         })
         .register(move |_| {
             let pool = pool_poll.clone();
+            let connectors = connectors.clone();
             let storage: PostgresStorage<PollConnectionJob> = PostgresStorage::new(&pool);
             WorkerBuilder::new("bulletin-poll-connection")
                 .backend(storage)
                 .data(pool)
+                .data(connectors)
                 .build(poll_connection)
         })
         .register(move |_| {
