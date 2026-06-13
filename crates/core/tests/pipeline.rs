@@ -11,7 +11,7 @@ use bulletin_core::digest::store::{
     candidates_in_window, create_with_items, mark_delivered, render_items,
 };
 use bulletin_core::digest::subscriber::{
-    due_subscribers, insert_subscriber, load_subscriber, update_preferences,
+    advance_after_delivery, due_subscribers, insert_subscriber, load_subscriber, update_preferences,
 };
 use bulletin_core::ingest::store::insert_event;
 use bulletin_core::{
@@ -164,7 +164,7 @@ async fn digest_waits_for_public_build() {
     let (pool, _pg) = setup().await;
 
     insert_public(&pool, "a", "a", "Pre-existing", 100).await;
-    let sub_id = insert_subscriber(&pool, "me@example.com", 1, "UTC", nine_am())
+    let sub_id = insert_subscriber(&pool, "me@example.com", "daily", None, "UTC", nine_am())
         .await
         .unwrap();
     force_due(&pool, sub_id).await;
@@ -193,7 +193,7 @@ async fn digest_delivery_and_idempotency() {
 
     insert_public(&pool, "a", "a", "Article A", 100).await;
     insert_public(&pool, "b", "b", "Article B", 200).await;
-    let sub_id = insert_subscriber(&pool, "me@example.com", 1, "UTC", nine_am())
+    let sub_id = insert_subscriber(&pool, "me@example.com", "daily", None, "UTC", nine_am())
         .await
         .unwrap();
     force_due(&pool, sub_id).await;
@@ -253,7 +253,8 @@ async fn insert_schedules_next_local_digest_time() {
     let id = insert_subscriber(
         &pool,
         "ny@example.com",
-        1,
+        "daily",
+        None,
         "America/New_York",
         NaiveTime::from_hms_opt(7, 30, 0).unwrap(),
     )
@@ -276,7 +277,7 @@ async fn insert_schedules_next_local_digest_time() {
 async fn update_preferences_snaps_without_losing_window() {
     let (pool, _pg) = setup().await;
 
-    let id = insert_subscriber(&pool, "t@example.com", 7, "UTC", nine_am())
+    let id = insert_subscriber(&pool, "t@example.com", "daily", None, "UTC", nine_am())
         .await
         .unwrap();
 
@@ -292,6 +293,8 @@ async fn update_preferences_snaps_without_losing_window() {
     let changed = update_preferences(
         &pool,
         id,
+        "daily",
+        None,
         "America/New_York",
         NaiveTime::from_hms_opt(7, 30, 0).unwrap(),
     )
@@ -317,6 +320,75 @@ async fn update_preferences_snaps_without_losing_window() {
 #[tokio::test]
 async fn insert_rejects_unknown_timezone() {
     let (pool, _pg) = setup().await;
-    let err = insert_subscriber(&pool, "bad@example.com", 1, "Mars/Phobos", nine_am()).await;
+    let err =
+        insert_subscriber(&pool, "bad@example.com", "daily", None, "Mars/Phobos", nine_am()).await;
     assert!(err.is_err(), "unknown timezone must be rejected");
+}
+
+// Weekly recurrence pins a stable weekday at the chosen local time, in the future.
+#[tokio::test]
+async fn weekly_schedules_on_chosen_weekday() {
+    let (pool, _pg) = setup().await;
+
+    // weekly on Tuesday (Postgres DOW 2) at 17:00 UTC.
+    let id = insert_subscriber(
+        &pool,
+        "w@example.com",
+        "weekly",
+        Some(2),
+        "UTC",
+        NaiveTime::from_hms_opt(17, 0, 0).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let sub = load_subscriber(&pool, id).await.unwrap().unwrap();
+    assert!(sub.next_run_at > Utc::now());
+    let dow: i32 = sqlx::query(
+        "SELECT extract(dow from (next_run_at AT TIME ZONE 'UTC'))::int AS dow
+         FROM subscriber WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .get("dow");
+    assert_eq!(dow, 2, "lands on Tuesday");
+    assert_eq!(
+        local_run_time(&pool, id, "UTC").await,
+        NaiveTime::from_hms_opt(17, 0, 0).unwrap()
+    );
+}
+
+// After a worker outage spanning several boundaries, one delivery jumps next_run_at straight to the
+// next *future* boundary — coalescing, not backfilling a burst of stale digests.
+#[tokio::test]
+async fn advance_coalesces_missed_boundaries() {
+    let (pool, _pg) = setup().await;
+
+    let id = insert_subscriber(&pool, "c@example.com", "daily", None, "UTC", nine_am())
+        .await
+        .unwrap();
+    // Pretend the worker was down: the boundary is days in the past.
+    sqlx::query(
+        "UPDATE subscriber
+         SET next_run_at = now() - interval '3 days', last_run_at = now() - interval '4 days'
+         WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let overdue_boundary = load_subscriber(&pool, id).await.unwrap().unwrap().next_run_at;
+
+    advance_after_delivery(&pool, id, overdue_boundary).await.unwrap();
+
+    let sub = load_subscriber(&pool, id).await.unwrap().unwrap();
+    assert_eq!(sub.last_run_at, Some(overdue_boundary));
+    assert!(
+        sub.next_run_at > Utc::now(),
+        "coalesced to a future boundary — no backlog of past fires"
+    );
+    assert!(sub.next_run_at <= Utc::now() + Duration::days(1));
+    assert_eq!(local_run_time(&pool, id, "UTC").await, nine_am());
 }

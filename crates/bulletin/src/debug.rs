@@ -31,13 +31,16 @@ pub enum DebugCommand {
         #[arg(long, default_value = "20")]
         limit: i64,
     },
-    /// Seed a subscriber (first digest fires at the next local digest time)
+    /// Seed a subscriber (first digest fires at the next scheduled local time)
     SubscriberAdd {
         #[arg(long)]
         email: String,
-        /// Digest cadence in days (1 = daily, 7 = weekly)
-        #[arg(long, default_value_t = 1)]
-        interval_days: i32,
+        /// Recurrence frequency: daily | weekly
+        #[arg(long, default_value = "daily")]
+        freq: String,
+        /// Day of week for weekly digests: 0=Sun .. 6=Sat (required iff --freq weekly)
+        #[arg(long)]
+        weekday: Option<i32>,
         /// IANA timezone the digest time is interpreted in, e.g. America/New_York
         #[arg(long, default_value = "UTC")]
         timezone: String,
@@ -120,18 +123,29 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> R
         }
         DebugCommand::SubscriberAdd {
             email,
-            interval_days,
+            freq,
+            weekday,
             timezone,
             digest_time,
         } => {
-            if interval_days < 1 {
-                anyhow::bail!("--interval-days must be >= 1");
+            match freq.as_str() {
+                "daily" if weekday.is_some() => {
+                    anyhow::bail!("--weekday is only valid with --freq weekly");
+                }
+                "daily" => {}
+                "weekly" => match weekday {
+                    Some(d) if (0..=6).contains(&d) => {}
+                    Some(_) => anyhow::bail!("--weekday must be 0..6 (0=Sun)"),
+                    None => anyhow::bail!("--freq weekly requires --weekday 0..6 (0=Sun)"),
+                },
+                other => anyhow::bail!("--freq must be daily or weekly (got {other})"),
             }
             let digest_time = chrono::NaiveTime::parse_from_str(&digest_time, "%H:%M")
                 .context("--digest-time must be HH:MM (24-hour)")?;
-            let id =
-                digest::subscriber::insert_subscriber(pool, &email, interval_days, &timezone, digest_time)
-                    .await?;
+            let id = digest::subscriber::insert_subscriber(
+                pool, &email, &freq, weekday, &timezone, digest_time,
+            )
+            .await?;
             println!("{id}");
         }
         DebugCommand::SubscriberList => {
@@ -140,11 +154,15 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> R
                 println!("no subscribers");
             }
             for s in rows {
+                let cadence = match s.on_weekday {
+                    Some(d) => format!("weekly d{d}"),
+                    None => "daily".to_string(),
+                };
                 println!(
-                    "{}\t{}\tevery {}d\t{} {}\tmax={}\tnext={}\tlast={}",
+                    "{}\t{}\t{}\t{} {}\tmax={}\tnext={}\tlast={}",
                     s.id,
                     s.email,
-                    s.interval_days,
+                    cadence,
                     s.digest_time.format("%H:%M"),
                     s.timezone,
                     s.max_items,

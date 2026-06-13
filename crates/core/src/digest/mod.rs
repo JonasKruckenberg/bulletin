@@ -83,9 +83,12 @@ pub async fn generate(
     }
 
     let window_end = sub.next_run_at;
+    // Phase-1 window lower bound: the last delivery, or one cadence back on the first run. (Lookback
+    // selection in the next phase replaces this window with a freshness-scored candidate set.)
+    let period_days = if sub.freq == "weekly" { 7 } else { 1 };
     let window_start = sub
         .last_run_at
-        .unwrap_or_else(|| window_end - Duration::days(sub.interval_days as i64));
+        .unwrap_or_else(|| window_end - Duration::days(period_days));
 
     log_selection(sub.id, sub.max_items as usize, &decisions);
     let selected = selected_ids(&decisions);
