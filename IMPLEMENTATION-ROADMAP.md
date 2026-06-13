@@ -1,6 +1,6 @@
 # Bulletin — Implementation Roadmap
 
-**Status:** Proposed build plan
+**Status:** In progress — M1 completed (2026-06-13); M2 next
 **Last updated:** 2026-06-13
 **Reads against:** `digest-system-design.md` (product + data model), `digest-technical-architecture.md` (Rust runtime), `digest-data-sources.md` (source backlog).
 
