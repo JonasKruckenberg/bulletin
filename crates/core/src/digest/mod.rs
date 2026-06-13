@@ -1,6 +1,6 @@
-//! The digest flow: drain the clusters a subscriber gained since its last run, select by recency,
-//! freeze the selection, render, and deliver — advancing the subscriber's watermark on delivery.
-//! Consumer of the clustering→digest seam.
+//! The digest flow (projection / read side): take a freshness-scored lookback over the cluster
+//! cache, select by recency, freeze the selection, render, and deliver — advancing the subscriber's
+//! schedule on delivery. A pure read of the materialization side's snapshot (design §3.0, §9.4).
 
 mod render;
 pub mod select;
@@ -12,16 +12,21 @@ pub use render::{DigestContent, Mailer};
 use std::collections::HashMap;
 
 use anyhow::{anyhow, Context, Result};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::common::kind::SourceKind;
 use crate::digest::select::{select, Decision, Verdict};
 use crate::digest::store::{
-    candidates_in_window, cluster_display, create_with_items, mark_delivered, render_items,
+    candidates_in_lookback, cluster_display, create_with_items, mark_delivered, render_items,
 };
 use crate::digest::subscriber::{load_subscriber, SubscriberRow};
+
+/// How far back a digest's candidate lookback reaches for *context*, beyond the guaranteed
+/// reach-back to the last delivery (design §9.4). Generous on purpose: it must exceed the longest
+/// cadence (weekly) plus any plausible outage so nothing ages out unconsidered. Config table later.
+const CONTEXT_HORIZON_DAYS: i32 = 30;
 
 #[derive(Debug)]
 pub enum DigestOutcome {
@@ -39,15 +44,15 @@ pub enum DigestOutcome {
     NotYetDue,
 }
 
-/// Loads a subscriber and runs the pure selection over its current window — the shared front
-/// half of [`generate`] (which then freezes, renders, delivers) and [`explain`] (which only
-/// reports). Both observe the same `(last_run_at, next_run_at]` window, so they can't disagree.
+/// Loads a subscriber and runs the pure selection over its lookback candidate set — the shared
+/// front half of [`generate`] (which then freezes, renders, delivers) and [`explain`] (which only
+/// reports). Both observe the same lookback, so they can't disagree.
 async fn plan(pool: &PgPool, subscriber_id: Uuid) -> Result<(SubscriberRow, Vec<Decision>)> {
     let sub = load_subscriber(pool, subscriber_id)
         .await
         .context("load subscriber")?
         .ok_or_else(|| anyhow!("subscriber {subscriber_id} not found"))?;
-    let candidates = candidates_in_window(pool, sub.last_run_at, sub.next_run_at)
+    let candidates = candidates_in_lookback(pool, sub.last_run_at, CONTEXT_HORIZON_DAYS)
         .await
         .context("collect candidates")?;
     let decisions = select(candidates, sub.max_items as usize);
@@ -73,27 +78,25 @@ pub async fn generate(
     subscriber_id: Uuid,
     content: &DigestContent<'_>,
 ) -> Result<DigestOutcome> {
+    // The lookback reads the cluster cache as of ~now; on delivery this instant becomes the new
+    // last_run_at (the next digest's consideration floor). Captured before the read so the floor
+    // can't sit *after* it — a cluster updated mid-read is re-considered next fire, never dropped.
+    let snapshot_at = Utc::now();
     let (sub, decisions) = plan(pool, subscriber_id).await?;
 
-    // A preference change (timezone/digest_time) can push next_run_at into the future after this
+    // A preference change (timezone/digest_time/freq) can push next_run_at into the future after this
     // job was enqueued for the old, due boundary. Don't deliver early: bail and let the next tick
     // fire it at the corrected boundary. This is what makes update_preferences safe mid-flight.
     if sub.next_run_at > Utc::now() {
         return Ok(DigestOutcome::NotYetDue);
     }
 
-    let window_end = sub.next_run_at;
-    // Phase-1 window lower bound: the last delivery, or one cadence back on the first run. (Lookback
-    // selection in the next phase replaces this window with a freshness-scored candidate set.)
-    let period_days = if sub.freq == "weekly" { 7 } else { 1 };
-    let window_start = sub
-        .last_run_at
-        .unwrap_or_else(|| window_end - Duration::days(period_days));
+    let window_end = sub.next_run_at; // the digest's identity (UNIQUE(subscriber_id, window_end))
 
     log_selection(sub.id, sub.max_items as usize, &decisions);
     let selected = selected_ids(&decisions);
 
-    let digest = create_with_items(pool, sub.id, window_start, window_end, &selected)
+    let digest = create_with_items(pool, sub.id, window_end, &selected)
         .await
         .context("create digest")?;
 
@@ -106,7 +109,7 @@ pub async fn generate(
         .context("load render items")?;
     if items.is_empty() {
         // Nothing to send, but advance so the subscriber isn't perpetually due.
-        mark_delivered(pool, digest.id, sub.id, window_end)
+        mark_delivered(pool, digest.id, sub.id, snapshot_at)
             .await
             .context("mark delivered")?;
         return Ok(DigestOutcome::Empty);
@@ -121,7 +124,7 @@ pub async fn generate(
         content,
     )?;
     mailer.send(message).await?;
-    mark_delivered(pool, digest.id, sub.id, window_end)
+    mark_delivered(pool, digest.id, sub.id, snapshot_at)
         .await
         .context("mark delivered")?;
 

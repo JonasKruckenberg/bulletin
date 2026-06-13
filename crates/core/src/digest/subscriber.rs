@@ -124,24 +124,13 @@ pub async fn load_subscriber(
         .await
 }
 
-/// Subscribers whose digest is due AND whose window is fully built: the boundary has passed
-/// (`next_run_at <= now()`) and no public event ingested before it is still unbuilt. The second
-/// clause is the build→digest gate; it is removed in the lookback-selection phase (design §9.4),
-/// where an unbuilt event simply isn't a candidate this fire and rides the next one.
+/// Subscribers whose digest is due: the boundary has passed (`next_run_at <= now()`). There is no
+/// build gate — projection reads whatever the materialization side has built so far (design §9.4);
+/// an event not yet clustered simply isn't a candidate this fire and rides the next one, never lost.
 pub async fn due_subscribers(pool: &PgPool) -> Result<Vec<SubscriberRow>, sqlx::Error> {
-    sqlx::query(
-        "SELECT s.id, s.email, s.freq, s.on_weekday, s.max_items, s.timezone, s.digest_time,
-                s.next_run_at, s.last_run_at
-         FROM subscriber s
-         WHERE s.next_run_at <= now()
-           AND NOT EXISTS (
-               SELECT 1 FROM event e
-               WHERE e.scope_kind = 'public'
-                 AND e.ingest_time <= s.next_run_at
-                 AND e.ingest_time > (SELECT built_through FROM build_watermark)
-           )
-         ORDER BY s.next_run_at",
-    )
+    sqlx::query(&format!(
+        "SELECT {SELECT_COLS} FROM subscriber WHERE next_run_at <= now() ORDER BY next_run_at"
+    ))
     .try_map(row_to_subscriber)
     .fetch_all(pool)
     .await

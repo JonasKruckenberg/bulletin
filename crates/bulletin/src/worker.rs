@@ -163,9 +163,9 @@ fn is_duplicate_enqueue(e: &TaskSinkError<sqlx::Error>) -> bool {
 }
 
 /// The tick is the sole enqueuer. It reads three "what's due" conditions and pushes work; it
-/// advances no watermarks itself (the flows do). The clustering → digest dependency is honored
-/// as a *data precondition* of the digest sweep (`due_subscribers` only returns a subscriber once
-/// every public event before its boundary is built), so no job needs to chain another.
+/// advances no watermarks itself (the flows do). Build and digest are **decoupled** (design
+/// §3.0/§9.4): the digest sweep does not wait on clustering — projection reads whatever the
+/// materialization side has built, and an unbuilt event simply rides the next fire (never lost).
 async fn handle_tick(_: Tick<Utc>, pool: Data<PgPool>) -> Result<(), BoxDynError> {
     let span = tracing::info_span!("tick");
     async move {
@@ -204,7 +204,8 @@ async fn run_tick(pool: Data<PgPool>) -> Result<(), BoxDynError> {
         storage.push(PublicBuildJob).await?;
     }
 
-    // 3. Subscribers due *and* fully built → GenerateDigest (dedup: apalis idempotency key).
+    // 3. Subscribers due → GenerateDigest (dedup: apalis idempotency key). No build gate — the
+    //    digest reads the latest materialized snapshot; unbuilt events ride the next fire.
     let subs = due_subscribers(&pool).await?;
     if !subs.is_empty() {
         tracing::info!(count = subs.len(), "tick: dispatching due digests");

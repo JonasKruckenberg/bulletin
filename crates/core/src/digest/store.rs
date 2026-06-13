@@ -7,7 +7,7 @@ use uuid::Uuid;
 pub struct DigestRow {
     pub id: Uuid,
     pub subscriber_id: Uuid,
-    pub window_start: DateTime<Utc>,
+    /// The scheduled boundary that fired — the digest's identity (`UNIQUE(subscriber_id, window_end)`).
     pub window_end: DateTime<Utc>,
     pub delivered_at: Option<DateTime<Utc>>,
 }
@@ -16,7 +16,6 @@ fn row_to_digest(row: PgRow) -> Result<DigestRow, sqlx::Error> {
     Ok(DigestRow {
         id: row.get("id"),
         subscriber_id: row.get("subscriber_id"),
-        window_start: row.get("window_start"),
         window_end: row.get("window_end"),
         delivered_at: row.get("delivered_at"),
     })
@@ -30,29 +29,28 @@ pub struct RenderItem {
     pub last_event_time: DateTime<Utc>,
 }
 
-/// Clusters that received a new event (by ingest_time) in `(last_run, window_end]` — the
-/// digest's candidate set. Ordered newest-first; the pure `select()` applies the cap.
-/// `last_run = None` ⇒ unbounded lower edge.
-pub async fn candidates_in_window(
+/// The digest's candidate set: clusters built/updated since the **consideration floor**
+/// `min(last_run, now − horizon_days)` — a freshness-scored lookback, not a window partition. The
+/// floor always reaches back to the last delivery (so nothing since then is missed, even a backdated
+/// event, since the bound is on `cluster.updated_at` = ingest/build recency) and pulls in older
+/// context up to the horizon. Ordered newest-first; the pure `select()` applies the cap. A cluster
+/// may legitimately appear in consecutive digests (design §9.4). `last_run = None` ⇒ floor is just
+/// `now − horizon_days`.
+pub async fn candidates_in_lookback(
     executor: impl PgExecutor<'_>,
     last_run: Option<DateTime<Utc>>,
-    window_end: DateTime<Utc>,
+    horizon_days: i32,
 ) -> Result<Vec<Candidate>, sqlx::Error> {
     sqlx::query(
-        "SELECT c.id, c.last_event_time
-         FROM cluster c
-         WHERE EXISTS (
-             SELECT 1 FROM event e
-             WHERE e.scope_kind = 'public'
-               AND e.source = c.source
-               AND e.group_key = c.group_key
-               AND e.ingest_time > COALESCE($1, '-infinity'::timestamptz)
-               AND e.ingest_time <= $2
-         )
-         ORDER BY c.last_event_time DESC",
+        "SELECT id, last_event_time
+         FROM cluster
+         WHERE updated_at >= LEAST(
+                 COALESCE($1, now() - make_interval(days => $2)),
+                 now() - make_interval(days => $2))
+         ORDER BY last_event_time DESC",
     )
     .bind(last_run)
-    .bind(window_end)
+    .bind(horizon_days)
     .try_map(|row: PgRow| {
         Ok(Candidate {
             cluster_id: row.get("id"),
@@ -97,20 +95,18 @@ pub async fn cluster_display(
 pub async fn create_with_items(
     pool: &PgPool,
     subscriber_id: Uuid,
-    window_start: DateTime<Utc>,
     window_end: DateTime<Utc>,
     cluster_ids: &[Uuid],
 ) -> Result<DigestRow, sqlx::Error> {
     let mut tx = pool.begin().await?;
 
     let created = sqlx::query(
-        "INSERT INTO digest (subscriber_id, window_start, window_end)
-         VALUES ($1, $2, $3)
+        "INSERT INTO digest (subscriber_id, window_end)
+         VALUES ($1, $2)
          ON CONFLICT (subscriber_id, window_end) DO NOTHING
-         RETURNING id, subscriber_id, window_start, window_end, delivered_at",
+         RETURNING id, subscriber_id, window_end, delivered_at",
     )
     .bind(subscriber_id)
-    .bind(window_start)
     .bind(window_end)
     .try_map(row_to_digest)
     .fetch_optional(&mut *tx)
@@ -133,7 +129,7 @@ pub async fn create_with_items(
         // Already exists — its items are frozen from the original transaction.
         None => {
             sqlx::query(
-                "SELECT id, subscriber_id, window_start, window_end, delivered_at
+                "SELECT id, subscriber_id, window_end, delivered_at
              FROM digest WHERE subscriber_id = $1 AND window_end = $2",
             )
             .bind(subscriber_id)
@@ -170,21 +166,23 @@ pub async fn render_items(pool: &PgPool, digest_id: Uuid) -> Result<Vec<RenderIt
     .await
 }
 
-/// Marks the digest delivered and advances the subscriber's watermark in one transaction, so
-/// the "delivered ⇒ watermark moved" invariant can't tear across a crash. The `delivered_at IS
-/// NULL` guard makes a re-run a no-op (idempotent).
+/// Marks the digest delivered and advances the subscriber's schedule in one transaction, so the
+/// "delivered ⇒ schedule moved" invariant can't tear across a crash. `delivered_through` becomes
+/// the new `last_run_at` (the lookback's consideration floor); `next_run_at` jumps to the next
+/// future boundary (coalescing). The `delivered_at IS NULL` guard makes a re-run a no-op.
 pub async fn mark_delivered(
     pool: &PgPool,
     digest_id: Uuid,
     subscriber_id: Uuid,
-    window_end: DateTime<Utc>,
+    delivered_through: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
     sqlx::query("UPDATE digest SET delivered_at = now() WHERE id = $1 AND delivered_at IS NULL")
         .bind(digest_id)
         .execute(&mut *tx)
         .await?;
-    crate::digest::subscriber::advance_after_delivery(&mut *tx, subscriber_id, window_end).await?;
+    crate::digest::subscriber::advance_after_delivery(&mut *tx, subscriber_id, delivered_through)
+        .await?;
     tx.commit().await?;
     Ok(())
 }
@@ -195,7 +193,7 @@ pub async fn list_digests(
     limit: i64,
 ) -> Result<Vec<(DigestRow, String, i64)>, sqlx::Error> {
     sqlx::query(
-        "SELECT d.id, d.subscriber_id, d.window_start, d.window_end, d.delivered_at,
+        "SELECT d.id, d.subscriber_id, d.window_end, d.delivered_at,
                 s.email,
                 (SELECT count(*) FROM digest_item di WHERE di.digest_id = d.id) AS item_count
          FROM digest d JOIN subscriber s ON s.id = d.subscriber_id

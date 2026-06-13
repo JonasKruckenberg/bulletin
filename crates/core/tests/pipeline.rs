@@ -1,6 +1,7 @@
-//! Integration coverage for the M1 tick DAG's store contract: PublicBuild grouping, the
-//! candidate-window query, the PublicBuild → GenerateDigest dependency gate, and the digest
-//! delivery lifecycle. Mirrors the orchestration in the `bulletin` binary against a real Postgres.
+//! Integration coverage for the tick's store contract: PublicBuild grouping, the lookback
+//! candidate query, the (now decoupled) build/digest relationship, recurrence scheduling, and the
+//! digest delivery lifecycle. Mirrors the orchestration in the `bulletin` binary against a real
+//! Postgres.
 
 use bulletin_core::cluster::store::{
     advance_build_watermark, build_bounds, dirty_public_groups, list_public_group_events,
@@ -8,7 +9,7 @@ use bulletin_core::cluster::store::{
 };
 use bulletin_core::digest::select::{select, Verdict};
 use bulletin_core::digest::store::{
-    candidates_in_window, create_with_items, mark_delivered, render_items,
+    candidates_in_lookback, create_with_items, mark_delivered, render_items,
 };
 use bulletin_core::digest::subscriber::{
     advance_after_delivery, due_subscribers, insert_subscriber, load_subscriber, update_preferences,
@@ -122,8 +123,7 @@ async fn build_groups_events_into_clusters() {
         .unwrap();
     assert_eq!(rollup(&shared).unwrap().title, "Shared latest");
 
-    let window_end = Utc::now() + Duration::hours(1);
-    let candidates = candidates_in_window(&pool, None, window_end).await.unwrap();
+    let candidates = candidates_in_lookback(&pool, None, 30).await.unwrap();
     assert_eq!(candidates.len(), 3);
 
     // Pure selection caps and orders newest-first.
@@ -157,10 +157,11 @@ async fn rebuild_upserts_cluster_in_place() {
 }
 
 // The dependency gate: a subscriber whose window contains an unbuilt public event is withheld
-// until PublicBuild catches up. Events are inserted *before* the subscriber, so their ingest_time
-// precedes next_run_at and the gate's NOT EXISTS clause fires.
+// No build gate: a due subscriber is dispatched even with unbuilt public events. Those events just
+// aren't candidates until clustered — they ride the next fire (never lost), so build and digest are
+// decoupled rather than gated.
 #[tokio::test]
-async fn digest_waits_for_public_build() {
+async fn no_build_gate_unbuilt_events_ride_next_fire() {
     let (pool, _pg) = setup().await;
 
     insert_public(&pool, "a", "a", "Pre-existing", 100).await;
@@ -169,19 +170,25 @@ async fn digest_waits_for_public_build() {
         .unwrap();
     force_due(&pool, sub_id).await;
 
-    // Due by the clock, but its window has an unbuilt event → not yet selectable.
+    // Due regardless of build state — no gate.
     let due = due_subscribers(&pool).await.unwrap();
     assert!(
-        due.iter().all(|s| s.id != sub_id),
-        "subscriber must wait for build"
+        due.iter().any(|s| s.id == sub_id),
+        "subscriber is due even with unbuilt events"
+    );
+    // ...but the unbuilt event is not yet a candidate.
+    assert!(
+        candidates_in_lookback(&pool, None, 30).await.unwrap().is_empty(),
+        "unbuilt event is not a candidate"
     );
 
     build_all(&pool).await;
 
-    let due = due_subscribers(&pool).await.unwrap();
-    assert!(
-        due.iter().any(|s| s.id == sub_id),
-        "subscriber due once built"
+    // Once clustered it becomes a candidate.
+    assert_eq!(
+        candidates_in_lookback(&pool, None, 30).await.unwrap().len(),
+        1,
+        "built cluster is now a candidate"
     );
 }
 
@@ -201,9 +208,8 @@ async fn digest_delivery_and_idempotency() {
 
     let sub = load_subscriber(&pool, sub_id).await.unwrap().unwrap();
     let window_end = sub.next_run_at;
-    let window_start = window_end - Duration::days(1);
 
-    let candidates = candidates_in_window(&pool, sub.last_run_at, window_end)
+    let candidates = candidates_in_lookback(&pool, sub.last_run_at, 30)
         .await
         .unwrap();
     let selected: Vec<_> = select(candidates, sub.max_items as usize)
@@ -213,7 +219,7 @@ async fn digest_delivery_and_idempotency() {
         .collect();
     assert_eq!(selected.len(), 2);
 
-    let digest = create_with_items(&pool, sub_id, window_start, window_end, &selected)
+    let digest = create_with_items(&pool, sub_id, window_end, &selected)
         .await
         .unwrap();
     assert!(digest.delivered_at.is_none());
@@ -227,7 +233,7 @@ async fn digest_delivery_and_idempotency() {
         .unwrap();
 
     // Re-creating the same window returns the same delivered row; items unchanged (no duplicates).
-    let again = create_with_items(&pool, sub_id, window_start, window_end, &selected)
+    let again = create_with_items(&pool, sub_id, window_end, &selected)
         .await
         .unwrap();
     assert_eq!(again.id, digest.id);
