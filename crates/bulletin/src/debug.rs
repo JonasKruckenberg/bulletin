@@ -54,6 +54,8 @@ pub enum DebugCommand {
     },
     /// List subscribers
     SubscriberList,
+    /// Delete a subscriber row by id (cascades to their digests)
+    SubscriberRm { id: Uuid },
     /// Run PublicBuild once, inline (cluster new public events now)
     BuildRun,
     /// Run GenerateDigest once for a subscriber, inline (select → render → deliver)
@@ -175,6 +177,13 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> R
                         .map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
                         .unwrap_or_else(|| "never".to_string()),
                 );
+            }
+        }
+        DebugCommand::SubscriberRm { id } => {
+            if digest::subscriber::delete_subscriber(pool, id).await? {
+                println!("deleted {id}");
+            } else {
+                println!("not found: {id}");
             }
         }
         DebugCommand::BuildRun => match cluster::build(pool).await? {
