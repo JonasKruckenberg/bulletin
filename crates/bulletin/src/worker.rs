@@ -62,6 +62,9 @@ async fn traced(
     fut: impl std::future::Future<Output = Result<(), BoxDynError>>,
 ) -> Result<(), BoxDynError> {
     let enqueued_ms = task_id.inner().timestamp_ms() as i64;
+    if attempt.current() > 1 {
+        metric::job_retried(job);
+    }
     let span = tracing::info_span!("job", job, task_id = %task_id, attempt = attempt.current());
     async move {
         let wait_ms = (Utc::now().timestamp_millis() - enqueued_ms).max(0);
@@ -138,8 +141,16 @@ async fn generate_digest(
         let content = email.content();
         match bulletin_core::digest::generate(&pool, &sender, job.subscriber_id, &content).await {
             Ok(outcome) => {
-                if matches!(outcome, DigestOutcome::Delivered { .. }) {
-                    metric::digest_delivered();
+                // `delivered` and `empty` both sent an email; `already_delivered`/`not_yet_due`
+                // sent nothing. Record every variant so the counter doesn't undercount real sends.
+                match outcome {
+                    DigestOutcome::Delivered { items } => {
+                        metric::digest_outcome("delivered");
+                        metric::digest_items(items);
+                    }
+                    DigestOutcome::Empty => metric::digest_outcome("empty"),
+                    DigestOutcome::AlreadyDelivered => metric::digest_outcome("already_delivered"),
+                    DigestOutcome::NotYetDue => metric::digest_outcome("not_yet_due"),
                 }
                 tracing::info!(subscriber_id = %job.subscriber_id, ?outcome, "digest generated");
             }
@@ -232,7 +243,10 @@ async fn run_tick(pool: Data<PgPool>) -> Result<(), BoxDynError> {
     // tick — keeps the DB read off the scrape path. A gather failure must not fail the tick.
     match bulletin_core::status::gather(&pool).await {
         Ok(report) => metric::publish_gauges(&report),
-        Err(e) => tracing::warn!(error = %e, "status gather for metrics failed"),
+        Err(e) => {
+            metric::status_gather_failed();
+            tracing::warn!(error = %e, "status gather for metrics failed");
+        }
     }
 
     Ok(())

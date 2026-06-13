@@ -144,11 +144,26 @@ scrape_configs:
       - targets: ["127.0.0.1:9464"]
 ```
 
-Series: `bulletin_jobs_total{job,outcome}`, `bulletin_job_duration_seconds` (histogram),
+Counters: `bulletin_jobs_total{job,outcome}`, `bulletin_job_retries_total{job}`,
 `bulletin_events_ingested_total{source}`, `bulletin_events_deduplicated_total{source}`,
-`bulletin_poll_failures_total{source}`, `bulletin_digests_delivered_total`; gauges
-`bulletin_queue_depth{job_type}`, `bulletin_build_lag_seconds`, `bulletin_events_unbuilt`,
-`bulletin_connections_active`, `bulletin_subscribers_due`.
+`bulletin_poll_failures_total{source}`, `bulletin_digests_total{outcome}` (`delivered`/`empty`
+both put an email on the wire, so emails sent = `delivered + empty`),
+`bulletin_status_gather_failures_total`. Histograms: `bulletin_job_duration_seconds{job}`,
+`bulletin_digest_items` (items per delivered digest). Gauges (refreshed once per minute by the
+cron tick): `bulletin_queue_depth{job_type}`, `bulletin_queue_running{job_type}`,
+`bulletin_queue_failed{job_type}`, `bulletin_queue_killed{job_type}`,
+`bulletin_queue_oldest_pending_seconds{job_type}`, `bulletin_build_lag_seconds`,
+`bulletin_events_unbuilt`, `bulletin_clusters_total`, `bulletin_connections_active`,
+`bulletin_connections_errored`, `bulletin_connections_due`, `bulletin_subscribers{freq}`,
+`bulletin_subscribers_due`, `bulletin_digests_pending`,
+`bulletin_last_ingest_timestamp_seconds`, `bulletin_last_delivered_timestamp_seconds`.
+
+### Grafana dashboard
+
+A ready-to-import overview dashboard lives at `ops/grafana/bulletin-overview.json` (health/SLO,
+jobs, queue backlog, ingestion, delivery). Import it via *Dashboards → New → Import*, paste the
+JSON, and pick your Prometheus datasource when prompted. See `ops/grafana/README.md` for the
+suggested alert rules.
 
 ## Seeding & ops
 
