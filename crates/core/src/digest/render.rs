@@ -110,7 +110,9 @@ pub(crate) fn render_empty(
     salutation: &str,
     content: &DigestContent<'_>,
 ) -> Result<Message> {
-    let subject = format!("{}: you're all caught up", content.brand);
+    // Mirror the populated digest: the subject is the email's own opening line, so the inbox
+    // preview reads in the same time-of-day voice as the body.
+    let subject = format!("{salutation}. You're all caught up");
 
     // Show the window date in the subscriber's own zone, like the item digest does. An
     // unparseable name can't reach here (the DB rejects it on signup/update); fall back to UTC.
