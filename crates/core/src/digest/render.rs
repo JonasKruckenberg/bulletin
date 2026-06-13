@@ -154,7 +154,7 @@ fn render_empty_plain(window_end: DateTime<Utc>, tz: Tz) -> String {
     format!(
         "You're all caught up!\n\n\
          No new items in the window ending {}.\n\
-         Nothing needed your attention this time — enjoy the quiet. \u{2728}\n",
+         Enjoy the quiet. \u{2728}\n",
         window_end.with_timezone(&tz).format("%Y-%m-%d %H:%M %Z")
     )
 }
@@ -297,7 +297,7 @@ fn render_empty_html(window_end: DateTime<Utc>, tz: Tz, content: &DigestContent<
 <div style="text-align:center;padding:46px 8px 18px 8px;">
 <div style="font-size:52px;line-height:1;" aria-hidden="true">&#x2728;</div>
 <div style="margin:24px 0 0 0;font-family:{SERIF};font-size:28px;font-weight:700;line-height:1.3;color:{ACCENT};">You're all caught up</div>
-<div style="margin:14px auto 0 auto;max-width:360px;font-family:{SERIF};font-size:17px;font-style:italic;line-height:1.7;color:{INK_BODY};">No new notifications this time — nothing needed your attention in this window. Sit back and enjoy the calm.</div>
+<div style="margin:14px auto 0 auto;max-width:360px;font-family:{SERIF};font-size:17px;font-style:italic;line-height:1.7;color:{INK_BODY};">No new notifications this time. Sit back and enjoy the calm.</div>
 </div>
 </td>
 </tr>
