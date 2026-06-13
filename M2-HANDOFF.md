@@ -143,8 +143,9 @@ conditional GET + last-seen-id high-water mark); the legible `ingest/github/even
 > **Status: implemented** (branch `claude/m1-phase-2-c1tvgu`). What landed, vs. the plan below:
 > - **Realtime traits** in `ingest/realtime.rs`: `RealtimeConnection: Connection`
 >   (`accept_webhook(event_type, delivery_id, body)` + `hydrate` default-identity), app-level
->   `RealtimeConnector` (`verify` + `route`), `Inbound`/`NormalizedInbound`, `Verified`,
->   `LifecycleStatus`/`LifecycleChange`, and `RealtimeDispatch { Github(..) }` (**no RSS arm**).
+>   `RealtimeConnector` (`verify`; the credential-free routing peek is the free `realtime::route`
+>   fn), `Inbound<I>`, `Verified`, `LifecycleStatus`/`LifecycleChange`, and
+>   `RealtimeDispatch { Github(..) }` (**no RSS arm**).
 > - **GitHub realtime head**: `ingest/github/webhook.rs` (`GithubWebhook` HMAC-SHA256 verify over raw
 >   bytes via `hmac`'s constant-time `verify_slice`; `route` peeks `installation.id`); `event_map`
 >   gained `from_webhook` (synthesizes a `GithubEvent` whose `payload` *is* the webhook body, so it
