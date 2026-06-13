@@ -278,3 +278,107 @@ a real (operator-seeded) GitHub install ingests end-to-end via both webhook and 
 **Open question to settle at end of M2** (roadmap §5): revisit crate-graph names/granularity
 (`connectors`/`store`/`support` split) now that real deps exist; group-key/near-dup tuning for
 GitHub.
+
+---
+
+## 11. Appendix — GitHub event surface map (repo / org / user / enterprise)
+
+> Catalog is **as of early 2026** — GitHub adds event types regularly; **re-verify against the live
+> "Webhook events and payloads" + "REST Activity/Events" docs when configuring the App.** The point
+> of this map is to scope deliberately, not to hardcode.
+
+### 11.1 The two intakes have different coverage (the crux)
+
+- **Activity timeline** (`GET /repos/{o}/{r}/events`, `/orgs/{org}/events`, `/users/{u}/events`,
+  `/networks/{o}/{r}/events`) — what Phase 1's poll reads. Carries only the **~17 timeline types**
+  below. Public events only for public actors; an installation token widens repo visibility.
+- **Webhooks** — the full **~70+ type** catalog (header `X-GitHub-Event`). Most types are **not on
+  the timeline**, so they arrive *only* by webhook.
+- **Resource REST endpoints** — for non-timeline signals (alerts, checks, runs, deployments…),
+  each has its own list endpoint. **These are what a reconciliation poll must hit** to keep the
+  "poll is the correctness floor; webhooks are freshness" invariant (§7.2/§5.4) for that signal.
+
+**Consequence:** `event_map` already *captures* any webhook type generically (so nothing is dropped
+once a webhook arrives), but (a) **rich** classification and (b) **poll reconciliation** for a
+non-timeline signal are per-signal work: subscribe the webhook type **and** add a paired REST
+fetcher to `GithubConnection::poll`, **and** request the App permission.
+
+### 11.2 Timeline types (poll-visible today via `/events`)
+
+`CommitCommentEvent`, `CreateEvent` (branch/tag), `DeleteEvent`, `ForkEvent`, `GollumEvent` (wiki),
+`IssueCommentEvent`, `IssuesEvent`, `MemberEvent`, `PublicEvent` (repo made public),
+`PullRequestEvent`, `PullRequestReviewEvent`, `PullRequestReviewCommentEvent`,
+`PullRequestReviewThreadEvent`, `PushEvent`, `ReleaseEvent`, `SponsorshipEvent`, `WatchEvent`.
+Phase 1 maps Issues/PR/Release/Push/comments richly; the rest fall through to the generic capture.
+
+### 11.3 Webhook catalog by scope (T = also on the timeline → poll-visible without a new endpoint)
+
+**Repo — collaboration & content:** `push`(T) · `pull_request`(T) · `pull_request_review`(T) ·
+`pull_request_review_comment`(T) · `pull_request_review_thread`(T) · `issues`(T) · `issue_comment`(T) ·
+`sub_issues` · `commit_comment`(T) · `create`(T) · `delete`(T) · `fork`(T) · `gollum`(T) · `release`(T) ·
+`discussion` · `discussion_comment` · `label` · `milestone` · `watch`(T) · `star` · `public`(T) ·
+`member`(T) · `page_build` · `status`.
+
+**Repo — CI/CD & automation (webhook-only; reconcile via Actions/Checks/Deployments REST):**
+`check_run` · `check_suite` · `workflow_run` · `workflow_job` · `workflow_dispatch` ·
+`repository_dispatch` · `deployment` · `deployment_status` · `deployment_review` ·
+`deployment_protection_rule` · `merge_group` · `registry_package` · `package`.
+
+**Repo — security & policy (webhook-only; reconcile via the alert REST endpoints in §11.4):**
+`dependabot_alert` · `code_scanning_alert` · `secret_scanning_alert` ·
+`secret_scanning_alert_location` · `secret_scanning_scan` · `security_advisory` ·
+`security_and_analysis` · `repository_vulnerability_alert` (deprecated → `dependabot_alert`) ·
+`branch_protection_rule` · `branch_protection_configuration` · `repository_ruleset` · `deploy_key`.
+
+**Repo — admin/meta (webhook-only):** `repository` (created/deleted/archived/renamed/transferred/
+publicized/privatized) · `repository_import` · `repository_ruleset` · `meta` (hook deleted) ·
+`team_add` · `custom_property_values`.
+
+**Project management:** `projects_v2` · `projects_v2_item` · `projects_v2_status_update` (org) ·
+`project`/`project_card`/`project_column` (classic, deprecated).
+
+**Org-level:** `organization` (member added/removed/renamed/deleted) · `membership` · `team` ·
+`org_block` · `personal_access_token_request` · `custom_property`/`custom_property_values` ·
+`repository` (org repos) · `projects_v2*` · `repository_ruleset`.
+
+**App / installation lifecycle (webhook-only — must drive `connection.status`, Phase 2):**
+`installation` (created/deleted/suspend/unsuspend/new_permissions_accepted) ·
+`installation_repositories` (added/removed) · `installation_target` · `github_app_authorization`.
+
+**Account / marketplace / sponsors / global:** `marketplace_purchase` · `sponsorship`(T) ·
+`security_advisory` (global GitHub Advisory DB feed).
+
+**Enterprise-level:** enterprise webhooks receive most repo/org events across all orgs plus
+enterprise-scoped security (`dependabot_alert`/`secret_scanning_alert` enterprise-wide), `audit`,
+`organization`, `team`, `membership`, `repository`.
+
+### 11.4 REST endpoints for poll reconciliation of non-timeline signals (high value)
+
+| Signal | Repo | Org / Enterprise | App permission (read) |
+|---|---|---|---|
+| Dependabot alerts | `/repos/{o}/{r}/dependabot/alerts` | `/orgs/{org}/dependabot/alerts`, enterprise | Dependabot alerts |
+| Code scanning | `/repos/{o}/{r}/code-scanning/alerts` | `/orgs/{org}/code-scanning/alerts` | Code scanning alerts |
+| Secret scanning | `/repos/{o}/{r}/secret-scanning/alerts` | `/orgs/{org}/…`, enterprise | Secret scanning alerts |
+| Repo advisories | `/repos/{o}/{r}/security-advisories` | — | Repo advisories |
+| Global advisories | `/advisories` (GitHub Advisory DB) | — | none (public) |
+| Workflow runs | `/repos/{o}/{r}/actions/runs` | — | Actions |
+| Check runs/suites | `/repos/{o}/{r}/commits/{ref}/check-runs` | — | Checks |
+| Deployments | `/repos/{o}/{r}/deployments` (+ statuses) | — | Deployments |
+| Commit statuses | `/repos/{o}/{r}/commits/{ref}/statuses` | — | Commit statuses / Contents |
+| Packages | user/org packages | `/orgs/{org}/packages` | Packages |
+| Discussions | GraphQL only (no REST list) | — | Discussions |
+
+### 11.5 Recommended M2 tiering (proposal — confirm before wiring)
+
+- **Tier 1 (ingest in M2):** the timeline collaboration set (already poll-able, free) + **security
+  alerts** (`dependabot_alert`, `code_scanning_alert`, `secret_scanning_alert`, `security_advisory`)
+  via **webhook + paired REST reconciliation** + **installation lifecycle** → `connection.status`.
+  These are the "things that matter" core.
+- **Tier 2 (M2 if cheap, else next):** CI health — `workflow_run`/`check_suite` failures,
+  `deployment_status`, commit `status`. High value, but each needs a poll fetcher.
+- **Tier 3 (defer):** projects_v2, discussions, sponsors/marketplace, packages, admin/meta churn,
+  classic (deprecated) projects, branch-protection/ruleset config noise.
+
+**Scope mapping:** private-repo signals → `Private(owner)`; org/account-level meta → owner-private
+or treated as administrative; global advisories → `Public`. (`finalize` owns this, Phase 3.)
+
