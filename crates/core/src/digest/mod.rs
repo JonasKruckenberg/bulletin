@@ -122,8 +122,13 @@ pub async fn generate(
         // Empty windows are rare — going silent reads as a broken pipeline. Send a cheerful
         // "you're all caught up" note instead, then advance the schedule so the subscriber
         // isn't perpetually due.
-        let message =
-            render::render_empty(mailer.from(), &sub.email, window_end, &sub.timezone, content)?;
+        let message = render::render_empty(
+            mailer.from(),
+            &sub.email,
+            window_end,
+            &sub.timezone,
+            content,
+        )?;
         mailer.send(message).await?;
         mark_delivered(pool, digest.id, sub.id, snapshot_at)
             .await

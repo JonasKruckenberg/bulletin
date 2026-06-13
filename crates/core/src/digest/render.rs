@@ -154,7 +154,7 @@ fn render_empty_plain(window_end: DateTime<Utc>, tz: Tz) -> String {
     format!(
         "You're all caught up!\n\n\
          No new items in the window ending {}.\n\
-         Enjoy the quiet. \u{2728}\n",
+         Enjoy the quiet. \u{1F343}\n",
         window_end.with_timezone(&tz).format("%Y-%m-%d %H:%M %Z")
     )
 }
@@ -295,7 +295,7 @@ fn render_empty_html(window_end: DateTime<Utc>, tz: Tz, content: &DigestContent<
 <h1 style="margin:18px 0 30px 0;font-family:{SERIF};font-size:34px;font-weight:700;line-height:1.25;color:{INK};text-align:center;">{title}</h1>
 {date_rule}
 <div style="text-align:center;padding:46px 8px 18px 8px;">
-<div style="font-size:52px;line-height:1;" aria-hidden="true">&#x2728;</div>
+<div style="font-size:52px;line-height:1;" aria-hidden="true">&#x1F343;</div>
 <div style="margin:24px 0 0 0;font-family:{SERIF};font-size:28px;font-weight:700;line-height:1.3;color:{ACCENT};">You're all caught up</div>
 <div style="margin:14px auto 0 auto;max-width:360px;font-family:{SERIF};font-size:17px;font-style:italic;line-height:1.7;color:{INK_BODY};">No new notifications this time. Sit back and enjoy the calm.</div>
 </div>
@@ -568,7 +568,8 @@ mod tests {
 
     #[test]
     fn empty_plain_is_caught_up() {
-        let plain = render_empty_plain(Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(), Tz::UTC);
+        let plain =
+            render_empty_plain(Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(), Tz::UTC);
 
         assert!(plain.contains("You're all caught up"));
         assert!(plain.contains("2026-06-13 09:00 UTC"));
