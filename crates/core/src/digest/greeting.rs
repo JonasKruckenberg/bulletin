@@ -75,12 +75,11 @@ const VARIANTS: &[&str] = &[
     "{salutation}. Find a quiet moment for your {cadence} digest.",
     "{salutation}. Ease into your {cadence} digest.",
     "{salutation}. When you're ready, your {cadence} digest is waiting.",
-    "{salutation}. Inhale, exhale, and ease into your {cadence} digest.",
+    "{salutation}. Inhale, exhale; your {cadence} digest is ready.",
     "{salutation}. Drop your shoulders; your {cadence} digest is here.",
     "{salutation}. Find your flow with your {cadence} digest.",
     "{salutation}. Unwind a little; your {cadence} digest is ready.",
     "{salutation}. Channel your inner calm; your {cadence} digest awaits.",
-    "{salutation}. Sink in and savor your {cadence} digest.",
 ];
 
 /// Builds the greeting for one digest. `digest_time` is the subscriber's local delivery time (which
