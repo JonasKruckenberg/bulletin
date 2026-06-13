@@ -21,6 +21,8 @@ uuid        = { version = "1", features = ["v7", "serde"] }
 chrono      = { version = "0.4", features = ["serde"] }
 chrono-tz   = "0.10"  # IANA tz lookup for rendering a digest's date in the subscriber's zone
 sha2        = "0.10"
+hmac        = "0.12"  # webhook HMAC-SHA256 signature verification (GitHub X-Hub-Signature-256)
+hex         = "0.4"   # decode the hex-encoded webhook signature
 ulid        = "1"  # read enqueue time from the apalis TaskId for job wait/run timing
 clap        = { version = "4", features = ["derive", "env"] }
 axum        = "0.7"

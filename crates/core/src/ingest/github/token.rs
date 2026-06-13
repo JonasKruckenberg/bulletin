@@ -59,3 +59,20 @@ impl TokenProvider for StaticTokenProvider {
         Box::pin(async move { Ok(token) })
     }
 }
+
+/// A token provider that never yields a token — it errors if asked. Used by the realtime-only
+/// worker ([`super::GithubConnection::realtime_only`]): webhook normalization needs no token, so a
+/// realtime-only worker has none. Calling `poll` on it is a bug, and this turns that into a clear
+/// runtime error instead of a malformed request.
+pub struct UnavailableToken;
+
+impl TokenProvider for UnavailableToken {
+    fn access_token(&self) -> TokenFuture<'_> {
+        Box::pin(async {
+            Err(SourceError::Request(
+                "no token provider configured (realtime-only GitHub worker cannot poll)"
+                    .to_string(),
+            ))
+        })
+    }
+}

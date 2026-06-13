@@ -1,6 +1,7 @@
 mod debug;
 mod metric;
 mod transport;
+mod webhook;
 mod worker;
 
 use anyhow::{Context, Result};
@@ -25,6 +26,11 @@ struct Cli {
     /// Log output format: `text` (human) or `json` (one structured line per event, for Loki).
     #[arg(long, env = "BULLETIN_LOG_FORMAT", default_value = "text")]
     log_format: LogFormat,
+    /// GitHub App webhook signing secret — the HMAC-SHA256 key for `X-Hub-Signature-256` over the
+    /// raw body (`serve` / `all`). Plumbed now; sealed at rest in a later phase ("plumbing now,
+    /// secrets later"). Absent → `/webhooks/github` fails closed (rejects every delivery).
+    #[arg(long, env = "BULLETIN_GITHUB_WEBHOOK_SECRET")]
+    github_webhook_secret: Option<String>,
     /// Email delivery config (worker + `debug digest-run`); defaults to local file transport.
     #[command(flatten)]
     email: transport::EmailConfig,
@@ -67,8 +73,9 @@ async fn main() -> Result<()> {
             tracing::info!("migrations complete");
         }
         Command::Serve => {
+            let pool = connect_pool(&cli.database_url).await?;
             tracing::info!(addr = %cli.http_addr, "starting HTTP server");
-            serve_health(cli.http_addr).await?;
+            serve(cli.http_addr, pool, cli.github_webhook_secret.clone()).await?;
         }
         Command::Worker => {
             metric::init(cli.metrics_addr)?;
@@ -81,7 +88,11 @@ async fn main() -> Result<()> {
             let pool = connect_pool(&cli.database_url).await?;
             tracing::info!(addr = %cli.http_addr, "starting server + worker");
             tokio::try_join!(
-                serve_health(cli.http_addr),
+                serve(
+                    cli.http_addr,
+                    pool.clone(),
+                    cli.github_webhook_secret.clone()
+                ),
                 worker::start(pool, cli.email.clone(), connector_ctx())
             )?;
         }
@@ -108,10 +119,15 @@ fn connector_ctx() -> bulletin_core::ingest::ConnectorCtx {
     bulletin_core::ingest::ConnectorCtx::default()
 }
 
-/// The liveness HTTP server (`serve` / `all`): a single `/health` route, separate from the
-/// metrics exporter the worker installs.
-async fn serve_health(addr: SocketAddr) -> Result<()> {
-    let app = axum::Router::new().route("/health", axum::routing::get(|| async { "ok" }));
+/// The HTTP server (`serve` / `all`): liveness `/health` + the webhook catcher (`/webhooks/github`),
+/// separate from the metrics exporter the worker installs. Needs the pool (for the apalis enqueue
+/// handle) and the webhook secret (for edge HMAC verification).
+async fn serve(
+    addr: SocketAddr,
+    pool: PgPool,
+    github_webhook_secret: Option<String>,
+) -> Result<()> {
+    let app = webhook::router(pool, github_webhook_secret.map(String::into_bytes));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("failed to bind to {addr}"))?;

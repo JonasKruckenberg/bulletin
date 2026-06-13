@@ -14,6 +14,7 @@
 
 pub mod event_map;
 pub mod token;
+pub mod webhook;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,6 +22,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::common::event::EventBuilder;
+use crate::ingest::realtime::{Inbound, LifecycleChange, RealtimeConnection};
 use crate::ingest::{Batch, Connection, SourceError};
 use event_map::GithubEvent;
 use token::TokenProvider;
@@ -75,6 +77,14 @@ impl GithubConnection {
     pub fn with_repos(mut self, repos: Option<Vec<String>>) -> Self {
         self.repos = repos;
         self
+    }
+
+    /// A realtime-only worker for the webhook path: it normalizes deliveries (`accept_webhook` /
+    /// `to_events`, all pure, no network) but must never `poll` — its token provider errors if
+    /// asked. This lets webhooks ingest before the App credentials (`ConnectorCtx.github`) are wired
+    /// in Phase 5: webhook normalization needs no token, only the poll does.
+    pub fn realtime_only() -> Self {
+        Self::new(DEFAULT_API_BASE, Arc::new(token::UnavailableToken))
     }
 
     /// Common header set: bearer auth, the JSON media type, the pinned API version, and the UA
@@ -214,5 +224,35 @@ impl Connection for GithubConnection {
 
     fn to_events(&self, item: Self::Item) -> Vec<EventBuilder> {
         vec![event_map::to_builder(item)]
+    }
+}
+
+impl RealtimeConnection for GithubConnection {
+    /// Normalize a verified GitHub webhook delivery. App lifecycle events (`installation` /
+    /// `installation_repositories`) become a status change; everything else is synthesized into the
+    /// same [`GithubEvent`] shape the poll yields, so the two intakes dedup. `hydrate` is the
+    /// default identity — GitHub webhook payloads are already complete (no follow-up fetch).
+    fn accept_webhook(
+        &self,
+        event_type: &str,
+        delivery_id: &str,
+        body: &[u8],
+    ) -> Result<Inbound<Self::Item>, SourceError> {
+        let value: serde_json::Value = serde_json::from_slice(body)
+            .map_err(|e| SourceError::Parse(format!("webhook body is not JSON: {e}")))?;
+
+        if matches!(event_type, "installation" | "installation_repositories") {
+            return Ok(match event_map::lifecycle_status(&value) {
+                Some(status) => Inbound::Lifecycle(LifecycleChange { status }),
+                // install / new_permissions / repos add-remove: nothing to ingest, status unchanged.
+                None => Inbound::Events(vec![]),
+            });
+        }
+
+        Ok(Inbound::Events(vec![event_map::from_webhook(
+            event_type,
+            delivery_id,
+            value,
+        )]))
     }
 }
