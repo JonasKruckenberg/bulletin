@@ -1,0 +1,280 @@
+# M2 Implementation Handoff
+
+**Purpose.** M2 is being built in five reviewable phases, each in its own session. Phase 1 is
+merged in this PR. This doc carries the full plan, the locked decisions, the codebase orientation,
+and the per-phase implementation detail so a *fresh session with no prior memory* can execute
+Phases 2–5 faithfully. Read this top-to-bottom before starting a phase.
+
+**Reads against:** `IMPLEMENTATION-ROADMAP.md` (§M2), `digest-system-design.md` (product: §4 scopes,
+§6 data model, §7 ingress/webhooks, §8 aggregation, §9 generation, §12 security), and
+`digest-technical-architecture.md` (runtime: §2 topology, §3 ingestion, §3A auth/webhooks, §5.1/5.3/5.4
+type modeling, §6 cross-cutting).
+
+---
+
+## 1. What M2 is
+
+> **Goal (roadmap §M2):** add GitHub as a second source exercising **webhooks**, the
+> **poll-reconciliation backstop**, and **private scope** (private repos) — and make it **safe to
+> point at your own real account**: private data is DB-isolated by RLS and credentials are encrypted
+> at rest.
+
+**M2 exit criteria (the demo):** push to a watched public repo → appears in the next digest via
+webhook; drop the webhook → still appears via the reconciliation poll (fingerprint collapses the
+overlap). A private repo's events appear **only** in the owner's digest *and* are DB-isolated (a
+mis-scoped query under the runtime role returns nothing; the scope-invariant property test passes).
+The GitHub App key is never stored or logged in plaintext.
+
+**Not in M2** (deferred): OAuth `/connect` flow (M5), managed-KMS backend (M5), SSRF guard (M5, while
+only the operator adds feeds), Slack (M6), per-subscriber linking + the `story` table (M3),
+relevance/feedback (M4).
+
+---
+
+## 2. Locked cross-cutting decisions (do not relitigate)
+
+| Decision | Choice | Why |
+|---|---|---|
+| **Delivery** | 5 phases, commit each, **pause for review between phases** | user preference |
+| **GitHub client** | **hand-rolled** on `reqwest` + (later) `jsonwebtoken` + `hmac` | tiny API surface (1 token POST, a few conditional GETs, RS256 JWT); avoids the heavy `octocrab` dep, matches hand-rolled RSS |
+| **GitHub realism** | **plumbing now, secrets later** | full machinery built + fixture-tested; operator creates the real App / hand-seeds the install + secrets afterward. No live secrets needed during implementation |
+| **RLS roles** | **two roles, two connection strings** (owner/migration role owns DDL; app logs in as a separate non-owner role, no `BYPASSRLS`; `FORCE ROW LEVEL SECURITY`; tenant ctx via `SET LOCAL app.subscriber_id` through a `with_scope()` wrapper) | strong privilege boundary at the *credential* level — `SET ROLE` on one elevated connection is defeated by `RESET ROLE`/injection. Matches design §12 prereqs |
+| **GitHub event set** | **capture everything, classify in one legible place** | one `event_map` module; known types rich, unknown captured generically; add/reclassify by editing one file (per user) |
+| **Scope assignment** | adapter emits a structural `is_private` bool (from `repo.private`); **`finalize` owns the subscriber binding** and maps it to `Scope` | keeps design §12 risk-#1 invariant: an adapter can never name a subscriber or construct a `Scope` |
+| **Crate graph** | stays `core` + `bulletin` for all of M2 | design §4 says revisit at end of M2; `core` already isn't I/O-pure (uses `reqwest`). Reconsider a `connectors`/`store`/`support` split as a closing M2 note, don't act mid-milestone |
+
+---
+
+## 3. Codebase orientation (current state, post-Phase-1)
+
+**Layout.** Cargo workspace: `crates/core` (`bulletin-core`, the domain + flows) and
+`crates/bulletin` (the `bulletin` binary: clap roles, apalis worker, axum serve, debug CLI).
+
+**Roles** (`crates/bulletin/src/main.rs`): `serve` (axum — currently only `/health`), `worker`
+(apalis `Monitor` + cron tick + 3 processing workers), `migrate` (sqlx migrations + apalis storage),
+`all` (serve+worker, dev), `debug …` (`crates/bulletin/src/debug.rs`: seed/list connections &
+subscribers, run stages inline, status).
+
+**The tick & jobs** (`crates/bulletin/src/worker.rs`): one cron (`"0 * * * * *"`) is the sole
+enqueuer; three due-sweeps push `PollConnectionJob` / `PublicBuildJob` / `GenerateDigestJob`.
+apalis pins are RC (`=1.0.0-rc.9` / `-rc.8`); `unique-jobs` for idempotent enqueue. The sweep
+advances nothing — the processing job advances its own watermark (self-healing).
+
+**Flows** (`crates/core/src`): `ingest` (poll → normalize → append to `event` log),
+`cluster` (drain event log into `cluster` rows via the build watermark), `digest`
+(lookback select → freeze → render → deliver, advancing the subscriber schedule). `common` holds
+shared vocab (`event`, `kind`, `scope`, `fingerprint`, `db`, `status`).
+
+**Connector model (Phase 1).** `ingest::Connection` trait (RPITIT `poll` + pure `to_events ->
+Vec<EventBuilder>`). `ingest::ConnDispatch` enum (`Rss`, `Github`) is the hand-written dispatch; a
+generic `poll_inner` erases the cursor to JSON inside each arm. GitHub lives in
+`ingest/github/{mod,event_map,token}.rs`. `ConnectorCtx { github: Option<GithubCtx> }` is the
+app-level seam threaded `main.rs → worker → ingest::poll`.
+
+**Event identity.** `EventBuilder::finalize(scope) -> NewEvent` stamps `scope` + the SHA-256
+`Fingerprint` over `(source, stable_id)` (length-framed, content **not** folded in). Connectors
+never set scope or fingerprint. `UNIQUE(fingerprint)` + `ON CONFLICT DO NOTHING` = idempotent
+ingest.
+
+**Scope.** `scope::Scope { Public, Private(Uuid) }`. The `event` table already has
+`scope_kind` + `scope_subscriber_id` (+ CHECK). **`cluster` has no scope columns yet** (public-only)
+— Phase 3 adds them. `connection` has **no owning `subscriber_id` yet** — Phase 3 adds it.
+
+**DB / migrations.** `common/db.rs`: `connect` = plain `PgPool::connect`; `migrate` =
+`sqlx::migrate!("./migrations")` with `ignore_missing = true`. Migrations are **append-only**
+(sqlx checksums them — never edit an applied file; fix forward), additive/expand-contract. Requires
+**PostgreSQL 18** (built-in `uuidv7()`). No RLS, no role separation, no `with_scope` yet.
+
+**Test harness.** Integration tests use `testcontainers` + `postgres:18-alpine` and connect as the
+**`postgres` superuser** (see `tests/pipeline.rs::setup`). Pure tests (no DB) live in `#[cfg(test)]`
+mods + `tests/{rss,github}.rs`. **Docker is required** for the DB-backed suites
+(`pipeline`/`poll_rss`/`connection`/`event`) — they may not run in every sandbox; always run
+`clippy --all-targets` (compiles them) + the pure suites, and note if Docker was unavailable.
+
+**Dep facts.** `reqwest` is `default-features=false, features=["rustls-tls"]` — Phase 1 uses
+`serde_json::from_slice` on response bytes (no `json` feature needed). Already transitive in the
+lockfile: `hmac`, `subtle`, `hex`, `ring`, `zeroize`. **Not yet present:** `secrecy`,
+`chacha20poly1305`, `jsonwebtoken`, `base64`. `cargo-deny` (advisories+licenses+bans) runs in CI on
+every PR — verify new deps' licenses.
+
+**Commands.** `cargo clippy --workspace --all-targets`; `cargo fmt`; pure tests:
+`cargo test -p bulletin-core --lib --test rss --test github`; full (Docker): `cargo test --workspace`
+or `cargo nextest run`.
+
+---
+
+## 4. Phase status
+
+| Phase | Scope | Status |
+|---|---|---|
+| **1** | Connector trait family seam, `ContentKind`, GitHub poll, `ConnDispatch` | ✅ merged (commit `6236abd`) |
+| **2** | Webhook catcher + `ProcessWebhook` job + HMAC verify + realtime traits | ⬜ next |
+| **3** | Private scope load-bearing + per-subscriber private clusters + scope-invariant proptest | ⬜ |
+| **4** | Two-context RLS (two roles, two URLs) | ⬜ |
+| **5** | Credential-at-rest (interim XChaCha20-Poly1305 envelope) + real GitHub token minting | ⬜ |
+
+---
+
+## 5. Phase 1 — DONE (context for later phases)
+
+**Landed:** `ContentKind { Message, Announcement, Longform }` (ordered) threaded connector →
+`EventBuilder` → `NewEvent`/`Event` → DB (replaced the hardcoded `'longform'`); `ConnDispatch`
+enum + generic `poll_inner`; GitHub `Connection` (REST events-feed reconciliation, per-repo
+conditional GET + last-seen-id high-water mark); the legible `ingest/github/event_map.rs`;
+`TokenProvider` port + `StaticTokenProvider`; `ConnectorCtx`/`GithubCtx` seam.
+
+**Seams deliberately left for later phases — wire these, don't rebuild them:**
+- **`ConnectorCtx.github == None`** in `main.rs::connector_ctx()`. Phase 5 sets it to a real
+  `GithubCtx { base_url, token_factory }` once the App key is sealed/loaded. Until then GitHub
+  connections skip with a logged `BuildError::NotConfigured`.
+- **`ingest::poll` finalizes every event `Scope::Public`.** Phase 3 makes this per-event
+  (visibility-aware) — see §7.
+- **App-level traits `Connector` / `RealtimeConnector` (`verify`/`route`) were intentionally NOT
+  added** (would be dead code in Phase 1). Add them in Phase 2 where the catcher uses them.
+- **`event_map::stable_id` already uses content-identity** (issue/PR/release/comment ids, push head
+  SHA) precisely so a Phase 2 webhook for the same activity dedups against the poll's event. The
+  webhook payload's nested objects (`issue.id`, `comment.id`, `release.id`, `after` for push) carry
+  the same values — Phase 2 must feed them through the same `stable_id`/`to_builder`.
+
+---
+
+## 6. Phase 2 — Webhook catcher + `ProcessWebhook`
+
+**Goal:** GitHub webhooks ingest in real time; a dropped webhook is recovered by the Phase 1 poll
+(fingerprint collapses the overlap).
+
+**Build:**
+1. **Realtime traits** (in `ingest`, design §5.4): `RealtimeConnection: Connection` with
+   `accept_webhook(...) -> Result<Inbound<Self::Item>, SourceError>` and `hydrate(item) -> item`
+   (default identity); `Inbound<I> { Events(Vec<I>), Lifecycle(LifecycleChange) }`. App-level:
+   `RealtimeConnector` with `verify(headers, body) -> Verified` (HMAC over raw bytes, app secret,
+   **constant-time**) and `route(body) -> Result<String>` (credential-free peek of `installation.id`).
+   `Verified { Authentic, Challenge(Vec<u8>), Invalid }`. Add a **`RealtimeDispatch { Github(...) }`**
+   enum — **no RSS arm**, so "webhook routed to a pull-only source" is uncompilable.
+2. **Catcher** in `serve` (`crates/bulletin/src/main.rs` — `serve_health` becomes a real router):
+   `POST /webhooks/github` → verify `X-Hub-Signature-256` (`sha256=`, app webhook secret, constant
+   time) over the **raw body bytes** → on GitHub `ping` reply 200 → else enqueue
+   `ProcessWebhook { source, raw_body, delivery_id, event_type }` → return 2xx fast. Unverified →
+   401 drop *before* enqueue. The `serve` role now needs a `PgPool` (for the apalis storage handle)
+   + the webhook secret + `ConnectorCtx` — thread them in (today `serve_health` takes only an addr).
+3. **`ProcessWebhook` job** (`worker.rs` + a `core` flow): `route` (peek `installation.id`) → resolve
+   our `connection` by `(source, provider_account_id)` — **IDOR defense: derive subscriber+scope
+   from OUR row, never the payload** → `accept_webhook` → `Inbound::Events` → `hydrate` (identity) →
+   `to_events` → `finalize` → dedup insert; `Inbound::Lifecycle` → update `connection.status`.
+   `unique-jobs` idempotency key = `X-GitHub-Delivery`.
+4. **Migration** (additive): `connection.provider_account_id text` + `UNIQUE(source,
+   provider_account_id)` (the webhook routing key — installation_id, **not a secret**);
+   `connection.creds_ref text NULL`; allow `status = 'revoked'`. Add a store fn
+   `resolve_connection_by_provider(source, provider_account_id)`.
+
+**Key wrinkle to decide:** the GitHub **event type is in the `X-GitHub-Event` header, not the body**,
+but the design's `accept_webhook(body)` takes body only. Resolution (recommended): carry
+`event_type` (+ `delivery_id`) in the `ProcessWebhook` payload and either pass it into a
+GitHub-specific `accept_webhook(event_type, body)` or synthesize a `GithubEvent` in the job from
+`{type: map(X-GitHub-Event) → "IssuesEvent"/…, repo: repository.full_name, payload: <whole body>,
+created_at}` and reuse the existing `event_map::to_builder`. The webhook payload's nested ids line up
+with `stable_id`, so dedup-with-poll works for free.
+
+**Exit:** a signed fixture webhook ingests; a bad signature → 401; an item delivered by webhook and
+then re-seen by the reconciliation poll produces exactly one event (fingerprint collapse). Tests:
+HMAC verify (good/bad/constant-time), `accept_webhook` over recorded GitHub webhook fixtures,
+poll↔webhook dedup, lifecycle → status.
+
+---
+
+## 7. Phase 3 — Private scope load-bearing + per-subscriber private clusters
+
+**Goal:** private-repo events reach only their owner's digest; public stays shared.
+
+**Build:**
+1. **Migration** (additive): `cluster` gains `scope_kind` + `scope_subscriber_id`; replace
+   `cluster_identity` with `UNIQUE(scope_kind, scope_subscriber_id, source, group_key)`; add a
+   scope-aware recency index. `connection` gains owning `subscriber_id uuid NULL` (null = global/
+   public source like RSS). (`cluster_entities` GIN for blocking is M3, not now.)
+2. **Visibility-aware finalize:** add `is_private: bool` to `EventBuilder` (connector sets via e.g.
+   `.private(bool)`); change `finalize` so infra maps `(is_private, connection.subscriber_id)` →
+   `Scope` (`private + owner → Private(owner)`, else `Public`). The adapter still only reports a
+   bool — it never constructs a `Scope` or names a subscriber (design §12 risk #1). Update
+   `ingest::poll` to finalize per-event with the connection's owner instead of the uniform
+   `Scope::Public`.
+3. **GitHub visibility:** `repos_to_poll` must return per-repo `private` (from
+   `/installation/repositories`, which has the `private` field) and tag each event; pass it into
+   `event_map::to_builder`. (Phase 2 webhook payloads carry `repository.private` directly.)
+4. **private-build inside `GenerateDigest`** (`digest/mod.rs`, design §9.1): build the subscriber's
+   private clusters just-in-time, then `candidates = public ∪ own-private`. `PublicBuild` stays
+   public-only. Make `cluster::store::candidates_in_lookback` (and the build queries) scope-aware
+   (take a subscriber_id).
+5. **Scope-invariant property test** (pure, in `core`): for any mixed public/private event set, the
+   public build never places a private event into a public cluster, and a subscriber's candidate set
+   never contains another subscriber's private cluster. This is a **primary** isolation defense
+   alongside the typed `Scope`.
+
+**Exit:** a private-repo fixture event appears only in its owner's digest; public events still
+shared; the proptest passes.
+
+---
+
+## 8. Phase 4 — Two-context RLS (two roles, two URLs)
+
+**Goal:** the DB physically enforces scope isolation even against a logic bug.
+
+**Build (design §12, tech §6):**
+1. **Migration** (run by the **owner/migration role**): create a **non-owner, non-superuser runtime
+   role** with **no `BYPASSRLS`**; `FORCE ROW LEVEL SECURITY` on every scoped table (`event`,
+   `cluster`, `connection`, `digest`, `digest_item`, and any with subscriber data); policies:
+   - **public-build / no-subscriber context** → exposes only `scope_kind='public'`.
+   - **subscriber context** (`SET LOCAL app.subscriber_id = $id`) → `scope_kind='public' OR
+     scope_subscriber_id = current_setting(...)`, **SELECT-only on public**, writes confined to
+     own-private rows.
+2. **`with_scope(ctx, …)` wrapper** = the *only* connection path (transaction-scoped `SET LOCAL`,
+   pool/PgBouncer-safe). `PublicBuild` runs in the no-subscriber context; `GenerateDigest` (incl.
+   private-build) in the subscriber context.
+3. **Two URLs:** `migrate` uses the owner connection string; `serve`/`worker` connect as the runtime
+   role. Update `main.rs` connect path + config; update the **NixOS module** to provision both
+   roles; update the **README** (currently describes a single peer-auth role).
+4. **Test harness:** the testcontainers superuser owns DDL; create the runtime role in `setup` and
+   open a **second pool as the runtime role**; run flows under it. **Superusers bypass RLS even with
+   FORCE** — the runtime role must be non-superuser/non-owner or the test proves nothing. Add a
+   verification test: a deliberately mis-scoped query under the runtime role returns nothing.
+
+**Exit:** mis-scoped query under the runtime role returns nothing (RLS verified by integration test).
+
+---
+
+## 9. Phase 5 — Credential-at-rest (interim envelope) + real GitHub tokens
+
+**Goal:** secrets encrypted at rest; GitHub token minting becomes real.
+
+**Build (design §6 Secrets, tech §6):**
+1. **In memory:** `secrecy` + `zeroize` — redacted `Debug`, zeroized on drop, explicit
+   `.expose_secret()`.
+2. **At rest:** interim **envelope encryption** — a single app **master key** (sealed file/env,
+   e.g. `BULLETIN_MASTER_KEY`, 32 bytes) + **XChaCha20-Poly1305** (`chacha20poly1305` crate) over
+   secrets; store only `creds_ref` + a wrapped DEK, plaintext DEK only in a `SecretBox`. Keep the
+   `creds_ref` + wrapped-DEK **indirection** so a managed-KMS swap (M5) and per-connection secrets
+   (Slack, M6) are later *backend* changes, not migrations.
+3. **GitHub secrets become real:** seal the **App private key** + **webhook signing secret** at rest,
+   loaded once at startup. Implement `GithubAppTokens` (`jsonwebtoken` RS256 app JWT, iat/exp ≤10m →
+   `POST /app/installations/{id}/access_tokens`, cache per connection) and set
+   `ConnectorCtx.github = Some(GithubCtx{ base_url: DEFAULT_API_BASE, token_factory })`. Wire the
+   webhook secret into the Phase 2 `verify`.
+4. **Deps:** add `secrecy`, `zeroize`, `chacha20poly1305`, `jsonwebtoken`, `base64`. Run `cargo-deny`.
+
+**Exit:** App key / webhook secret never stored or logged in plaintext; seal/unseal round-trips;
+a real (operator-seeded) GitHub install ingests end-to-end via both webhook and poll.
+
+---
+
+## 10. Per-phase workflow
+
+1. Branch off this PR's merge base (or the branch a given session is assigned).
+2. Implement the phase; keep migrations append-only/additive; match the surrounding style (doc
+   comment density, naming).
+3. `cargo fmt`; `cargo clippy --workspace --all-targets` (must be clean); run pure tests always +
+   DB-backed tests if Docker is present (else note it).
+4. Commit with a `M2 Phase N: …` subject + a body explaining the *why* and the seams left/closed.
+5. Push and **pause for review** before the next phase.
+
+**Open question to settle at end of M2** (roadmap §5): revisit crate-graph names/granularity
+(`connectors`/`store`/`support` split) now that real deps exist; group-key/near-dup tuning for
+GitHub.

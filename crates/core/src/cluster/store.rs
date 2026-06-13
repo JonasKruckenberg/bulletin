@@ -124,7 +124,7 @@ pub async fn list_public_group_events(
     sqlx::query(
         "SELECT id, fingerprint, source, scope_kind, scope_subscriber_id,
                 event_time, title, body, links, group_key, entities,
-                severity_hint, ingest_time, raw
+                content_kind, severity_hint, ingest_time, raw
          FROM event
          WHERE scope_kind = 'public' AND source = $1 AND group_key = $2
          ORDER BY event_time, id",

@@ -74,7 +74,7 @@ async fn main() -> Result<()> {
             metric::init(cli.metrics_addr)?;
             let pool = connect_pool(&cli.database_url).await?;
             tracing::info!("starting worker");
-            worker::start(pool, cli.email.clone()).await?;
+            worker::start(pool, cli.email.clone(), connector_ctx()).await?;
         }
         Command::All => {
             metric::init(cli.metrics_addr)?;
@@ -82,7 +82,7 @@ async fn main() -> Result<()> {
             tracing::info!(addr = %cli.http_addr, "starting server + worker");
             tokio::try_join!(
                 serve_health(cli.http_addr),
-                worker::start(pool, cli.email.clone())
+                worker::start(pool, cli.email.clone(), connector_ctx())
             )?;
         }
         Command::Debug { command } => {
@@ -99,6 +99,13 @@ async fn connect_pool(database_url: &str) -> Result<PgPool> {
     bulletin_core::connect(database_url)
         .await
         .context("failed to connect to database")
+}
+
+/// The app-level connector context the worker hands to each poll. GitHub's App credentials are
+/// envelope-encrypted at rest in a later phase, so `github` is `None` here — a GitHub connection
+/// polled now is skipped with a clear log, while RSS works unchanged ("plumbing now, secrets later").
+fn connector_ctx() -> bulletin_core::ingest::ConnectorCtx {
+    bulletin_core::ingest::ConnectorCtx::default()
 }
 
 /// The liveness HTTP server (`serve` / `all`): a single `/health` route, separate from the

@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{postgres::PgRow, Row};
 use uuid::Uuid;
 
-use super::{fingerprint::Fingerprint, kind::SourceKind, scope::Scope};
+use super::{fingerprint::Fingerprint, kind::ContentKind, kind::SourceKind, scope::Scope};
 
 /// Connector-side event builder. Holds everything the connector knows; `source` is fixed
 /// at construction. Infra seals it by calling `finalize(scope)`, which stamps the scope
@@ -13,6 +13,7 @@ pub struct EventBuilder {
     event_time: DateTime<Utc>,
     title: String,
     group_key: String,
+    content_kind: ContentKind,
     body: Option<String>,
     links: Vec<String>,
     entities: Vec<String>,
@@ -34,12 +35,21 @@ impl EventBuilder {
             event_time,
             title: title.into(),
             group_key: group_key.into(),
+            // Longform is the conservative default (matches M1's behavior, where every event was
+            // longform); connectors override via `content_kind` where source semantics differ.
+            content_kind: ContentKind::Longform,
             body: None,
             links: Vec::new(),
             entities: Vec::new(),
             severity_hint: None,
             raw: None,
         }
+    }
+
+    /// Sets the depth signal (`message` / `announcement` / `longform`). Defaults to `longform`.
+    pub fn content_kind(mut self, kind: ContentKind) -> Self {
+        self.content_kind = kind;
+        self
     }
 
     pub fn body(mut self, body: impl Into<String>) -> Self {
@@ -79,6 +89,7 @@ impl EventBuilder {
             body: self.body,
             links: self.links,
             group_key: self.group_key,
+            content_kind: self.content_kind,
             entities: self.entities,
             severity_hint: self.severity_hint,
             raw: self.raw,
@@ -96,6 +107,7 @@ pub struct NewEvent {
     pub body: Option<String>,
     pub links: Vec<String>,
     pub group_key: String,
+    pub content_kind: ContentKind,
     pub entities: Vec<String>,
     pub severity_hint: Option<i16>,
     pub raw: Option<Vec<u8>>,
@@ -112,6 +124,7 @@ pub struct Event {
     pub body: Option<String>,
     pub links: Vec<String>,
     pub group_key: String,
+    pub content_kind: ContentKind,
     pub entities: Vec<String>,
     pub severity_hint: Option<i16>,
     pub ingest_time: DateTime<Utc>,
@@ -149,6 +162,7 @@ pub fn from_row(row: PgRow) -> Result<Event, sqlx::Error> {
         body: row.get("body"),
         links: row.get("links"),
         group_key: row.get("group_key"),
+        content_kind: row.try_get("content_kind")?,
         entities: row.get("entities"),
         severity_hint: row.get("severity_hint"),
         ingest_time: row.get("ingest_time"),

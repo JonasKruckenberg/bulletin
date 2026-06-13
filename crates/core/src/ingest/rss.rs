@@ -4,6 +4,12 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::io::BufReader;
 
+/// Per-connection config persisted in `connection.config`: just the feed URL.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RssConfig {
+    pub url: String,
+}
+
 /// Opaque cursor for RSS/Atom feeds: HTTP conditional-GET validators.
 #[derive(Serialize, Deserialize, Default)]
 pub struct RssCursor {
