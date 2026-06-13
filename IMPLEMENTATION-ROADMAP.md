@@ -1,7 +1,7 @@
 # Bulletin — Implementation Roadmap
 
 **Status:** Proposed build plan
-**Last updated:** 2026-06-08
+**Last updated:** 2026-06-13
 **Reads against:** `digest-system-design.md` (product + data model), `digest-technical-architecture.md` (Rust runtime), `digest-data-sources.md` (source backlog).
 
 This is the *order of operations* for building Bulletin. The design docs already separate
@@ -75,10 +75,13 @@ These are load-bearing for everything after them.
 
 Each milestone: **Goal · Build · Defer · Exit criteria.** Exit criteria are demoable.
 
-### M1 — Walking skeleton (RSS → email, end to end) ★ the keystone
+### M1 — Walking skeleton (RSS → email, end to end) ★ the keystone — ✅ Completed (2026-06-13)
 
 *Goal:* one subscriber receives a scheduled email digest of recent **RSS** items. Group = Story.
 No linking, no relevance scoring, no auth, no private data.
+
+> **Status:** Completed 2026-06-13. Deployed locally with demo connections and a demo account;
+> the end-to-end RSS → email loop and idempotent re-runs were verified against the exit criteria below.
 
 **Build**
 - **The tick DAG, minimal:** `PollConnection` (events-before-cursor ordering, tech §3) →
