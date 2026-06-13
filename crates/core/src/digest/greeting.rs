@@ -13,7 +13,8 @@ use crate::digest::subscriber::Recurrence;
 
 /// Salutation for the subscriber's local delivery time — what the wall clock would say when the
 /// mail lands. Late nights and the small hours greet as "evening" (a 2am "good morning" reads odd).
-fn salutation(t: NaiveTime) -> &'static str {
+/// Shared with the empty-digest mail, which splices it onto its own "all caught up" copy.
+pub(crate) fn salutation(t: NaiveTime) -> &'static str {
     match t.hour() {
         5..=11 => "Good morning",
         12..=16 => "Good afternoon",

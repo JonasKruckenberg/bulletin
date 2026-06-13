@@ -121,13 +121,14 @@ pub async fn generate(
         .context("load render items")?;
     if items.is_empty() {
         // Empty windows are rare — going silent reads as a broken pipeline. Send a cheerful
-        // "you're all caught up" note instead, then advance the schedule so the subscriber
-        // isn't perpetually due.
+        // "you're all caught up" note instead, opened with the same time-of-day salutation as a
+        // full digest, then advance the schedule so the subscriber isn't perpetually due.
         let message = render::render_empty(
             mailer.from(),
             &sub.email,
             window_end,
             &sub.timezone,
+            greeting::salutation(sub.digest_time),
             content,
         )?;
         mailer.send(message).await?;
