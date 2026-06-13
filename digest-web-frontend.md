@@ -46,7 +46,7 @@ or may not exist yet.
 | **S3** | **Feedback / control** | "Care more/less" on an entity; "wrong aggregation" (split/cannot-link); mute. Append-only log that tunes the *next* tick. | `POST` feedback endpoints, CSRF, IDOR re-check | **Not yet.** Feedback log + affinity/edge-constraint consumers are **M4**. |
 | **S4** | **Connections & connect flow** | List your connections + status (active/paused/revoked/errored); add one via the OAuth/app-install dance (`/connect/{source}` signed-`state` → callback binds provider-account→subscriber→scope). | `/connect/{source}` + callback (tech §3A), connection list read | **Backend partial.** `connection` rows + status exist (M2, hand-seeded); the *flow* is **M5**. |
 | **S5** | **Preferences / account** | Recurrence (daily/weekly, local `at_time`, weekday, tz), name, pause/resume, unsubscribe. | CRUD on `subscriber`/recurrence | **Backend partial.** Subscriber + recurrence land with M5 scheduling; `debug subscriber-rm` exists today. |
-| **S6** | **The "system working" dashboard** | A consumer-facing glass-box: a live, animated view of the pipeline doing its job for *you* — what it read, what it suppressed, what's next. Trust surface, not an operator console. | per-subscriber count reads (RLS) + global aggregates; SSE for live (§5a) | **Partial.** Counts derivable from existing rows now; the *delight* version wants M4 (suppression is meaningful once gating exists) + the F4 live channel. **Detailed in §10.** |
+| **S6** | **The "system working" dashboard** | A consumer-facing glass-box: a live, animated view of the pipeline doing its job for *you* — what it read, what it suppressed, what's next. Trust surface, not an operator console. | per-subscriber count reads (RLS) + global aggregates; **SSE for live (§5a)** | **Deferred to F4.** Counts exist now, but per the decision below we ship **only the live version** on the F4 channel — no static stopgap. **Detailed in §10.** |
 
 **Phasing falls out of the dependency column, not out of taste:** S1 (read-only) is the keystone and can
 come forward the moment there's a digest worth viewing; S2 needs M3's `story` table; S3 needs M4's feedback
@@ -238,13 +238,17 @@ A native (mobile/desktop) app introduces two things the web-only Option A conven
    but the design's "only Postgres + webhook catcher always-on / don't over-async" thesis (tech §1) means
    you add **deliberately**, when the app needs it — not speculatively.
 
-**The timezone example, concretely** — it's a real feature, not decoration, and the backend already has the
-machinery: the app reads the **device timezone**, and when it differs from the stored `subscriber.timezone`
-it silently `PATCH`es it. The scheduler's existing **preference-change boundary function** — "`ref =
-max(now, last_delivered)`, snap to the next earliest slot, lose nothing" (design §9.2, tech §13) — recomputes
-`next_run_at` DST-safely, so "daily 8am" keeps firing at 8am *local* as the user travels, with no missed or
-double digest. The "live" part is just the app pushing the tz change behind the scenes + an SSE nudge when
-the next-run preview updates. **No new scheduling design — it's an API + push veneer over §9.2.**
+**The timezone example, concretely (and DECIDED as app-only)** — continuous, silent tz tracking is the
+canonical reason an app is wanted, and it is **explicitly gated on the app** — we will *not* ship a
+half-working web version of it (a flaky browser heuristic that moves when your digest fires is worse than
+nothing; pre-app, tz is manual with a one-time confirmed guess — §7, §9). The backend machinery already
+exists for when the app lands: the app reads the **device timezone**, and when it differs from the stored
+`subscriber.timezone` it silently `PATCH`es it. The scheduler's existing **preference-change boundary
+function** — "`ref = max(now, last_delivered)`, snap to the next earliest slot, lose nothing" (design §9.2,
+tech §13) — recomputes `next_run_at` DST-safely, so "daily 8am" keeps firing at 8am *local* as the user
+travels, with no missed or double digest. The "live" part is just the app pushing the tz change behind the
+scenes + an SSE nudge when the next-run preview updates. **No new scheduling design — it's an API + push
+veneer over §9.2, and it's the reason the app exists rather than just a web view.**
 
 **What this means for the build (the actionable part):**
 
@@ -296,8 +300,10 @@ the read-only shell forward.
 - **F4 — native-app read API + live channel** *(post-M5, when the app is actually built)*
   Add a JSON responder over the *same* projection structs (§5a) — HTML for web, JSON for app, one read path
   — plus an SSE/WebSocket push channel on `serve` for "new digest ready / connection errored / tz updated"
-  nudges, and the silent device-tz `PATCH` → §9.2 boundary recompute. **No new scheduling or auth design;**
-  it's an additive serialization + push layer, *if* F0 was built projection-first.
+  nudges, the **continuous auto-tz** device `PATCH` → §9.2 boundary recompute (app-only, §5a), and the
+  **S6 "system working" dashboard** (deferred here on purpose — it ships *only* as the live version, on this
+  channel — §10). **No new scheduling or auth design;** it's an additive serialization + push layer, *if*
+  F0 was built projection-first.
 
 **Net:** only **F0** is a pull-forward, and it's a small, high-leverage one — it unblocks demoing M3/M4 as a
 product and forces the email→deep-link swap that the design already mandates. F1–F3 are the *UI side* of
@@ -314,16 +320,18 @@ each tab maps to a backend owner and a milestone — don't ship it as one flat f
 
 | Group | Controls | Reads/writes | Default | Lands |
 |---|---|---|---|---|
-| **Schedule** | freq (daily/weekly), `at_time`, `on_weekday`, **timezone** (auto-detected, confirmable), pause/resume | `subscriber` recurrence → §9.2 boundary recompute | daily, 08:00, auto-tz | M5 (sched) |
+| **Schedule** | freq (daily/weekly), `at_time`, `on_weekday`, **timezone** (manual; one-time browser guess prefills, no continuous auto until app), pause/resume | `subscriber` recurrence → §9.2 boundary recompute | daily, 08:00, manual tz | M5 (sched) |
 | **Content & relevance** | muted entities/topics, **boosted** ("care more") list, keyword subscriptions/filters, per-source on/off, digest size ("how much": Stories ~3–5 / Notes ~15–25 caps) | feedback log + config caps table (design §8.4) | sensible caps | M4 |
 | **Delivery** | email address (re-verify on change), channel (email now; push later), empty-digest behavior ("send 'all caught up'" vs stay silent), quiet hours (later) | `subscriber`; the empty-digest greeting already exists (`greeting.rs`) | email, send empty | M1→M5 |
 | **Connections** | list + status (active/paused/revoked/errored), add/pause/revoke per connection | `connection` rows (M2) + connect flow (M5) — overlaps S4 | — | M5 |
 | **Account** | name, timezone, **export my data**, **delete account** (GDPR cascade → `raw` + reasons, design §13), sign-out | `subscriber`; deletion is a real cascade, not a flag | — | M5 |
 
 **Design rules that matter here:**
-- **The timezone control is the live-update poster child (§5a).** "Auto" means the client reports device tz
-  and silently PATCHes it; "manual" pins it. Either way it flows through the *one* §9.2 boundary function
-  ("snap to next slot, lose nothing") — no setting touches scheduling math directly.
+- **The timezone control is manual until the app (DECIDED).** Pre-app: a user-set tz, prefilled once from a
+  confirmed browser guess — no background tracking. Continuous silent auto-update ("digest follows you as
+  you travel") is **app-only (§5a, F4)**, because a flaky web heuristic that moves when your digest fires is
+  worse than nothing. Whichever sets it, the value flows through the *one* §9.2 boundary function ("snap to
+  next slot, lose nothing") — no setting touches scheduling math directly.
 - **Every preference change is "effective next digest," never retroactive.** Say so in the UI; it mirrors
   the pipeline's tick model and sets honest expectations (same as feedback, §8).
 - **The "boosted/muted" lists in Content are the *persistent view* of the feedback log** (§8) — settings and
@@ -370,11 +378,15 @@ Design the flow around that, not around a generic "create account" form.
 ```
 1. Enter email          → magic-link sent (email IS the identity; no password — §4)
 2. Click link / verify  → session minted; double opt-in satisfied (deliverability + anti-abuse)
-3. Name + timezone      → tz auto-detected from device, shown for confirm (feeds §9.2 scheduling)
+3. Name + timezone      → tz picked from a list, prefilled from a ONE-TIME browser guess the user
+                          confirms (NOT a continuous auto feature — see below); feeds §9.2 scheduling
 4. Schedule             → prefilled "daily, 8:00am your time" — one tap to accept
-5. Connect first source → the cold-start fix; two tiers of friction:
-      · RSS    → paste a feed URL (no auth)            ← the thin, self-host-friendly path
-      · GitHub → app-install OAuth dance (tech §3A)    ← heavier, M5
+5. Connect first source → REQUIRED to finish setup (the cold-start fix — DECIDED). Two tiers:
+      · Curated public  → pick from a vetted starter list (HN, advisories, a few good feeds) — the
+                          zero-friction option that still seeds a non-empty first digest
+      · Personal        → RSS paste-a-URL (no auth) / GitHub app-install OAuth (M5) — NUDGED as the
+                          more useful choice ("this is where Bulletin earns its keep — your repos,
+                          your sources"); curated is the floor, personal is the goal
 6. Confirm              → "Your first digest arrives <local time>. Here's what we'll watch."
 ```
 
@@ -382,17 +394,28 @@ Design the flow around that, not around a generic "create account" form.
 - **Email-first, password-never.** Email is already the only identity we hold and the delivery channel, so
   magic-link/OTP is the whole auth story (§4) — no password store, no SSO dependency. Double opt-in is free
   and buys deliverability + abuse resistance.
-- **Cold-start is the real design problem, not the form.** Between signup and the first tick the product has
-  *nothing to show*. Mitigations, pick per taste: (a) set the expectation explicitly ("first digest at
-  8am"); (b) offer a **"preview now"** that runs an immediate off-schedule generation over whatever's been
-  ingested so far; (c) a friendly empty state with the watch-list. The existing **"all caught up" empty
-  greeting** (`greeting.rs`) is the same muscle.
-- **Two onboarding tiers by source friction.** RSS-only onboarding (paste a URL) is the **thin path that
-  works today / for self-hosters** and needs no OAuth; GitHub/Slack pull in the M5 connect flow. The UI
-  should let someone reach a working digest on RSS alone before the OAuth surfaces exist.
-- **SSRF gate on the RSS URL field (§11).** The signup form is the *first place a non-you user supplies a
-  URL* — the M5 SSRF guard (resolve-then-pin, RFC1918 denylist) must gate it before public signup opens
-  (roadmap M5). Until then, onboarding is invite/self-host only.
+- **Cold-start — DECIDED: require at least one source before setup completes.** You cannot finish onboarding
+  with zero connections, so there is always *something* to digest — that removes the empty-first-digest
+  failure mode at its root rather than papering over it. The curated public list is the no-friction floor
+  (a single tap seeds a useful digest); the flow **nudges toward personal connections** because that's where
+  the product's value actually is. A first digest may still be thin until a tick runs, so we still **set the
+  expectation explicitly** ("first digest at 8am"); a `preview-now` off-schedule generation stays *optional*
+  (the required-source rule already does the heavy lifting). The existing **"all caught up" greeting**
+  (`greeting.rs`) handles the genuinely-quiet case gracefully.
+- **Two source tiers by friction (and by value).** *Curated public* (vetted starter list) needs no auth and
+  works today / for self-hosters; *personal* — RSS paste-a-URL, then GitHub/Slack via the M5 connect flow —
+  is the nudged goal. The UI should let someone reach a working digest on curated/RSS alone before the OAuth
+  surfaces exist, while always pointing at personal sources as the upgrade.
+- **Timezone — DECIDED: no continuous auto-update until the app exists.** A *one-time* browser guess
+  (`Intl.DateTimeFormat().resolvedOptions().timeZone`) prefilling a tz the user **explicitly confirms** at
+  signup is fine — it's a sensible default, not a background feature. What we will **not** ship pre-app is
+  *continuous, silent* tz tracking, because doing it well needs a real client (the app) that can detect
+  travel reliably; a half-working web heuristic that silently changes when your digest fires is worse than
+  nothing. So: manual tz with a one-time confirmed guess now; **continuous auto-tz is an app-only feature
+  (F4)** — see §5a, §7.
+- **SSRF gate on the RSS/personal-source URL field (§11).** Signup (and the connect flow) is the *first
+  place a non-you user supplies a URL* — the M5 SSRF guard (resolve-then-pin, RFC1918 denylist) must gate it
+  before public signup opens (roadmap M5). Until then, onboarding is invite/self-host only.
 
 ---
 
@@ -430,11 +453,13 @@ dashboard is in fact the *first natural consumer* of that channel, and a fine re
 version of it. The animation is client-side (counts ticking up, items flowing stage-to-stage); with Option
 A this is htmx + a little CSS/JS or a small island — it does **not** justify a SPA framework on its own.
 
-**Phasing (keep it from ballooning):**
-- **S6a — static snapshot** *(cheap, can ride alongside F1/M4):* render the hero stat + stage counts +
-  next-digest from a single scoped query on page load. No live channel. Already ~80% of the emotional value.
-- **S6b — live + animated** *(rides F4):* SSE pushes deltas; counts animate; the activity ticker streams.
-  Build only when the F4 channel exists for the app anyway — shared infrastructure, not a bespoke build.
+**Phasing — DECIDED: defer the whole thing until live (no static stopgap).** A static snapshot was on the
+table, but the call is to **ship S6 only as the live, animated version, riding the F4 SSE channel** the
+native app needs anyway. Rationale: the dashboard's entire reason to exist is the *liveness* — a static
+counts page is a weaker, separate build that we'd then throw away; better to wait and do it once, properly,
+on shared infrastructure. So **S6 lands with/after F4**, not alongside M4. (The underlying counts exist far
+earlier, so nothing blocks pulling it in the moment F4's channel is up — it's a scheduling choice, not a
+data dependency.)
 
 **Risks to name out loud:** (1) **scope creep** — a "delightful animated dashboard" is a bottomless time
 sink; cap it at the table above and resist turning it into analytics. (2) **honesty** — the suppression
@@ -484,12 +509,14 @@ provenance, and feedback; it amplifies trust but doesn't *deliver* the digest.
    Option A keeps it small enough to start inside `serve` and split later.
 5. **Branding/theme ownership** — the email renderer already externalizes brand/masthead/footer
    (`DigestContent`, `render.rs`); the web view should share that config so email and web stay one identity.
-6. **The "system working" dashboard (§10) — static snapshot now, or hold for the live version?**
-   Recommendation: ship **S6a (static snapshot)** alongside M4 (it's ~one scoped query and captures most of
-   the value), and let **S6b (live/animated)** ride the F4 channel the app needs anyway. Cap its scope hard
-   — it's high-delight, high-creep.
-7. **Cold-start strategy for onboarding (§9)** — explicit-expectation only, or build a **"preview now"**
-   off-schedule generation so a new user sees a digest immediately? Recommendation: expectation-setting for
-   F0; add "preview now" if early users bounce on the empty first screen.
-8. **Settings information architecture (§7)** — confirm the five-tab split (Schedule · Content · Delivery ·
-   Connections · Account), and whether "timezone = auto" is the default (recommended) or opt-in.
+6. **The "system working" dashboard (§10) — ✅ DECIDED: defer until live.** No static stopgap; S6 ships
+   *only* as the live, animated version on the F4 SSE channel. It's a scheduling choice, not a data
+   dependency (the counts exist earlier), so it can be pulled in the moment F4's channel is up.
+7. **Cold-start (§9) — ✅ DECIDED: require ≥1 source to finish setup.** Onboarding can't complete with zero
+   connections; a curated public starter list is the no-friction floor, but the flow nudges toward personal
+   connections (where the value is). `preview-now` stays optional — the required source already prevents the
+   empty first digest.
+8. **Timezone — ✅ DECIDED: manual until the app.** No continuous auto-tz on web (a flaky heuristic that
+   moves your digest time is worse than nothing); a one-time browser guess prefills a tz the user confirms.
+   **Continuous auto-tz is an app-only feature (F4, §5a).** *Still open:* confirm the five-tab Settings IA
+   (Schedule · Content · Delivery · Connections · Account).
