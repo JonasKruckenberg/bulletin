@@ -515,6 +515,8 @@ dependencies = [
  "axum 0.7.9",
  "chrono",
  "chrono-tz",
+ "hex",
+ "hmac",
  "lettre",
  "proptest",
  "reqwest",

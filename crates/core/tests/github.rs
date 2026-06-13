@@ -11,11 +11,18 @@ use axum::{
 };
 use bulletin_core::ingest::github::event_map::{self, GithubEvent};
 use bulletin_core::ingest::github::token::StaticTokenProvider;
+use bulletin_core::ingest::github::webhook::{self, GithubWebhook};
 use bulletin_core::ingest::github::GithubConnection;
+use bulletin_core::ingest::realtime::{
+    LifecycleStatus, NormalizedInbound, RealtimeConnector, RealtimeDispatch, Verified,
+    WebhookHeaders,
+};
 use bulletin_core::ingest::Connection;
 use bulletin_core::kind::{ContentKind, SourceKind};
 use bulletin_core::scope::Scope;
+use hmac::{Hmac, Mac};
 use serde_json::json;
+use sha2::Sha256;
 use tokio::net::TcpListener;
 
 fn event(value: serde_json::Value) -> GithubEvent {
@@ -131,6 +138,191 @@ fn distinct_activities_never_collide() {
         a.fingerprint, b.fingerprint,
         "open vs close are distinct events"
     );
+}
+
+// ── webhook intake: dedup-against-poll, signature verify, routing, lifecycle ──
+
+// A webhook `issues` delivery and the poll's REST `IssuesEvent` for the same issue produce one
+// event: the webhook body is wrapped as the REST payload shape, so `stable_id` (issue id + action)
+// matches and `UNIQUE(fingerprint)` collapses the overlap — even with a differing title.
+#[test]
+fn webhook_issue_dedups_against_polled_event() {
+    let polled = event_map::to_builder(event(json!({
+        "id": "300", "type": "IssuesEvent", "actor": {"login": "alice"},
+        "repo": {"name": "octo/repo"}, "created_at": "2026-06-10T10:00:00Z",
+        "payload": {"action": "opened", "issue": {
+            "id": 555, "number": 42, "title": "A bug",
+            "html_url": "https://github.com/octo/repo/issues/42"
+        }}
+    })))
+    .finalize(Scope::Public);
+
+    // The `issues` webhook body: action + issue at the top level, plus repository/sender/installation.
+    let body = json!({
+        "action": "opened",
+        "issue": {
+            "id": 555, "number": 42, "title": "A bug (edited later)",
+            "html_url": "https://github.com/octo/repo/issues/42",
+            "updated_at": "2026-06-10T10:05:00Z"
+        },
+        "repository": {"full_name": "octo/repo", "private": false},
+        "sender": {"login": "alice"},
+        "installation": {"id": 12345}
+    });
+    let hooked = event_map::to_builder(event_map::from_webhook("issues", "delivery-1", body))
+        .finalize(Scope::Public);
+
+    assert_eq!(
+        polled.fingerprint, hooked.fingerprint,
+        "webhook + poll for the same issue collapse to one event"
+    );
+    assert_eq!(hooked.source, SourceKind::Github);
+    assert_eq!(hooked.group_key, "gh:octo/repo#issue-42");
+    assert_eq!(hooked.content_kind, ContentKind::Longform);
+}
+
+// Push identity is the head SHA on both intakes (REST `payload.head`, webhook top-level `after`).
+#[test]
+fn webhook_push_identity_matches_polled_head_sha() {
+    let polled = event_map::to_builder(event(json!({
+        "id": "299", "type": "PushEvent", "actor": {"login": "bob"},
+        "repo": {"name": "octo/repo"}, "created_at": "2026-06-10T09:00:00Z",
+        "payload": {"ref": "refs/heads/main", "head": "deadbeef"}
+    })))
+    .finalize(Scope::Public);
+
+    let body = json!({
+        "ref": "refs/heads/main", "after": "deadbeef",
+        "head_commit": {"timestamp": "2026-06-10T09:00:00Z"},
+        "repository": {"full_name": "octo/repo"},
+        "sender": {"login": "bob"},
+        "installation": {"id": 1}
+    });
+    let hooked = event_map::to_builder(event_map::from_webhook("push", "delivery-2", body))
+        .finalize(Scope::Public);
+
+    assert_eq!(polled.fingerprint, hooked.fingerprint);
+}
+
+fn sign(secret: &[u8], body: &[u8]) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).unwrap();
+    mac.update(body);
+    format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+}
+
+fn headers(sig: Option<&str>, event_type: &str) -> WebhookHeaders {
+    WebhookHeaders {
+        signature: sig.map(String::from),
+        event_type: Some(event_type.to_string()),
+        delivery_id: Some("d-1".to_string()),
+    }
+}
+
+#[test]
+fn verify_accepts_a_valid_signature() {
+    let secret = b"s3cr3t";
+    let body = br#"{"action":"opened"}"#;
+    let wh = GithubWebhook::new(Some(secret.to_vec()));
+    let sig = sign(secret, body);
+    assert!(matches!(
+        wh.verify(&headers(Some(&sig), "issues"), body),
+        Verified::Authentic
+    ));
+}
+
+#[test]
+fn verify_rejects_a_tampered_body() {
+    let secret = b"s3cr3t";
+    let wh = GithubWebhook::new(Some(secret.to_vec()));
+    let sig = sign(secret, br#"{"action":"opened"}"#);
+    // Same signature, different body → the recomputed MAC won't match.
+    assert!(matches!(
+        wh.verify(&headers(Some(&sig), "issues"), br#"{"action":"closed"}"#),
+        Verified::Invalid
+    ));
+}
+
+#[test]
+fn verify_rejects_a_wrong_secret() {
+    let wh = GithubWebhook::new(Some(b"right".to_vec()));
+    let sig = sign(b"wrong", br#"{"x":1}"#);
+    assert!(matches!(
+        wh.verify(&headers(Some(&sig), "issues"), br#"{"x":1}"#),
+        Verified::Invalid
+    ));
+}
+
+#[test]
+fn verify_fails_closed_without_a_secret() {
+    let wh = GithubWebhook::new(None);
+    let sig = sign(b"any", br#"{}"#);
+    assert!(matches!(
+        wh.verify(&headers(Some(&sig), "ping"), br#"{}"#),
+        Verified::Invalid
+    ));
+}
+
+#[test]
+fn verify_rejects_missing_or_malformed_signature() {
+    let wh = GithubWebhook::new(Some(b"s".to_vec()));
+    assert!(matches!(
+        wh.verify(&headers(None, "issues"), b"{}"),
+        Verified::Invalid
+    ));
+    // No "sha256=" prefix.
+    assert!(matches!(
+        wh.verify(&headers(Some("deadbeef"), "issues"), b"{}"),
+        Verified::Invalid
+    ));
+}
+
+#[test]
+fn route_extracts_the_installation_id() {
+    let body = json!({"action": "opened", "installation": {"id": 98765}}).to_string();
+    assert_eq!(webhook::route(body.as_bytes()).unwrap(), "98765");
+}
+
+#[test]
+fn route_errors_when_installation_is_missing() {
+    let body = json!({"action": "opened"}).to_string();
+    assert!(webhook::route(body.as_bytes()).is_err());
+}
+
+#[test]
+fn installation_deleted_is_a_revoke_lifecycle() {
+    let dispatch = RealtimeDispatch::build(SourceKind::Github).unwrap();
+    let body = json!({"action": "deleted", "installation": {"id": 1}}).to_string();
+    match dispatch
+        .accept_and_normalize("installation", "d", body.as_bytes())
+        .unwrap()
+    {
+        NormalizedInbound::Lifecycle(c) => assert_eq!(c.status, LifecycleStatus::Revoked),
+        NormalizedInbound::Events(_) => panic!("expected a lifecycle change"),
+    }
+}
+
+#[test]
+fn content_webhook_normalizes_through_the_dispatch() {
+    let dispatch = RealtimeDispatch::build(SourceKind::Github).unwrap();
+    let body = json!({
+        "action": "opened",
+        "issue": {"id": 7, "number": 3, "title": "t"},
+        "repository": {"full_name": "o/r"},
+        "sender": {"login": "a"},
+        "installation": {"id": 1}
+    })
+    .to_string();
+    match dispatch
+        .accept_and_normalize("issues", "d", body.as_bytes())
+        .unwrap()
+    {
+        NormalizedInbound::Events(builders) => {
+            assert_eq!(builders.len(), 1);
+            let ev = builders.into_iter().next().unwrap().finalize(Scope::Public);
+            assert_eq!(ev.group_key, "gh:o/r#issue-3");
+        }
+        NormalizedInbound::Lifecycle(_) => panic!("expected events"),
+    }
 }
 
 // ── poll: reconciliation against a mocked REST API ───────────────────────

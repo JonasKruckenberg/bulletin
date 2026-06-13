@@ -12,6 +12,8 @@ uuid        = { workspace = true }
 chrono      = { workspace = true }
 chrono-tz   = { workspace = true }
 sha2        = { workspace = true }
+hmac        = { workspace = true }
+hex         = { workspace = true }
 sqlx        = { workspace = true }
 tokio       = { workspace = true }
 tracing     = { workspace = true }
@@ -23,6 +25,9 @@ lettre           = { workspace = true }
 [dev-dependencies]
 proptest               = { workspace = true }
 axum                   = { workspace = true }
+hmac                   = { workspace = true }  # tests compute a valid webhook signature to verify against
+hex                    = { workspace = true }
+sha2                   = { workspace = true }
 uuid                   = { workspace = true, features = ["v4"] }  # tests build random ids
 testcontainers         = { workspace = true }
 testcontainers-modules = { workspace = true }

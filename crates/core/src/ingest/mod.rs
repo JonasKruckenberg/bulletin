@@ -2,6 +2,7 @@
 //! the event log (`store::insert_event`). Producer side of the ingest→clustering seam.
 
 pub mod github;
+pub mod realtime;
 pub mod rss;
 pub mod store;
 
@@ -237,6 +238,113 @@ pub async fn poll(pool: &PgPool, connection_id: Uuid, ctx: &ConnectorCtx) -> Res
             tracing::warn!(%connection_id, error = %e, "poll failed");
             store::record_failure(pool, conn_row.id).await?;
             Ok(PollOutcome::Failed { source })
+        }
+    }
+}
+
+// ── Webhook intake (realtime) ─────────────────────────────────────────────
+
+/// What one `process_webhook` did — the trigger layer turns this into metrics.
+pub enum WebhookOutcome {
+    /// Activity normalized + appended (dedup-collapsed against any prior poll/webhook overlap).
+    Ingested {
+        source: SourceKind,
+        inserted: usize,
+        deduplicated: usize,
+    },
+    /// A lifecycle webhook updated the connection's status.
+    Lifecycle {
+        source: SourceKind,
+        status: &'static str,
+    },
+    /// No connection matched the delivery's routing key (unknown/foreign install) — dropped.
+    Unrouted { source: SourceKind },
+    /// Nothing to do (unroutable body, or an unsupported realtime source).
+    Skipped,
+}
+
+/// Ingest one **verified** webhook delivery (design §3A/§5.4). The HTTP edge has already
+/// authenticated the raw bytes; here we (1) peek the routing key credential-free, (2) resolve OUR
+/// connection by `(source, provider_account_id)` — deriving nothing about scope/subscriber from the
+/// payload (IDOR defense), (3) normalize via the same path the poll uses, and (4) append (fingerprint
+/// dedup collapses any poll overlap) or apply a lifecycle status change.
+pub async fn process_webhook(
+    pool: &PgPool,
+    source: SourceKind,
+    event_type: &str,
+    delivery_id: &str,
+    body: &[u8],
+) -> Result<WebhookOutcome> {
+    let provider_account_id = match realtime::route(source, body) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(source = source.as_str(), error = %e, "cannot route webhook; dropping");
+            return Ok(WebhookOutcome::Skipped);
+        }
+    };
+
+    // IDOR defense: the connection (and thus its owner/scope) comes from OUR row keyed by the
+    // routing id, never from anything else the payload claims. An unknown install is dropped.
+    let conn =
+        match store::resolve_connection_by_provider(pool, source, &provider_account_id).await? {
+            Some(c) => c,
+            None => {
+                tracing::warn!(
+                    source = source.as_str(),
+                    provider_account_id,
+                    "no connection for webhook; dropping"
+                );
+                return Ok(WebhookOutcome::Unrouted { source });
+            }
+        };
+
+    let dispatch = match realtime::RealtimeDispatch::build(source) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(source = source.as_str(), error = %e, "no realtime worker; dropping");
+            return Ok(WebhookOutcome::Skipped);
+        }
+    };
+
+    match dispatch.accept_and_normalize(event_type, delivery_id, body)? {
+        realtime::NormalizedInbound::Events(builders) => {
+            let total = builders.len();
+            let mut inserted = 0usize;
+            for builder in builders {
+                // Scope is uniformly public until private scope becomes load-bearing (Phase 3),
+                // where `finalize` derives it per-event from the resolved connection's owner.
+                if store::insert_event(pool, &builder.finalize(Scope::Public))
+                    .await?
+                    .is_some()
+                {
+                    inserted += 1;
+                }
+            }
+            let deduplicated = total - inserted;
+            tracing::info!(
+                connection_id = %conn.id,
+                source = source.as_str(),
+                event_type,
+                inserted,
+                deduplicated,
+                "webhook ingested"
+            );
+            Ok(WebhookOutcome::Ingested {
+                source,
+                inserted,
+                deduplicated,
+            })
+        }
+        realtime::NormalizedInbound::Lifecycle(change) => {
+            let status = change.status.as_str();
+            store::update_connection_status(pool, conn.id, status).await?;
+            tracing::info!(
+                connection_id = %conn.id,
+                source = source.as_str(),
+                status,
+                "webhook lifecycle status change"
+            );
+            Ok(WebhookOutcome::Lifecycle { source, status })
         }
     }
 }

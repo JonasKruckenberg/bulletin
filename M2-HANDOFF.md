@@ -108,8 +108,8 @@ or `cargo nextest run`.
 | Phase | Scope | Status |
 |---|---|---|
 | **1** | Connector trait family seam, `ContentKind`, GitHub poll, `ConnDispatch` | ✅ merged (commit `6236abd`) |
-| **2** | Webhook catcher + `ProcessWebhook` job + HMAC verify + realtime traits | ⬜ next |
-| **3** | Private scope load-bearing + per-subscriber private clusters + scope-invariant proptest | ⬜ |
+| **2** | Webhook catcher + `ProcessWebhook` job + HMAC verify + realtime traits | ✅ implemented (branch `claude/m1-phase-2-c1tvgu`) |
+| **3** | Private scope load-bearing + per-subscriber private clusters + scope-invariant proptest | ⬜ next |
 | **4** | Two-context RLS (two roles, two URLs) | ⬜ |
 | **5** | Credential-at-rest (interim XChaCha20-Poly1305 envelope) + real GitHub token minting | ⬜ |
 
@@ -139,6 +139,38 @@ conditional GET + last-seen-id high-water mark); the legible `ingest/github/even
 ---
 
 ## 6. Phase 2 — Webhook catcher + `ProcessWebhook`
+
+> **Status: implemented** (branch `claude/m1-phase-2-c1tvgu`). What landed, vs. the plan below:
+> - **Realtime traits** in `ingest/realtime.rs`: `RealtimeConnection: Connection`
+>   (`accept_webhook(event_type, delivery_id, body)` + `hydrate` default-identity), app-level
+>   `RealtimeConnector` (`verify` + `route`), `Inbound`/`NormalizedInbound`, `Verified`,
+>   `LifecycleStatus`/`LifecycleChange`, and `RealtimeDispatch { Github(..) }` (**no RSS arm**).
+> - **GitHub realtime head**: `ingest/github/webhook.rs` (`GithubWebhook` HMAC-SHA256 verify over raw
+>   bytes via `hmac`'s constant-time `verify_slice`; `route` peeks `installation.id`); `event_map`
+>   gained `from_webhook` (synthesizes a `GithubEvent` whose `payload` *is* the webhook body, so it
+>   reuses the poll's `stable_id`/`group_key`/`to_builder` → dedup-for-free) + `lifecycle_status`;
+>   `GithubConnection::realtime_only()` (token-less worker, since accept needs no token) backed by
+>   `token::UnavailableToken`.
+> - **Catcher** in `crates/bulletin/src/webhook.rs` (`POST /webhooks/github`): verify → `ping`→200 →
+>   enqueue `ProcessWebhookJob` (idempotency key `gh-webhook:<delivery>`) → 202. `serve` now takes a
+>   `PgPool` + the webhook secret (`--github-webhook-secret` / `BULLETIN_GITHUB_WEBHOOK_SECRET`,
+>   fail-closed when absent).
+> - **`ProcessWebhook`** flow `ingest::process_webhook` (route → `resolve_connection_by_provider`
+>   (IDOR) → accept/normalize → dedup insert / `update_connection_status`); worker handler +
+>   `bulletin-process-webhook` registration.
+> - **Migration** `…011_webhook_routing.sql`: `connection.provider_account_id` + partial
+>   `UNIQUE(source, provider_account_id)` + `creds_ref` (NULL for now; status is free text, so
+>   'suspended'/'revoked' need no constraint change).
+> - **Seams left for later phases:** event scope is still uniformly `Scope::Public` in
+>   `process_webhook` (Phase 3 makes it per-event from the resolved connection's owner — the webhook
+>   body already carries `repository.private`); the webhook secret is a plain config value (Phase 5
+>   seals it at rest + wires real token minting); webhook-ingested events reuse the `poll_result`
+>   ingest counters.
+> - **Tests:** pure (`tests/github.rs`) — webhook↔poll fingerprint dedup (issue + push), HMAC verify
+>   (valid/tampered/wrong-secret/no-secret/malformed), routing, lifecycle/dispatch. DB-backed
+>   (`tests/webhook.rs`, needs Docker) — resolve, ingest, dedup-vs-poll, unrouted drop, revoke.
+>   `clippy --all-targets` clean; Docker was unavailable in the build sandbox so the DB suites
+>   compiled but did not run.
 
 **Goal:** GitHub webhooks ingest in real time; a dropped webhook is recovered by the Phase 1 poll
 (fingerprint collapses the overlap).

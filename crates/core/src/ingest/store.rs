@@ -105,6 +105,42 @@ pub async fn load_connection(
     .await
 }
 
+/// Resolves the connection a webhook delivery routes to, by `(source, provider_account_id)` — the
+/// webhook routing key (GitHub: installation_id). This is the IDOR-defense boundary: the caller
+/// derives the subscriber/scope from the returned row, never from the webhook payload.
+pub async fn resolve_connection_by_provider(
+    pool: &PgPool,
+    source: SourceKind,
+    provider_account_id: &str,
+) -> Result<Option<ConnectionRow>, sqlx::Error> {
+    sqlx::query(
+        "SELECT id, source, status, config, cursor, poll_interval_secs,
+                next_poll_at, last_polled_at, consecutive_failures
+         FROM connection
+         WHERE source = $1 AND provider_account_id = $2",
+    )
+    .bind(source)
+    .bind(provider_account_id)
+    .try_map(row_to_connection)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Sets a connection's status (e.g. a GitHub App suspend/uninstall lifecycle webhook → 'suspended'
+/// / 'revoked'). Any non-'active' value pauses polling via the `due_connections` predicate.
+pub async fn update_connection_status(
+    pool: &PgPool,
+    id: Uuid,
+    status: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE connection SET status = $2 WHERE id = $1")
+        .bind(id)
+        .bind(status)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Advances the cursor after a successful poll and resets the failure counter.
 pub async fn advance_cursor(
     pool: &PgPool,

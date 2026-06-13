@@ -20,7 +20,8 @@ use bulletin_core::cluster::store::unbuilt_public_events_exist;
 use bulletin_core::digest::subscriber::due_subscribers;
 use bulletin_core::digest::DigestOutcome;
 use bulletin_core::ingest::store::due_connections;
-use bulletin_core::ingest::{ConnectorCtx, PollOutcome};
+use bulletin_core::ingest::{ConnectorCtx, PollOutcome, WebhookOutcome};
+use bulletin_core::kind::SourceKind;
 
 use crate::metric;
 use crate::transport::EmailConfig;
@@ -46,6 +47,17 @@ pub struct PublicBuildJob;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenerateDigestJob {
     pub subscriber_id: Uuid,
+}
+
+/// A verified webhook delivery, taken off the HTTP edge for off-request-path processing. Carries the
+/// raw body plus the two header values the body itself doesn't hold: the activity `event_type` and
+/// the `delivery_id` (also the enqueue idempotency key — GitHub retries on a non-2xx).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessWebhookJob {
+    pub source: SourceKind,
+    pub event_type: String,
+    pub delivery_id: String,
+    pub raw_body: Vec<u8>,
 }
 
 // ── Job instrumentation ────────────────────────────────────────────────
@@ -101,6 +113,40 @@ async fn poll_connection(
             }) => metric::poll_result(source.as_str(), inserted, deduplicated),
             Ok(PollOutcome::Failed { source }) => metric::poll_failed(source.as_str()),
             Ok(PollOutcome::Skipped) => {}
+            Err(e) => return Err(format!("{e:#}").into()),
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// Process one verified webhook delivery: resolve our connection, normalize, append (or apply a
+/// lifecycle status change). Reuses `poll_result` for the ingest counters — a webhook-ingested event
+/// is "events ingested for this source" just as a polled one is.
+async fn process_webhook(
+    job: ProcessWebhookJob,
+    task_id: TaskId<Ulid>,
+    attempt: Attempt,
+    pool: Data<PgPool>,
+) -> Result<(), BoxDynError> {
+    traced("process_webhook", task_id, attempt, async move {
+        match bulletin_core::ingest::process_webhook(
+            &pool,
+            job.source,
+            &job.event_type,
+            &job.delivery_id,
+            &job.raw_body,
+        )
+        .await
+        {
+            Ok(WebhookOutcome::Ingested {
+                source,
+                inserted,
+                deduplicated,
+            }) => metric::poll_result(source.as_str(), inserted, deduplicated),
+            Ok(WebhookOutcome::Lifecycle { .. })
+            | Ok(WebhookOutcome::Unrouted { .. })
+            | Ok(WebhookOutcome::Skipped) => {}
             Err(e) => return Err(format!("{e:#}").into()),
         }
         Ok(())
@@ -169,7 +215,7 @@ async fn generate_digest(
 
 /// A duplicate-enqueue of a `GenerateDigest` for an already-seen `(subscriber, window)` hits
 /// apalis's permanent `(job_type, idempotency_key)` unique index — expected, not an error.
-fn is_duplicate_enqueue(e: &TaskSinkError<sqlx::Error>) -> bool {
+pub(crate) fn is_duplicate_enqueue(e: &TaskSinkError<sqlx::Error>) -> bool {
     matches!(e, TaskSinkError::PushError(err)
         if err.as_database_error().is_some_and(|db| db.is_unique_violation()))
 }
@@ -266,6 +312,7 @@ pub async fn start(pool: PgPool, email: EmailConfig, connectors: ConnectorCtx) -
     let pool_poll = pool.clone();
     let pool_build = pool.clone();
     let pool_digest = pool.clone();
+    let pool_webhook = pool.clone();
 
     Monitor::new()
         .register(move |_| {
@@ -302,6 +349,14 @@ pub async fn start(pool: PgPool, email: EmailConfig, connectors: ConnectorCtx) -
                 .data(pool)
                 .data(email)
                 .build(generate_digest)
+        })
+        .register(move |_| {
+            let pool = pool_webhook.clone();
+            let storage: PostgresStorage<ProcessWebhookJob> = PostgresStorage::new(&pool);
+            WorkerBuilder::new("bulletin-process-webhook")
+                .backend(storage)
+                .data(pool)
+                .build(process_webhook)
         })
         .run()
         .await

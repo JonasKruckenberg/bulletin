@@ -20,6 +20,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::common::{event::EventBuilder, kind::ContentKind, kind::SourceKind};
+use crate::ingest::realtime::LifecycleStatus;
 
 /// One activity from the REST events feed (`GET /repos/{owner}/{repo}/events`) or, later, a webhook
 /// (Phase 2 maps a webhook body onto the same shape). `payload` is the type-specific blob we reach
@@ -197,6 +198,96 @@ fn title(ev: &GithubEvent) -> String {
             format!("{repo}: new comment")
         }
         other => format!("{repo}: {other}"),
+    }
+}
+
+// ── Webhook intake (Phase 2) ─────────────────────────────────────────────
+//
+// A webhook delivery's body *is* the REST events-feed item's `payload` shape — it carries `action`
+// plus the typed object (`issue`/`pull_request`/`release`/…) at the top level. Wrapping it as a
+// `GithubEvent.payload` lets a webhook reuse the exact `stable_id`/`group_key`/`to_builder` path the
+// poll uses, so the two intakes dedup on `UNIQUE(fingerprint)` and the long tail is still captured.
+
+/// A webhook's `X-GitHub-Event` type (snake_case) → the REST events-feed `type` (PascalCase +
+/// `Event`) by GitHub's uniform naming rule: `issues` → `IssuesEvent`, `pull_request` →
+/// `PullRequestEvent`, `fork` → `ForkEvent`. Producing the REST `type` string routes the synthesized
+/// event through the same per-type handling (and the same generic fallback for the long tail).
+fn rest_type(event_type: &str) -> String {
+    let mut out = String::new();
+    for part in event_type.split('_') {
+        let mut chars = part.chars();
+        if let Some(first) = chars.next() {
+            out.extend(first.to_uppercase());
+            out.push_str(chars.as_str());
+        }
+    }
+    out.push_str("Event");
+    out
+}
+
+/// Best-effort activity timestamp for a webhook (the body has no single top-level `created_at` like
+/// the REST feed). Reads the type's natural timestamp; the caller falls back to "now" when absent.
+/// Time isn't folded into the fingerprint, so a small webhook/poll skew never spawns a duplicate.
+fn webhook_time(rest_kind: &str, body: &serde_json::Value) -> Option<DateTime<Utc>> {
+    let path: &[&str] = match rest_kind {
+        "IssuesEvent" => &["issue", "updated_at"],
+        "PullRequestEvent" => &["pull_request", "updated_at"],
+        "PullRequestReviewEvent" => &["review", "submitted_at"],
+        "IssueCommentEvent" | "CommitCommentEvent" | "PullRequestReviewCommentEvent" => {
+            &["comment", "updated_at"]
+        }
+        "ReleaseEvent" => &["release", "published_at"],
+        "PushEvent" => &["head_commit", "timestamp"],
+        _ => return None,
+    };
+    let mut cur = body;
+    for key in path {
+        cur = cur.get(key)?;
+    }
+    cur.as_str()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+/// Synthesize a [`GithubEvent`] from a verified webhook delivery so it flows through the same
+/// normalization as a polled event (and dedups against it). `repo`/`actor`/`created_at` are lifted
+/// from the body; the delivery id is the generic-fallback identity (only used for activity with no
+/// content id of its own — the same role the REST event id plays on the poll path).
+pub fn from_webhook(event_type: &str, delivery_id: &str, body: serde_json::Value) -> GithubEvent {
+    let kind = rest_type(event_type);
+    let repo = body
+        .get("repository")
+        .and_then(|r| r.get("full_name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let actor = body
+        .get("sender")
+        .and_then(|s| s.get("login"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let created_at = webhook_time(&kind, &body).unwrap_or_else(Utc::now);
+    GithubEvent {
+        id: delivery_id.to_string(),
+        kind,
+        repo: RepoRef { name: repo },
+        actor: ActorRef { login: actor },
+        created_at,
+        payload: body,
+    }
+}
+
+/// The connection-status change implied by a GitHub App lifecycle webhook (`installation` /
+/// `installation_repositories`), if any. A suspend/uninstall pauses/revokes our connection; install,
+/// unsuspend (→ back to active), permission-accept, and repo add/remove either restore or carry no
+/// status change (`None` = leave the status untouched, ingest nothing).
+pub fn lifecycle_status(body: &serde_json::Value) -> Option<LifecycleStatus> {
+    match body.get("action").and_then(|a| a.as_str()) {
+        Some("deleted") => Some(LifecycleStatus::Revoked),
+        Some("suspend") => Some(LifecycleStatus::Suspended),
+        Some("unsuspend") => Some(LifecycleStatus::Active),
+        _ => None,
     }
 }
 
