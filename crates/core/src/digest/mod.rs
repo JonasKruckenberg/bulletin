@@ -45,19 +45,28 @@ pub enum DigestOutcome {
     NotYetDue,
 }
 
-/// Loads a subscriber and runs the pure selection over its lookback candidate set — the shared
-/// front half of [`generate`] (which then freezes, renders, delivers) and [`explain`] (which only
-/// reports). Both observe the same lookback, so they can't disagree.
-async fn plan(pool: &PgPool, subscriber_id: Uuid) -> Result<(SubscriberRow, Vec<Decision>)> {
-    let sub = load_subscriber(pool, subscriber_id)
+/// Loads a subscriber or errors if it's gone — the shared first step of every flow below.
+async fn load_required(pool: &PgPool, subscriber_id: Uuid) -> Result<SubscriberRow> {
+    load_subscriber(pool, subscriber_id)
         .await
         .context("load subscriber")?
-        .ok_or_else(|| anyhow!("subscriber {subscriber_id} not found"))?;
-    let candidates = candidates_in_lookback(pool, sub.last_run_at, CONTEXT_HORIZON_DAYS)
+        .ok_or_else(|| anyhow!("subscriber {subscriber_id} not found"))
+}
+
+/// The pure selection over a lookback floor — the shared core of the scheduled digest, the ad-hoc
+/// dispatch, and `explain`, so all three rank candidates identically. The caller logs/uses the
+/// decisions and decides the floor: `last_run`/`CONTEXT_HORIZON_DAYS` on schedule, `None`/an explicit
+/// lookback off-schedule.
+async fn select_over_lookback(
+    pool: &PgPool,
+    sub: &SubscriberRow,
+    last_run: Option<DateTime<Utc>>,
+    horizon_days: i32,
+) -> Result<Vec<Decision>> {
+    let candidates = candidates_in_lookback(pool, last_run, horizon_days)
         .await
         .context("collect candidates")?;
-    let decisions = select(candidates, sub.max_items as usize);
-    Ok((sub, decisions))
+    Ok(select(candidates, sub.max_items as usize))
 }
 
 /// The cluster ids that made the cut, in render order.
@@ -83,17 +92,18 @@ pub async fn generate(
     // last_run_at (the next digest's consideration floor). Captured before the read so the floor
     // can't sit *after* it — a cluster updated mid-read is re-considered next fire, never dropped.
     let snapshot_at = Utc::now();
-    let (sub, decisions) = plan(pool, subscriber_id).await?;
+    let sub = load_required(pool, subscriber_id).await?;
 
     // A preference change (timezone/digest_time/freq) can push next_run_at into the future after this
-    // job was enqueued for the old, due boundary. Don't deliver early: bail and let the next tick
-    // fire it at the corrected boundary. This is what makes update_preferences safe mid-flight.
+    // job was enqueued for the old, due boundary. Don't deliver early: bail (before the candidate
+    // scan) and let the next tick fire it. This is what makes update_preferences safe mid-flight.
     if sub.next_run_at > Utc::now() {
         return Ok(DigestOutcome::NotYetDue);
     }
 
     let window_end = sub.next_run_at; // the digest's identity (UNIQUE(subscriber_id, window_end))
 
+    let decisions = select_over_lookback(pool, &sub, sub.last_run_at, CONTEXT_HORIZON_DAYS).await?;
     log_selection(sub.id, sub.max_items as usize, &decisions);
     let selected = selected_ids(&decisions);
 
@@ -136,7 +146,9 @@ pub async fn generate(
 /// `lookback_days`**, *without* touching the subscriber's schedule or freezing a scheduled digest.
 /// It bypasses the due check and the `(subscriber, window_end)` freeze — purely a manual
 /// preview/send (the `debug digest-dispatch` command), so it never disturbs the subscriber's real
-/// cadence, `last_run_at`, or the de-dup history. Returns `Empty` if the lookback yields nothing.
+/// cadence, `last_run_at`, or the de-dup history. Because it records nothing, a manual dispatch can
+/// duplicate a concurrently-firing scheduled digest — acceptable for a debug tool. Returns `Empty`
+/// if the lookback yields nothing.
 pub async fn dispatch_now(
     pool: &PgPool,
     mailer: &impl Mailer,
@@ -144,25 +156,19 @@ pub async fn dispatch_now(
     lookback_days: i32,
     content: &DigestContent<'_>,
 ) -> Result<DigestOutcome> {
-    let sub = load_subscriber(pool, subscriber_id)
-        .await
-        .context("load subscriber")?
-        .ok_or_else(|| anyhow!("subscriber {subscriber_id} not found"))?;
+    let sub = load_required(pool, subscriber_id).await?;
 
     // Explicit lookback floor = now − lookback_days (last_run_at is ignored — this is off-schedule).
-    let candidates = candidates_in_lookback(pool, None, lookback_days)
-        .await
-        .context("collect candidates")?;
-    let decisions = select(candidates, sub.max_items as usize);
+    let decisions = select_over_lookback(pool, &sub, None, lookback_days).await?;
     log_selection(sub.id, sub.max_items as usize, &decisions);
     let selected = selected_ids(&decisions);
-    if selected.is_empty() {
-        return Ok(DigestOutcome::Empty);
-    }
 
     let items = render_items_for_clusters(pool, &selected)
         .await
         .context("load render items")?;
+    if items.is_empty() {
+        return Ok(DigestOutcome::Empty);
+    }
     // The rendered date header uses now() — this digest isn't tied to a scheduled boundary.
     let message =
         render::render(mailer.from(), &sub.email, Utc::now(), &sub.timezone, &items, content)?;
@@ -204,9 +210,10 @@ pub struct ExplainRow {
 
 /// Dry-run of selection for a subscriber: every candidate cluster paired with its verdict and a
 /// human-readable title, with **no writes and no send**. Runs the exact same pure `select` the
-/// real digest does, over the subscriber's current window.
+/// real digest does, over the subscriber's scheduled lookback.
 pub async fn explain(pool: &PgPool, subscriber_id: Uuid) -> Result<Vec<ExplainRow>> {
-    let (_sub, decisions) = plan(pool, subscriber_id).await?;
+    let sub = load_required(pool, subscriber_id).await?;
+    let decisions = select_over_lookback(pool, &sub, sub.last_run_at, CONTEXT_HORIZON_DAYS).await?;
 
     let ids: Vec<Uuid> = decisions.iter().map(|d| d.cluster_id).collect();
     let display: HashMap<Uuid, _> = cluster_display(pool, &ids)

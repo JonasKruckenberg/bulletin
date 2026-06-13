@@ -30,7 +30,6 @@ LANGUAGE sql STABLE AS $$
     ) AT TIME ZONE tz
 $$;
 
--- Snap every existing subscriber onto the new grid immediately (they default to 09:00 UTC): the
--- next daily occurrence of their digest_time, in their zone, strictly after now().
-UPDATE subscriber
-SET next_run_at = next_digest_boundary(now(), timezone, digest_time, 1);
+-- Existing rows default to UTC / 09:00. They are snapped onto the schedule grid by the recurrence
+-- migration (0008), which must read their *original* next_run_at first to recover each weekly
+-- subscriber's weekday — so this migration deliberately does NOT rewrite next_run_at.

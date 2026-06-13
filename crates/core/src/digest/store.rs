@@ -31,6 +31,17 @@ pub struct RenderItem {
     pub last_event_time: DateTime<Utc>,
 }
 
+/// Maps a `(title, link, source, last_event_time)` row to a [`RenderItem`] — shared by the frozen
+/// (`render_items`) and ad-hoc (`render_items_for_clusters`) render paths so they can't drift.
+fn map_render_item(row: &PgRow) -> Result<RenderItem, sqlx::Error> {
+    Ok(RenderItem {
+        title: row.get("title"),
+        link: row.get("link"),
+        source: row.try_get("source")?,
+        last_event_time: row.get("last_event_time"),
+    })
+}
+
 /// The digest's candidate set: clusters built/updated since the **consideration floor**
 /// `min(last_run, now − horizon_days)` — a freshness-scored lookback, not a window partition. The
 /// floor always reaches back to the last delivery (so nothing since then is missed, even a backdated
@@ -44,11 +55,10 @@ pub async fn candidates_in_lookback(
     horizon_days: i32,
 ) -> Result<Vec<Candidate>, sqlx::Error> {
     sqlx::query(
+        // LEAST ignores NULL, so a null last_run ($1) yields just `now() - horizon`.
         "SELECT id, last_event_time
          FROM cluster
-         WHERE updated_at >= LEAST(
-                 COALESCE($1, now() - make_interval(days => $2)),
-                 now() - make_interval(days => $2))
+         WHERE updated_at >= LEAST($1, now() - make_interval(days => $2))
          ORDER BY last_event_time DESC",
     )
     .bind(last_run)
@@ -156,14 +166,7 @@ pub async fn render_items(pool: &PgPool, digest_id: Uuid) -> Result<Vec<RenderIt
          ORDER BY di.position",
     )
     .bind(digest_id)
-    .try_map(|row: PgRow| {
-        Ok(RenderItem {
-            title: row.get("title"),
-            link: row.get("link"),
-            source: row.try_get("source")?,
-            last_event_time: row.get("last_event_time"),
-        })
-    })
+    .try_map(|row: PgRow| map_render_item(&row))
     .fetch_all(pool)
     .await
 }
@@ -179,17 +182,7 @@ pub async fn render_items_for_clusters(
         "SELECT id, title, link, source, last_event_time FROM cluster WHERE id = ANY($1)",
     )
     .bind(cluster_ids)
-    .try_map(|row: PgRow| {
-        Ok((
-            row.get::<Uuid, _>("id"),
-            RenderItem {
-                title: row.get("title"),
-                link: row.get("link"),
-                source: row.try_get("source")?,
-                last_event_time: row.get("last_event_time"),
-            },
-        ))
-    })
+    .try_map(|row: PgRow| Ok((row.get::<Uuid, _>("id"), map_render_item(&row)?)))
     .fetch_all(pool)
     .await?
     .into_iter()

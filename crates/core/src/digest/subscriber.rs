@@ -2,15 +2,59 @@ use chrono::{DateTime, NaiveTime, Utc};
 use sqlx::{postgres::PgRow, PgExecutor, PgPool, Row};
 use uuid::Uuid;
 
-/// The subscriber's selectable columns. Scheduling is a **recurrence** — `freq` (`daily`/`weekly`)
-/// at a local `digest_time` in `timezone` (IANA name), with `on_weekday` (0=Sun..6=Sat) pinning the
-/// weekly day — rather than an offset from signup, so the digest stays at the chosen local time
-/// across DST and across travel. The boundary math lives in the SQL `next_run` function.
+/// A subscriber's delivery cadence. `Weekly` carries its (stable) weekday, so the "weekly ⇔ has a
+/// weekday" invariant is unrepresentable-when-wrong in Rust — the DB CHECK is just a backstop.
+/// Weekday is 0 = Sunday .. 6 = Saturday (Postgres DOW), matching the `next_run` SQL function. The
+/// two-column storage shape (`freq` text, `on_weekday` int) is an implementation detail of [`columns`]
+/// / [`from_columns`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recurrence {
+    Daily,
+    Weekly { weekday: i32 },
+}
+
+impl Recurrence {
+    /// Build (and validate) from user input — the single validation path shared by signup and
+    /// preference updates: `weekday` must be present iff weekly, and in `0..=6`.
+    pub fn new(freq: &str, weekday: Option<i32>) -> Result<Self, String> {
+        match (freq, weekday) {
+            ("daily", None) => Ok(Recurrence::Daily),
+            ("daily", Some(_)) => Err("daily takes no weekday".into()),
+            ("weekly", Some(d)) if (0..=6).contains(&d) => Ok(Recurrence::Weekly { weekday: d }),
+            ("weekly", Some(_)) => Err("weekday must be 0..=6 (0 = Sunday)".into()),
+            ("weekly", None) => Err("weekly requires a weekday 0..=6 (0 = Sunday)".into()),
+            (other, _) => Err(format!("unknown frequency '{other}' (expected daily or weekly)")),
+        }
+    }
+
+    /// The stored `(freq, on_weekday)` shape.
+    fn columns(self) -> (&'static str, Option<i32>) {
+        match self {
+            Recurrence::Daily => ("daily", None),
+            Recurrence::Weekly { weekday } => ("weekly", Some(weekday)),
+        }
+    }
+
+    fn from_columns(freq: &str, on_weekday: Option<i32>) -> Result<Self, sqlx::Error> {
+        Self::new(freq, on_weekday).map_err(|e| sqlx::Error::Decode(e.into()))
+    }
+
+    /// A compact human label for the debug CLI / status output.
+    pub fn label(self) -> String {
+        match self {
+            Recurrence::Daily => "daily".to_string(),
+            Recurrence::Weekly { weekday } => format!("weekly d{weekday}"),
+        }
+    }
+}
+
+/// The subscriber's selectable columns. Scheduling is a [`Recurrence`] at a local `digest_time` in
+/// `timezone` (IANA name) — rather than an offset from signup — so the digest stays at the chosen
+/// local time across DST and across travel. The boundary math lives in the SQL `next_run` function.
 pub struct SubscriberRow {
     pub id: Uuid,
     pub email: String,
-    pub freq: String,
-    pub on_weekday: Option<i32>,
+    pub recurrence: Recurrence,
     pub max_items: i32,
     pub timezone: String,
     pub digest_time: NaiveTime,
@@ -27,8 +71,7 @@ fn row_to_subscriber(row: PgRow) -> Result<SubscriberRow, sqlx::Error> {
     Ok(SubscriberRow {
         id: row.get("id"),
         email: row.get("email"),
-        freq: row.get("freq"),
-        on_weekday: row.get("on_weekday"),
+        recurrence: Recurrence::from_columns(row.get("freq"), row.get("on_weekday"))?,
         max_items: row.get("max_items"),
         timezone: row.get("timezone"),
         digest_time: row.get("digest_time"),
@@ -39,16 +82,15 @@ fn row_to_subscriber(row: PgRow) -> Result<SubscriberRow, sqlx::Error> {
 
 /// Inserts a subscriber and returns its id. The first digest fires at the next occurrence of the
 /// recurrence (the next earliest local slot), not immediately — so it lands at the subscriber's
-/// chosen time from day one. An unknown `timezone`, or a `freq`/`on_weekday` mismatch, is rejected
-/// by the database (the `next_run` call / the `weekday-iff-weekly` check).
+/// chosen time from day one. An unknown `timezone` is rejected by the database (the `next_run` call).
 pub async fn insert_subscriber(
     pool: &PgPool,
     email: &str,
-    freq: &str,
-    on_weekday: Option<i32>,
+    recurrence: Recurrence,
     timezone: &str,
     digest_time: NaiveTime,
 ) -> Result<Uuid, sqlx::Error> {
+    let (freq, on_weekday) = recurrence.columns();
     let row = sqlx::query(
         "INSERT INTO subscriber (email, freq, on_weekday, timezone, digest_time, next_run_at)
          VALUES ($1, $2, $3, $4, $5, next_run(now(), $4, $5, $2, $3))
@@ -75,15 +117,15 @@ pub async fn insert_subscriber(
 ///   * **it's safe while a digest is due** — moving the boundary into the future simply defers the
 ///     pending send to the new schedule (the tick re-reads it; see [`super::generate`]'s guard).
 ///
-/// Returns `false` if no subscriber has that id. Invalid inputs are rejected by the database.
+/// Returns `false` if no subscriber has that id. An unknown `timezone` is rejected by the database.
 pub async fn update_preferences(
     pool: &PgPool,
     id: Uuid,
-    freq: &str,
-    on_weekday: Option<i32>,
+    recurrence: Recurrence,
     timezone: &str,
     digest_time: NaiveTime,
 ) -> Result<bool, sqlx::Error> {
+    let (freq, on_weekday) = recurrence.columns();
     let result = sqlx::query(
         "UPDATE subscriber
          SET freq = $2,
@@ -126,7 +168,8 @@ pub async fn load_subscriber(
 
 /// Subscribers whose digest is due: the boundary has passed (`next_run_at <= now()`). There is no
 /// build gate — projection reads whatever the materialization side has built so far (design §9.4);
-/// an event not yet clustered simply isn't a candidate this fire and rides the next one, never lost.
+/// an event not yet clustered just isn't a candidate this fire and is re-considered on a later one
+/// (it's never lost from the durable log, though freshness ranking may leave it unsurfaced).
 pub async fn due_subscribers(pool: &PgPool) -> Result<Vec<SubscriberRow>, sqlx::Error> {
     sqlx::query(&format!(
         "SELECT {SELECT_COLS} FROM subscriber WHERE next_run_at <= now() ORDER BY next_run_at"

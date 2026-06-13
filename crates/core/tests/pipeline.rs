@@ -13,6 +13,7 @@ use bulletin_core::digest::store::{
 };
 use bulletin_core::digest::subscriber::{
     advance_after_delivery, due_subscribers, insert_subscriber, load_subscriber, update_preferences,
+    Recurrence,
 };
 use bulletin_core::ingest::store::insert_event;
 use bulletin_core::{
@@ -165,7 +166,7 @@ async fn no_build_gate_unbuilt_events_ride_next_fire() {
     let (pool, _pg) = setup().await;
 
     insert_public(&pool, "a", "a", "Pre-existing", 100).await;
-    let sub_id = insert_subscriber(&pool, "me@example.com", "daily", None, "UTC", nine_am())
+    let sub_id = insert_subscriber(&pool, "me@example.com", Recurrence::Daily, "UTC", nine_am())
         .await
         .unwrap();
     force_due(&pool, sub_id).await;
@@ -200,7 +201,7 @@ async fn digest_delivery_and_idempotency() {
 
     insert_public(&pool, "a", "a", "Article A", 100).await;
     insert_public(&pool, "b", "b", "Article B", 200).await;
-    let sub_id = insert_subscriber(&pool, "me@example.com", "daily", None, "UTC", nine_am())
+    let sub_id = insert_subscriber(&pool, "me@example.com", Recurrence::Daily, "UTC", nine_am())
         .await
         .unwrap();
     force_due(&pool, sub_id).await;
@@ -259,8 +260,7 @@ async fn insert_schedules_next_local_digest_time() {
     let id = insert_subscriber(
         &pool,
         "ny@example.com",
-        "daily",
-        None,
+        Recurrence::Daily,
         "America/New_York",
         NaiveTime::from_hms_opt(7, 30, 0).unwrap(),
     )
@@ -283,7 +283,7 @@ async fn insert_schedules_next_local_digest_time() {
 async fn update_preferences_snaps_without_losing_window() {
     let (pool, _pg) = setup().await;
 
-    let id = insert_subscriber(&pool, "t@example.com", "daily", None, "UTC", nine_am())
+    let id = insert_subscriber(&pool, "t@example.com", Recurrence::Daily, "UTC", nine_am())
         .await
         .unwrap();
 
@@ -299,8 +299,7 @@ async fn update_preferences_snaps_without_losing_window() {
     let changed = update_preferences(
         &pool,
         id,
-        "daily",
-        None,
+        Recurrence::Daily,
         "America/New_York",
         NaiveTime::from_hms_opt(7, 30, 0).unwrap(),
     )
@@ -327,7 +326,7 @@ async fn update_preferences_snaps_without_losing_window() {
 async fn insert_rejects_unknown_timezone() {
     let (pool, _pg) = setup().await;
     let err =
-        insert_subscriber(&pool, "bad@example.com", "daily", None, "Mars/Phobos", nine_am()).await;
+        insert_subscriber(&pool, "bad@example.com", Recurrence::Daily, "Mars/Phobos", nine_am()).await;
     assert!(err.is_err(), "unknown timezone must be rejected");
 }
 
@@ -340,8 +339,7 @@ async fn weekly_schedules_on_chosen_weekday() {
     let id = insert_subscriber(
         &pool,
         "w@example.com",
-        "weekly",
-        Some(2),
+        Recurrence::Weekly { weekday: 2 },
         "UTC",
         NaiveTime::from_hms_opt(17, 0, 0).unwrap(),
     )
@@ -372,7 +370,7 @@ async fn weekly_schedules_on_chosen_weekday() {
 async fn advance_coalesces_missed_boundaries() {
     let (pool, _pg) = setup().await;
 
-    let id = insert_subscriber(&pool, "c@example.com", "daily", None, "UTC", nine_am())
+    let id = insert_subscriber(&pool, "c@example.com", Recurrence::Daily, "UTC", nine_am())
         .await
         .unwrap();
     // Pretend the worker was down: the boundary is days in the past.

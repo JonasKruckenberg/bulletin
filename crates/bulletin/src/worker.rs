@@ -165,7 +165,7 @@ fn is_duplicate_enqueue(e: &TaskSinkError<sqlx::Error>) -> bool {
 /// The tick is the sole enqueuer. It reads three "what's due" conditions and pushes work; it
 /// advances no watermarks itself (the flows do). Build and digest are **decoupled** (design
 /// §3.0/§9.4): the digest sweep does not wait on clustering — projection reads whatever the
-/// materialization side has built, and an unbuilt event simply rides the next fire (never lost).
+/// materialization side has built, and an unbuilt event rides a later fire (never lost from the log).
 async fn handle_tick(_: Tick<Utc>, pool: Data<PgPool>) -> Result<(), BoxDynError> {
     let span = tracing::info_span!("tick");
     async move {

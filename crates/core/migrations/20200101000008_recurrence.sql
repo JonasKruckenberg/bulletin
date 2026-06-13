@@ -43,7 +43,8 @@ END;
 $$;
 
 -- Migrate existing rows onto the recurrence: a weekly cadence (>= 7 days) keeps its current local
--- weekday; everything else becomes daily. Then snap next_run_at onto the new grid.
+-- weekday, derived from the *original* next_run_at (0007 left it untouched for exactly this). Then
+-- snap next_run_at onto the new grid (weekday-aware via next_run).
 UPDATE subscriber
 SET freq       = 'weekly',
     on_weekday = extract(dow from (next_run_at AT TIME ZONE timezone))::int

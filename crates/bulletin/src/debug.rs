@@ -2,6 +2,7 @@
 //! pipeline stages inline, and dump state. Kept out of `main.rs` so it stays a thin dispatcher.
 
 use anyhow::{Context, Result};
+use bulletin_core::digest::subscriber::Recurrence;
 use bulletin_core::status::StatusReport;
 use bulletin_core::{cluster, digest, ingest, kind::SourceKind, status};
 use clap::Subcommand;
@@ -136,22 +137,11 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> R
             timezone,
             digest_time,
         } => {
-            match freq.as_str() {
-                "daily" if weekday.is_some() => {
-                    anyhow::bail!("--weekday is only valid with --freq weekly");
-                }
-                "daily" => {}
-                "weekly" => match weekday {
-                    Some(d) if (0..=6).contains(&d) => {}
-                    Some(_) => anyhow::bail!("--weekday must be 0..6 (0=Sun)"),
-                    None => anyhow::bail!("--freq weekly requires --weekday 0..6 (0=Sun)"),
-                },
-                other => anyhow::bail!("--freq must be daily or weekly (got {other})"),
-            }
+            let recurrence = Recurrence::new(&freq, weekday).map_err(|e| anyhow::anyhow!("{e}"))?;
             let digest_time = chrono::NaiveTime::parse_from_str(&digest_time, "%H:%M")
                 .context("--digest-time must be HH:MM (24-hour)")?;
             let id = digest::subscriber::insert_subscriber(
-                pool, &email, &freq, weekday, &timezone, digest_time,
+                pool, &email, recurrence, &timezone, digest_time,
             )
             .await?;
             println!("{id}");
@@ -162,15 +152,11 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> R
                 println!("no subscribers");
             }
             for s in rows {
-                let cadence = match s.on_weekday {
-                    Some(d) => format!("weekly d{d}"),
-                    None => "daily".to_string(),
-                };
                 println!(
                     "{}\t{}\t{}\t{} {}\tmax={}\tnext={}\tlast={}",
                     s.id,
                     s.email,
-                    cadence,
+                    s.recurrence.label(),
                     s.digest_time.format("%H:%M"),
                     s.timezone,
                     s.max_items,
