@@ -19,6 +19,7 @@ metrics     = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
 uuid        = { version = "1", features = ["v7", "serde"] }
 chrono      = { version = "0.4", features = ["serde"] }
+chrono-tz   = "0.10"  # IANA tz lookup for rendering a digest's date in the subscriber's zone
 sha2        = "0.10"
 ulid        = "1"  # read enqueue time from the apalis TaskId for job wait/run timing
 clap        = { version = "4", features = ["derive", "env"] }

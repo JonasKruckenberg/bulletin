@@ -1,6 +1,7 @@
-//! Integration coverage for the M1 tick DAG's store contract: PublicBuild grouping, the
-//! candidate-window query, the PublicBuild → GenerateDigest dependency gate, and the digest
-//! delivery lifecycle. Mirrors the orchestration in the `bulletin` binary against a real Postgres.
+//! Integration coverage for the tick's store contract: PublicBuild grouping, the lookback
+//! candidate query, the (now decoupled) build/digest relationship, recurrence scheduling, and the
+//! digest delivery lifecycle. Mirrors the orchestration in the `bulletin` binary against a real
+//! Postgres.
 
 use bulletin_core::cluster::store::{
     advance_build_watermark, build_bounds, dirty_public_groups, list_public_group_events,
@@ -8,17 +9,48 @@ use bulletin_core::cluster::store::{
 };
 use bulletin_core::digest::select::{select, Verdict};
 use bulletin_core::digest::store::{
-    candidates_in_window, create_with_items, mark_delivered, render_items,
+    candidates_in_lookback, create_with_items, mark_delivered, render_items,
 };
-use bulletin_core::digest::subscriber::{due_subscribers, insert_subscriber, load_subscriber};
+use bulletin_core::digest::subscriber::{
+    advance_after_delivery, due_subscribers, insert_subscriber, load_subscriber,
+    update_preferences, Recurrence,
+};
 use bulletin_core::ingest::store::insert_event;
 use bulletin_core::{
     cluster::rollup, connect, event::EventBuilder, kind::SourceKind, migrate, scope::Scope,
 };
-use chrono::{Duration, TimeZone, Utc};
+use chrono::{Duration, NaiveTime, TimeZone, Utc};
 use sqlx::{PgPool, Row};
 use testcontainers::{runners::AsyncRunner, ImageExt};
 use testcontainers_modules::postgres::Postgres;
+use uuid::Uuid;
+
+/// 09:00 — the default local digest time, spelled out for test readability.
+fn nine_am() -> NaiveTime {
+    NaiveTime::from_hms_opt(9, 0, 0).unwrap()
+}
+
+/// Force a freshly-inserted subscriber due *now*. Signup schedules the first digest at the next
+/// local digest time (in the future); delivery-path tests want it immediately due.
+async fn force_due(pool: &PgPool, id: Uuid) {
+    sqlx::query("UPDATE subscriber SET next_run_at = now() WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// The next_run_at's local time-of-day in `tz`, read back through Postgres (avoids a chrono-tz
+/// test dependency) — used to assert a digest landed at the chosen wall-clock hour.
+async fn local_run_time(pool: &PgPool, id: Uuid, tz: &str) -> NaiveTime {
+    sqlx::query("SELECT (next_run_at AT TIME ZONE $2)::time AS lt FROM subscriber WHERE id = $1")
+        .bind(id)
+        .bind(tz)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .get("lt")
+}
 
 async fn setup() -> (PgPool, testcontainers::ContainerAsync<Postgres>) {
     let pg = Postgres::default()
@@ -92,8 +124,7 @@ async fn build_groups_events_into_clusters() {
         .unwrap();
     assert_eq!(rollup(&shared).unwrap().title, "Shared latest");
 
-    let window_end = Utc::now() + Duration::hours(1);
-    let candidates = candidates_in_window(&pool, None, window_end).await.unwrap();
+    let candidates = candidates_in_lookback(&pool, None, 30).await.unwrap();
     assert_eq!(candidates.len(), 3);
 
     // Pure selection caps and orders newest-first.
@@ -127,28 +158,41 @@ async fn rebuild_upserts_cluster_in_place() {
 }
 
 // The dependency gate: a subscriber whose window contains an unbuilt public event is withheld
-// until PublicBuild catches up. Events are inserted *before* the subscriber, so their ingest_time
-// precedes next_run_at and the gate's NOT EXISTS clause fires.
+// No build gate: a due subscriber is dispatched even with unbuilt public events. Those events just
+// aren't candidates until clustered — they ride the next fire (never lost), so build and digest are
+// decoupled rather than gated.
 #[tokio::test]
-async fn digest_waits_for_public_build() {
+async fn no_build_gate_unbuilt_events_ride_next_fire() {
     let (pool, _pg) = setup().await;
 
     insert_public(&pool, "a", "a", "Pre-existing", 100).await;
-    let sub_id = insert_subscriber(&pool, "me@example.com", 1).await.unwrap();
+    let sub_id = insert_subscriber(&pool, "me@example.com", Recurrence::Daily, "UTC", nine_am())
+        .await
+        .unwrap();
+    force_due(&pool, sub_id).await;
 
-    // Due by the clock, but its window has an unbuilt event → not yet selectable.
+    // Due regardless of build state — no gate.
     let due = due_subscribers(&pool).await.unwrap();
     assert!(
-        due.iter().all(|s| s.id != sub_id),
-        "subscriber must wait for build"
+        due.iter().any(|s| s.id == sub_id),
+        "subscriber is due even with unbuilt events"
+    );
+    // ...but the unbuilt event is not yet a candidate.
+    assert!(
+        candidates_in_lookback(&pool, None, 30)
+            .await
+            .unwrap()
+            .is_empty(),
+        "unbuilt event is not a candidate"
     );
 
     build_all(&pool).await;
 
-    let due = due_subscribers(&pool).await.unwrap();
-    assert!(
-        due.iter().any(|s| s.id == sub_id),
-        "subscriber due once built"
+    // Once clustered it becomes a candidate.
+    assert_eq!(
+        candidates_in_lookback(&pool, None, 30).await.unwrap().len(),
+        1,
+        "built cluster is now a candidate"
     );
 }
 
@@ -160,14 +204,16 @@ async fn digest_delivery_and_idempotency() {
 
     insert_public(&pool, "a", "a", "Article A", 100).await;
     insert_public(&pool, "b", "b", "Article B", 200).await;
-    let sub_id = insert_subscriber(&pool, "me@example.com", 1).await.unwrap();
+    let sub_id = insert_subscriber(&pool, "me@example.com", Recurrence::Daily, "UTC", nine_am())
+        .await
+        .unwrap();
+    force_due(&pool, sub_id).await;
     build_all(&pool).await;
 
     let sub = load_subscriber(&pool, sub_id).await.unwrap().unwrap();
     let window_end = sub.next_run_at;
-    let window_start = window_end - Duration::days(1);
 
-    let candidates = candidates_in_window(&pool, sub.last_run_at, window_end)
+    let candidates = candidates_in_lookback(&pool, sub.last_run_at, 30)
         .await
         .unwrap();
     let selected: Vec<_> = select(candidates, sub.max_items as usize)
@@ -177,7 +223,7 @@ async fn digest_delivery_and_idempotency() {
         .collect();
     assert_eq!(selected.len(), 2);
 
-    let digest = create_with_items(&pool, sub_id, window_start, window_end, &selected)
+    let digest = create_with_items(&pool, sub_id, window_end, &selected)
         .await
         .unwrap();
     assert!(digest.delivered_at.is_none());
@@ -191,15 +237,180 @@ async fn digest_delivery_and_idempotency() {
         .unwrap();
 
     // Re-creating the same window returns the same delivered row; items unchanged (no duplicates).
-    let again = create_with_items(&pool, sub_id, window_start, window_end, &selected)
+    let again = create_with_items(&pool, sub_id, window_end, &selected)
         .await
         .unwrap();
     assert_eq!(again.id, digest.id);
     assert!(again.delivered_at.is_some());
     assert_eq!(render_items(&pool, again.id).await.unwrap().len(), 2);
 
-    // Watermark advanced one interval; the just-delivered boundary is now last_run_at.
+    // Watermark advanced one cadence; the just-delivered boundary is now last_run_at, and
+    // next_run_at snapped to the next 09:00 UTC slot strictly after it (DST-safe wall-clock grid,
+    // not a blind +24h).
     let sub = load_subscriber(&pool, sub_id).await.unwrap().unwrap();
     assert_eq!(sub.last_run_at, Some(window_end));
-    assert_eq!(sub.next_run_at, window_end + Duration::days(1));
+    assert!(sub.next_run_at > window_end);
+    assert!(sub.next_run_at <= window_end + Duration::days(1));
+    assert_eq!(local_run_time(&pool, sub_id, "UTC").await, nine_am());
+}
+
+// Signup schedules the first digest at the next occurrence of the local digest time in the
+// subscriber's own zone — in the future, at the chosen wall-clock hour (not "due immediately").
+#[tokio::test]
+async fn insert_schedules_next_local_digest_time() {
+    let (pool, _pg) = setup().await;
+
+    let id = insert_subscriber(
+        &pool,
+        "ny@example.com",
+        Recurrence::Daily,
+        "America/New_York",
+        NaiveTime::from_hms_opt(7, 30, 0).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let sub = load_subscriber(&pool, id).await.unwrap().unwrap();
+    assert!(
+        sub.next_run_at > Utc::now(),
+        "first digest is in the future"
+    );
+    assert_eq!(
+        local_run_time(&pool, id, "America/New_York").await,
+        NaiveTime::from_hms_opt(7, 30, 0).unwrap(),
+        "lands at the chosen local time-of-day"
+    );
+}
+
+// Updating timezone/digest time reschedules to the next earliest occurrence WITHOUT losing the
+// pending window: last_run_at (the selection lower bound) is untouched, so every event since the
+// last delivery still falls in the next digest — the window only reshapes.
+#[tokio::test]
+async fn update_preferences_snaps_without_losing_window() {
+    let (pool, _pg) = setup().await;
+
+    let id = insert_subscriber(&pool, "t@example.com", Recurrence::Daily, "UTC", nine_am())
+        .await
+        .unwrap();
+
+    // A prior delivery establishes a window lower bound that must survive the reschedule.
+    let last = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+    sqlx::query("UPDATE subscriber SET last_run_at = $2 WHERE id = $1")
+        .bind(id)
+        .bind(last)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let changed = update_preferences(
+        &pool,
+        id,
+        Recurrence::Daily,
+        "America/New_York",
+        NaiveTime::from_hms_opt(7, 30, 0).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(changed);
+
+    let sub = load_subscriber(&pool, id).await.unwrap().unwrap();
+    // The window lower bound is preserved — nothing lost, nothing replayed.
+    assert_eq!(sub.last_run_at, Some(last));
+    assert_eq!(sub.timezone, "America/New_York");
+    assert_eq!(sub.digest_time, NaiveTime::from_hms_opt(7, 30, 0).unwrap());
+    // Snapped to a future 07:30 New_York slot.
+    assert!(sub.next_run_at > Utc::now());
+    assert!(sub.next_run_at <= Utc::now() + Duration::days(1));
+    assert_eq!(
+        local_run_time(&pool, id, "America/New_York").await,
+        NaiveTime::from_hms_opt(7, 30, 0).unwrap()
+    );
+}
+
+// An unknown IANA zone is rejected by the database rather than silently mis-scheduling.
+#[tokio::test]
+async fn insert_rejects_unknown_timezone() {
+    let (pool, _pg) = setup().await;
+    let err = insert_subscriber(
+        &pool,
+        "bad@example.com",
+        Recurrence::Daily,
+        "Mars/Phobos",
+        nine_am(),
+    )
+    .await;
+    assert!(err.is_err(), "unknown timezone must be rejected");
+}
+
+// Weekly recurrence pins a stable weekday at the chosen local time, in the future.
+#[tokio::test]
+async fn weekly_schedules_on_chosen_weekday() {
+    let (pool, _pg) = setup().await;
+
+    // weekly on Tuesday (Postgres DOW 2) at 17:00 UTC.
+    let id = insert_subscriber(
+        &pool,
+        "w@example.com",
+        Recurrence::Weekly { weekday: 2 },
+        "UTC",
+        NaiveTime::from_hms_opt(17, 0, 0).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let sub = load_subscriber(&pool, id).await.unwrap().unwrap();
+    assert!(sub.next_run_at > Utc::now());
+    let dow: i32 = sqlx::query(
+        "SELECT extract(dow from (next_run_at AT TIME ZONE 'UTC'))::int AS dow
+         FROM subscriber WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .get("dow");
+    assert_eq!(dow, 2, "lands on Tuesday");
+    assert_eq!(
+        local_run_time(&pool, id, "UTC").await,
+        NaiveTime::from_hms_opt(17, 0, 0).unwrap()
+    );
+}
+
+// After a worker outage spanning several boundaries, one delivery jumps next_run_at straight to the
+// next *future* boundary — coalescing, not backfilling a burst of stale digests.
+#[tokio::test]
+async fn advance_coalesces_missed_boundaries() {
+    let (pool, _pg) = setup().await;
+
+    let id = insert_subscriber(&pool, "c@example.com", Recurrence::Daily, "UTC", nine_am())
+        .await
+        .unwrap();
+    // Pretend the worker was down: the boundary is days in the past.
+    sqlx::query(
+        "UPDATE subscriber
+         SET next_run_at = now() - interval '3 days', last_run_at = now() - interval '4 days'
+         WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let overdue_boundary = load_subscriber(&pool, id)
+        .await
+        .unwrap()
+        .unwrap()
+        .next_run_at;
+
+    advance_after_delivery(&pool, id, overdue_boundary)
+        .await
+        .unwrap();
+
+    let sub = load_subscriber(&pool, id).await.unwrap().unwrap();
+    assert_eq!(sub.last_run_at, Some(overdue_boundary));
+    assert!(
+        sub.next_run_at > Utc::now(),
+        "coalesced to a future boundary — no backlog of past fires"
+    );
+    assert!(sub.next_run_at <= Utc::now() + Duration::days(1));
+    assert_eq!(local_run_time(&pool, id, "UTC").await, nine_am());
 }

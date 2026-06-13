@@ -1,8 +1,10 @@
 # Digest System — Architecture & Design
 
 **Status:** Draft
-**Last updated:** June 2026
+**Last updated:** 13 June 2026
 **Scope:** End-to-end design for v1 (purely scheduled digests), plus forward-compatible decisions that let later features slot in without rework.
+
+**Revision (13 June 2026) — read/write split.** The runtime is reframed as two decoupled pipelines — **materialization** (write side; durable, best-effort) and **projection** (read side; per-subscriber, punctual) — communicating only through durable shared state (CQRS / materialized-view). This supersedes the earlier *chained* `public-build → generate` tick (§3.1) and the hard *window-partition* selection (§9.4): selection is now a **freshness-scored lookback** over a durable event log, "no loss" is a **durability** guarantee on that log rather than a property of window partitioning, and missed boundaries **coalesce** into one catch-up digest. Cadence is **daily/weekly** at a local time (monthly dropped). Stories are the **per-subscriber read-model** at the head of the projection side.
 
 ---
 
@@ -13,7 +15,7 @@ The job is to *suppress noise and elevate the few things that matter* — in a w
 - **Draw connections across sources.** Surface things the user would have missed because the signal was split across GitHub, Slack, email, RSS, etc. with no obvious link between them.
 - **Earn trust through transparency and control.** A filter that hides things is only useful if the user can see *why* a decision was made, drill into the data behind it, and correct it.
 
-Everything in a **Digest** has cleared the same per-user **relevance** bar. Within that set, each item renders as either a **Story** (rich and expandable: many related events, or one substantive item like a followed author's new article) or a **Note** (compact: relevant but atomic — a followed library's release, an album drop). Story vs Note is about *how much material backs the item*, not how much it matters; a Note can outrank a Story in priority. Digests are delivered on a configurable cadence (daily / weekly / monthly).
+Everything in a **Digest** has cleared the same per-user **relevance** bar. Within that set, each item renders as either a **Story** (rich and expandable: many related events, or one substantive item like a followed author's new article) or a **Note** (compact: relevant but atomic — a followed library's release, an album drop). Story vs Note is about *how much material backs the item*, not how much it matters; a Note can outrank a Story in priority. Digests are delivered on a configurable recurrence — **daily or weekly at a chosen local time** (e.g. "weekly, Tuesdays at 17:00"), in the subscriber's timezone.
 
 ---
 
@@ -79,28 +81,50 @@ Three logical layers:
   Postgres = system of record (events · clusters · digests · feedback · jobs)
 ```
 
+### 3.0 The read/write split (CQRS / materialized-view)
+
+The functional layers above cross-cut a second, load-bearing decomposition that organizes the runtime:
+
+- **Materialization (write side).** Ingress + the *grouping* half of Aggregation: ingest → dedupe → group events into `cluster` rollups (public shared, private per-subscriber). Runs on the **world's clock** (sources + poll cadence), is **best-effort** under load, and everything it writes is a **recomputable cache over the durable event log**. Its one hard guarantee is **durability** — never lose an event (§5, §9.3).
+- **Projection (read side).** The *linking* half of Aggregation + Generation: at each subscriber's scheduled instant, take a **snapshot** of the cluster caches and project it into a digest — link → stories → gate → rank → classify → cap → render → deliver. Runs on the **subscriber's wall clock**, is **punctual**, and is a **pure function of the snapshot**.
+
+The two sides share nothing but durable state: materialization *pushes* into it, projection *pulls a snapshot* on schedule. They never call each other (no job chaining) — which is what lets a digest fire on time regardless of how far materialization has caught up. **Stories live at the head of the read side** (§8.2, §9): a `story` is a per-subscriber **read-model** rebuilt at fire time from the snapshot, with stable forwarded ids. The shared-global / per-subscriber split (§11) is a *third*, orthogonal axis: materialization has both (public clusters shared, private per-subscriber), and the deferred *shared public-story cache* (§2, §6) is exactly the move of promoting the shareable slice of projection back into materialization.
+
+**The diagram, mapped to the split.** The read/write seam cuts *through* the Aggregation layer: `group → cluster rollups` is materialization (write); `link → gate → rank → classify` onward — and all of Generation — is projection (read). The labeled inter-layer arrows (`canonical events`, `clusters`) are the durable seam itself.
+
+**Data flow & the durable seam.** Exactly three durable artifacts carry data across the split, all in Postgres:
+1. the **event log** — appended by ingest; the trust boundary (§5, §9.3);
+2. the **cluster cache** (`cluster` rollups) — upserted by build, read by projection; the *entire* interface between the two sides;
+3. **`digest` + `digest_item`** — written by projection; the delivered record (the per-subscriber `story` read-model is rebuilt alongside it).
+
+Materialization only ever *appends to the log and upserts cluster rollups*. Projection only ever *reads a **consistent snapshot** of clusters* (a single MVCC read taken at the fire instant) *and writes its own `story`/`digest` rows*. Neither side reads the other's in-flight state, and there is no callback or join between them — the cluster cache is the whole contract.
+
 ### 3.1 Runtime topology
 
 Only two things run continuously: **Postgres** and a thin **webhook catcher**. Everything else is cron/queue-triggered batch. The catcher verifies the signature, **enqueues a `process_webhook` job** (raw payload inline), and returns 2xx in milliseconds — never processing inline, because webhook senders disable or back off slow endpoints.
 
-The entire pipeline is one ordered DAG per tick:
+The pipeline is **two decoupled pipelines** sharing only durable state — not one chained tick:
 
 ```
-tick (cron; ≥ shortest-cadence resolution) →
-  [ingest]        drain process_webhook jobs + run due pollers → canonical events (deduped)
-  [public-build]  group public events → public clusters + rollups         ← global, shared (no linking)
-  [generate]      for each subscriber DUE now (in their isolation context):
-                    private-build  their private events → private clusters + rollups
-                    pre-select     blocking-seeded candidate clusters (public ∪ own private)
-                    link           connected-components → per-subscriber stories
-                    gate · rank · classify · cap · render · deliver
+MATERIALIZATION (write side · world's clock · best-effort · durable)
+  ingest        drain process_webhook jobs + run due pollers → canonical events (deduped)   [TRUST BOUNDARY]
+  public-build  group public events → public cluster rollups                ← global, shared
+  private-build group a subscriber's private events → private cluster rollups ← per-subscriber
+        (public-build runs as public events arrive; private-build is write-side too, but v1 runs it
+         just-in-time at the head of a fire — tech §2. Neither ever blocks projection.)
+
+PROJECTION (read side · subscriber's wall clock · punctual · pure over a snapshot)
+  generate, for each subscriber DUE now (in their RLS context):
+    pre-select   blocking-seeded candidate clusters (public ∪ own private), lookback-bounded
+    link         connected-components → per-subscriber STORIES (stable ids)
+    gate · rank · classify · cap · render · deliver · advance next_run_at
 ```
 
 The job queue is apalis's Postgres-backed schema, drained with `SELECT … FOR UPDATE SKIP LOCKED` — no Kafka, no stream processor. (Queue/runtime mapping: technical architecture doc §2.)
 
-**`public-build` is shared (once per tick); everything from `private-build` on is per-subscriber.** The tick is one chained DAG — `public-build` → fan out `generate` — so a digest always reads clusters built in the same tick; there is no separate build clock to drift. **Linking is not a global precompute:** it runs per subscriber at generate-time, because a story can fuse public clusters with that subscriber's *own* private clusters (§4).
+**`public-build` is shared; `private-build` and everything in projection are per-subscriber.** Build and generate are **decoupled**: a digest reads the *latest materialized snapshot*, not "clusters built in this tick." An event still being ingested or clustered when a digest fires simply isn't a candidate *that* fire and rides the next one — never lost, because the event log is durable and the **consideration floor** always reaches back to the last delivery (§9.4). **Linking is not a global precompute:** it runs per subscriber at generate-time, because a story can fuse public clusters with that subscriber's *own* private clusters (§4). Note the best-effort gap is asymmetric: a subscriber's own *ingested* private events are always current in their digest (private-build runs just-in-time at the fire), so only **shared public** clustering — and any event not yet drained from the ingest queue — is what can lag.
 
-**Two independent clocks:** ingestion polls on its own per-connection cadence (minutes) so events are fresh, while generation runs on each subscriber's cadence (daily/weekly). Polling frequency is never tied to the digest tick.
+**Two independent clocks — the organizing principle (§3.0).** Materialization runs on the world's clock (per-connection poll cadence, minutes) so clusters are *fresh*; projection runs on each subscriber's cadence (daily/weekly, at their local time). Under load materialization falls *behind*, never *wrong*; the digest still fires on time, with best-effort-fresh contents. Polling frequency is never tied to the digest schedule.
 
 **Key timing decision: hydrate at process-time, not receipt-time.** Source APIs are called for current content when the tick drains the webhook jobs, not when the webhook lands. This sidesteps sparse/out-of-order webhooks (e.g. Notion): you always fetch latest state, so stale or reordered signals don't matter.
 
@@ -150,22 +174,22 @@ The contract that lets aggregation and generation stay source-agnostic.
 
 ## 6. Data model
 
-**Principle:** split hot small tables from the cold big table, collapse anything 1:1 or derivable, and defer any table whose only justification is scale. The `event` table is large but *cold* for the per-subscriber fan-out — selection never scans it; it reads small **story** rows (built that tick) with cached signals. Only grouping/rollup, linking, and drill-down touch `event`/`cluster`.
+**Principle:** split hot small tables from the cold big table, collapse anything 1:1 or derivable, and defer any table whose only justification is scale. The `event` table is large but *cold* for the per-subscriber fan-out — selection never scans it; it reads small **story** rows (the per-subscriber read-model, rebuilt at fire time) with cached signals. Only grouping/rollup, linking, and drill-down touch `event`/`cluster`.
 
 Eight domain tables in three groups, plus the library-provided work queue:
 
 **Per-subscriber config**
-- **`subscriber`** — `kind`, delivery prefs (cadence, `send_at_local`, timezone, `max_stories`, `max_notes`, channels, quiet hours), plus `filters` jsonb (sources, mutes, keywords) and `affinity` jsonb (relevance weights, updated by feedback).
+- **`subscriber`** — `kind`, delivery prefs (**recurrence**: `freq` daily|weekly, `at_time` local time-of-day, `timezone`, `on_weekday` for weekly; `max_stories`, `max_notes`, channels, quiet hours), plus `filters` jsonb (sources, mutes, keywords) and `affinity` jsonb (relevance weights, updated by feedback).
 - **`connection`** — a linked source: owning `subscriber_id`, `source_type`, `creds_ref` (KMS reference, **not** the secret), `config`, poll `cursor`, `status`. Declares whether its events are public or private.
 
 **Shared content graph** (3 phases: dedup → group → aggregate; append-only, only upward FKs)
 - **`event`** — canonical event (§5). `UNIQUE(fingerprint)` for dedup. Unpartitioned in v1.
-- **`cluster`** — a within-source group: events sharing `(scope, source, group_key)` (one PR, one Slack thread). **Public clusters are shared** (built once per tick); **private clusters are per-subscriber**. Carries a build-maintained rollup (`event_count`, `max_severity`, `content_depth`, `entities`). Membership is by `group_key` — no per-event pointer. Carries **no `story_id`** (a public cluster belongs to many subscribers' stories).
+- **`cluster`** — a within-source group: events sharing `(scope, source, group_key)` (one PR, one Slack thread). **Public clusters are shared** (materialization side; rebuilt as public events arrive, decoupled from generate); **private clusters are per-subscriber**. Carries a build-maintained rollup (`event_count`, `max_severity`, `content_depth`, `entities`). Membership is by `group_key` — no per-event pointer. Carries **no `story_id`** (a public cluster belongs to many subscribers' stories).
 - **`story`** — the **per-subscriber** cross-source aggregation a digest references: a set of linked clusters, **owned by one subscriber** (`subscriber_id`). Holds members as `clusters` jsonb (`[{cluster_id, link_reason}]`) plus **cached signals** (`event_count`, `source_diversity`, `content_depth`, `max_severity`, `entities`). Stable `id`; `merged_into` forwards a retro-merged story to its survivor (§8.2).
 
 **Digest / feedback machinery**
-- **`digest`** — `subscriber_id`, `window_start/end`, status machine (`pending→built→rendered→delivered`), `idempotency_key`, `sent_at`. `UNIQUE(subscriber_id, window_end)` makes generation idempotent.
-- **`digest_item`** — selected items: `story_id`, `kind` (story|note), `rank`, `score`, `reasons` jsonb, `story_last_event_time` (snapshot for re-surface suppression). PK `(digest_id, story_id)`.
+- **`digest`** — `subscriber_id`, `window_end` (the scheduled boundary that fired), status machine (`pending→built→rendered→delivered`), `idempotency_key`, `sent_at`. `UNIQUE(subscriber_id, window_end)` makes generation idempotent. No `window_start`: selection is a lookback, not a partition (§9.4).
+- **`digest_item`** — selected items: `story_id`, `kind` (story|note), `rank`, `score`, `reasons` jsonb, `story_last_event_time` (snapshot powering the **recently-surfaced** damping — §9.4). PK `(digest_id, story_id)`.
 - **`feedback`** — append-only log: `target_type`/`target_id`, `kind` (care_more | care_less | wrong_aggregation), `payload`. Processed async.
 
 **Work queue (library-provided)**
@@ -351,7 +375,7 @@ v1 events are all **retrospective** (`event_time ≤ ingest_time`). The model is
 
 - **Tense is derived, not stored.** An item is prospective iff `event_time > now`, evaluated at read time.
 - **One salience curve scores both.** Priority's time term generalizes to `salience(Δ)` over the *signed* gap `Δ = last_event_time − now`: low far in the future, rising as the moment approaches, peaking at `Δ = 0`, decaying once past. A passed item then fades by the same decay — no `resolves_at`, no retire job.
-- **Windowing** would extend the candidate upper bound to `now + lookahead` (a single global knob); v1's bound is the scheduled tick (§9.4).
+- **Windowing** extends the candidate **upper** bound to `now + lookahead` (a single global knob); v1's candidate set is a freshness-scored **lookback** ending at the fire instant (§9.4).
 - **`confidence`** (§8.3) carries a prospective item's certainty (calendar high, ETA medium, ML low). An ML predictor is then just another connector emitting prospective, low-confidence events.
 - **Recurrence (RRULE)** expands lazily inside the lookahead horizon against the subscriber's wall clock (DST-correct; technical architecture doc §13).
 
@@ -359,23 +383,31 @@ v1 events are all **retrospective** (`event_time ≤ ingest_time`). The model is
 
 ## 9. Generation layer
 
-### 9.1 Scheduled DAG
+### 9.1 The read path (projection)
 
-See §3.1. `public-build` (grouping + rollups for public clusters) is global/shared and runs once per tick; everything from `private-build` through `deliver` is per-subscriber and runs inside the subscriber's isolation context (§12). **Linking runs per subscriber** inside `generate` (§8.2).
+See §3.0–§3.1. **Materialization** owns both builds — `public-build` (public clusters; no-subscriber RLS context; shared) and `private-build` (a subscriber's private clusters; that subscriber's RLS context) — each a write-side, recomputable cache over the event log. **Projection** is `generate`: at the subscriber's scheduled instant, in their isolation context (§12), it reads a consistent snapshot of `public ∪ own-private` clusters and runs link → gate → rank → classify → cap → render → deliver. **Linking runs per subscriber** inside `generate` (§8.2) — it can fuse public with own-private clusters, so it can't be precomputed globally.
+
+*Trigger latitude.* `private-build` is write-side, so whether it runs continuously (on private ingest) or **just-in-time at the head of a fire** is a scheduling choice, not an architectural one — v1 does the latter (tech §2), since private clusters are consumed only by their owner's digest. Either way projection's contract is unchanged: read the latest cluster snapshot.
 
 ### 9.2 Subscriber scheduling
 
-Each subscriber has cadence + send-time + timezone → `next_run_at`. Dispatcher sweeps `WHERE next_run_at <= now`, runs generation, sets `next_run_at += cadence`. `next_run_at` is computed in the subscriber's timezone so "daily 8am" means their 8am.
+Each subscriber has a **recurrence** — `freq` (daily | weekly), `at_time` (local time-of-day), `timezone`, and `on_weekday` for weekly — which yields `next_run_at`. The dispatcher sweeps `WHERE next_run_at <= now`, runs generation, and advances `next_run_at` to the **next future boundary** of the recurrence. The boundary is computed on the subscriber's **local wall clock** then anchored to UTC, so it is DST-safe: "weekly Tuesdays 17:00" stays 17:00 local across a DST transition (technical architecture doc §13).
+
+**Catch-up coalesces.** Because advance jumps to the next boundary *strictly after now* (not "previous + one interval"), a worker outage spanning several boundaries produces **one** catch-up digest, not a backfilled burst — the single fire selects the freshest items from a lookback that reaches back to the last delivery (§9.4). One boundary function backs all three callers: signup (`ref = now`), a preference change (`ref = max(now, last_delivered)` — snap to the next earliest slot, never lose the pending window), and advance.
 
 ### 9.3 Idempotency & restartability
 
 - The `digest` row is the unit of work, keyed `(subscriber_id, window_end)`, with status machine: `pending → built → rendered → delivered`. **`window_end` is the scheduled boundary that fired (derived from `next_run_at`), not wall-clock `now`** — so a crashed-then-retried run recomputes the *same* key and the `UNIQUE` collapses it. A retried run resumes from its last status; `idempotency_key` prevents double-send.
-- Each stage is independently idempotent (ingest dedupes via `UNIQUE(fingerprint)`; build upserts clusters; linking is a deterministic recompute with id-forwarding).
-- **The window boundary (`last_delivered_end`) advances only after successful delivery** — a crashed run reprocesses the same window rather than dropping events into a gap.
+- Each stage is independently idempotent (ingest dedupes via `UNIQUE(fingerprint)`; build upserts clusters; linking is a deterministic recompute with id-forwarding; selection is a pure view frozen into `digest_item` on first run).
+- **`last_delivered` advances only after successful delivery.** It is no longer a hard window edge — it is the **consideration floor** the next digest's lookback must reach back to (§9.4), so a crashed run reprocesses from the same floor rather than dropping events into a gap. No-loss is owed to the **durable, append-only event log** (clusters/stories/digests are recomputable views of it), not to careful window partitioning.
 
-### 9.4 Windowing & re-surfacing
+### 9.4 Lookback selection & re-surfacing
 
-A story qualifies for a digest if its `last_event_time` falls in `(last_delivered_end, window_end]`. To avoid re-sending an unchanged ongoing story every day, compare the story's current `last_event_time` against the `story_last_event_time` snapshot on the most recent `digest_item` for this subscriber; re-surface only on a **new event**, else suppress or demote to a one-line "still developing" note. (Because the fingerprint does not fold content — §5 — a trivial edit or re-poll cannot spuriously re-surface a story.)
+Selection is a **freshness-scored lookback**, not a hard window partition (this supersedes the earlier exactly-once window). The candidate set is every cluster (→ story) updated since a lower bound of `min(last_delivered, now − context_horizon)` — so it **always reaches back over the last delivery** (no event since then can be missed, even a backdated or late-arriving one, because the bound is on *ingest/build* recency, not the event's own timestamp) **and** optionally pulls in older context for synthesis. Freshness is a **scoring** term (recency decay over `now − last_event_time`), not a gate; the upper bound is the fire instant (`now + lookahead` once prospective events land — §8.5).
+
+**An item may appear in more than one digest** — wanted, for "ongoing story" continuity and synthesis that references prior context. Repetition is damped, not forbidden, by a **recently-surfaced penalty**: compare a story's current `last_event_time` against the `story_last_event_time` snapshot on its most recent `digest_item` for this subscriber; a story with no new events since it was last shown is **demoted** (faded toward a one-line "still developing" note, eventually out) and **resurfaces** on a genuinely new event. Stable story ids (forwarded across recomputes, §8.2) are what make this lookup well-defined even though membership is recomputed every fire. (Because the fingerprint does not fold content — §5 — a trivial edit or re-poll cannot spuriously re-surface a story.)
+
+**The guarantee, restated.** *Durability:* every event is permanently in the append-only log; digests are recomputable views. *Consideration:* every cluster updated since the last delivery is evaluated in the next digest. An item can score too low and age past the horizon **unsurfaced** — that is "not chosen," never "lost."
 
 **Graduation:** format can change over time. A relevant single Slack ping enters as a Note and **graduates to a Story** as tickets and posts accrete and richness crosses the bar. Re-surface on a Note→Story format change as well as on new events.
 
@@ -448,7 +480,8 @@ Hotspots, by risk:
 
 **Build:**
 - Modular monolith on a single Postgres (8-table domain model + a library-provided job queue, §6).
-- Always-on webhook catcher + single-tick scheduled DAG (`public-build` shared → per-subscriber `generate`).
+- Always-on webhook catcher + **two decoupled pipelines** — best-effort **materialization** (`public-build` shared, `private-build` per-subscriber) and per-subscriber **scheduled projection** (`generate`), sharing only the durable event log (§3.0, §3.1).
+- **Recurrence scheduling** (daily/weekly at a local time, DST-safe) with **coalescing** catch-up; **lookback + freshness-scored** selection over the durable log (no exactly-once partition), with recently-surfaced damping (§9.2, §9.4).
 - Connector SDK (incl. per-event `content_kind`) + RSS + GitHub + Slack (the v1 private source; Gmail deferred over CASA cost — §2, §7.4).
 - Visibility scopes with the directional public→private rule; subscriber abstraction (1:1 with users).
 - Deterministic grouping (public shared / private per-subscriber) + structured **per-subscriber** cross-source linking (connected-components recompute + stable-id forwarding; `cluster` + per-subscriber `story` with `clusters` jsonb).
@@ -460,7 +493,7 @@ Hotspots, by risk:
 **Defer (designed-for, with split-triggers in §6):**
 - `confidence` + forward-looking/prospective events (future-valued `event_time`, signed-gap salience curve) + `velocity`.
 - Embedding/ANN semantic linking (`vector` column + HNSW).
-- **Shared public-story cache** — memoize pure-public stories across subscribers.
+- **Shared public-story cache** — memoize pure-public stories across subscribers (promote the shareable slice of projection into materialization — §3.0).
 - Real-time in-app feed.
 - Teams / shared scopes.
 - Learned scoring (feedback-driven affinity).

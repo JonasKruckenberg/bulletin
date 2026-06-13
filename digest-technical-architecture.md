@@ -66,7 +66,7 @@ worker (apalis Monitor · run_with_signal · 1+ replicas)
      ProcessWebhook ─ hydrate+normalize ──────────────────────────────────── ┤→ events (UNIQUE(fingerprint) dedup)
      PublicBuild    ─ group public events → public clusters + rollups (no linking; no-subscriber RLS ctx)
      GenerateDigest ─ [subscriber RLS ctx] private-build → pre-select → link (per-sub) → select → render → deliver
-                       ▶ email; window_end = scheduled boundary; advance next_run_at after delivery
+                       ▶ email; window_end = scheduled boundary; advance next_run_at to next future boundary (coalesces missed)
 ```
 
 Key properties:
@@ -76,9 +76,11 @@ Key properties:
   reconciliation interval relax — it never carries correctness). Both normalize → dedup into the
   same `event` table via the §5 canonical-event contract. (v1: RSS = poll-only; GitHub/Slack =
   poll-reconcile + realtime webhooks.)
-- **Two independent clocks:** ingestion cadence (per `connection`, minutes) is decoupled from
-  digest cadence (per `subscriber`, daily/weekly). RSS polls continuously so events are *fresh*
-  when the digest tick runs; polling frequency is never tied to the digest tick.
+- **Two independent clocks (the read/write split):** *materialization* (ingest + grouping) runs on
+  the world's clock (per-`connection` poll cadence, minutes) and is best-effort; *projection*
+  (`GenerateDigest`) runs on each `subscriber`'s cadence (daily/weekly, at their local time). They
+  share only the durable event log; neither blocks the other. Under load materialization falls
+  *behind*, never *wrong* — the digest still fires on time with best-effort-fresh contents.
 - **The sweep advances nothing — the processing job does.** The sweep is a stateless "what's
   due?" reader; `next_poll_at`/`next_run_at` are written by the job. → self-healing: a job that
   crashes before advancing its watermark is simply still due next tick.
@@ -86,12 +88,16 @@ Key properties:
   replica, no catch-up), but the `unique-jobs` feature makes each enqueue idempotent on a key we
   choose, so duplicate ticks across replicas are harmless. Run the cron inside `worker`; split a
   dedicated single `tick` role only as a later scale optimization.
-- We **chain** `PublicBuild` → fan-out `GenerateDigest` within the tick (not separate sweeps), so a
-  digest reads clusters built this tick. **Linking is per-subscriber, inside `GenerateDigest`** — a
-  story can fuse public clusters with that subscriber's *own* private clusters (product §4), so it
-  can't be a global precompute. Public clusters (grouping + rollups) are built once and amortized;
-  only linking + scoring are per-subscriber. `PublicBuild` runs in a no-subscriber RLS context,
-  `GenerateDigest` in the subscriber's (product §12).
+- **`PublicBuild` and `GenerateDigest` are decoupled** (not chained). `PublicBuild` materializes
+  shared cluster rollups on its own cadence (private-build is write-side too, but v1 runs it
+  just-in-time at the head of `GenerateDigest` — §5.3); `GenerateDigest` reads the *latest
+  materialized snapshot* at the subscriber's scheduled instant. A not-yet-clustered event simply
+  isn't a candidate that fire and rides the next one — never lost (durable event log; the
+  consideration floor reaches back to the last delivery — product §9.4). **Linking is per-subscriber, inside `GenerateDigest`** — a story can fuse
+  public clusters with that subscriber's *own* private clusters (product §4), so it can't be a
+  global precompute. Public clusters (grouping + rollups) are built once and amortized; only linking
+  + scoring are per-subscriber. `PublicBuild` runs in a no-subscriber RLS context, `GenerateDigest`
+  in the subscriber's (product §12).
 
 ### apalis mapping  *(DECIDED — pinned `=1.0.0-rc.9`)*
 
@@ -390,8 +396,8 @@ Three phases: **`Event`** (deduplicated) → **`Cluster`** (grouped within one s
 is **per-subscriber** (product §4/§8.2). The product doc's self-referential `cluster` (`parent_id`) is
 gone; so is a single shared story object.
 
-**Clusters are a recomputed batch artifact; stories are a per-subscriber recomputed cache.**
-- `PublicBuild` recomputes **public** cluster rollups once per tick (shared, amortized).
+**Clusters are a recomputed batch artifact (materialization side); stories are the per-subscriber read-model, rebuilt at fire time from a snapshot of the cluster caches (projection side).**
+- `PublicBuild` recomputes **public** cluster rollups as public events arrive (shared, amortized; decoupled from generate).
 - Inside each `GenerateDigest`, `private-build` recomputes that subscriber's **private** cluster
   rollups; then **linking** computes connected components over the subscriber's candidate clusters
   (public ∪ own private) and writes one `Story` per component (product §8.2).
@@ -442,7 +448,7 @@ pub struct Story {                          // phase 3: the PER-SUBSCRIBER cross
     pub content_depth:    ContentKind,      // max over clusters
     pub entities:         Vec<String>,      // ∪ over clusters
     pub first_event_time: OffsetDateTime,
-    pub last_event_time:  OffsetDateTime,   // window check + (vs per-subscriber snapshot) re-surface
+    pub last_event_time:  OffsetDateTime,   // freshness score + (vs per-subscriber snapshot) recently-surfaced damping (product §9.4)
 }
 ```
 `clusters`/`entities`/`link_reason` stay freeform per §5.2; `clusters` persists as `jsonb` (split-trigger
@@ -597,13 +603,14 @@ installation token; Slack: bot token, or 12h access + single-use refresh if rota
 - `panic = "unwind"` + a panic hook into telemetry; the apalis worker loop isolates a panicked
   job (→ retried via attempts → dead-letter; worker survives).
 - Graceful shutdown via `Monitor::run_with_signal` (drains in-flight on SIGTERM).
-- **Idempotency we *prove*:** the doc's strong restart claims (window advances only after delivery;
-  `window_end` = scheduled boundary so retries collapse on the unique key; each stage idempotent)
-  are verified with **DST** (`turmoil`/`madsim`) injecting crashes between stages + **proptest**
-  asserting invariants (no event gaps, no double-send, **scope never crosses — on the build path
-  especially**, dedup idempotent, linking deterministic + id-stable across recompute). Prereq: an
-  **injectable clock** — no ambient "now" in logic (also makes timezone/DST scheduling and recency
-  decay deterministic to test). Every read of "now" — windowing, decay, `next_run_at` — flows through it.
+- **Idempotency we *prove*:** the doc's strong restart claims (the **consideration floor** advances
+  only after delivery; `window_end` = scheduled boundary so retries collapse on the unique key; each
+  stage idempotent) are verified with **DST** (`turmoil`/`madsim`) injecting crashes between stages +
+  **proptest** asserting invariants (no event lost from consideration, no double-send, **scope never
+  crosses — on the build path especially**, dedup idempotent, linking deterministic + id-stable
+  across recompute, missed boundaries coalesce to one). Prereq: an **injectable clock** — no ambient
+  "now" in logic (also makes timezone/DST scheduling and recency decay deterministic to test). Every
+  read of "now" — lookback bounds, decay, `next_run_at` — flows through it.
 
 ### Testing stack  *(DECIDED — "proptest + DST as much as possible")*
 `proptest` (1.11) + `insta` (1.47) in `core` over fixtures; `testcontainers` (0.27 + modules
@@ -721,10 +728,14 @@ Proposed sequence (next-up first):
 11. **Observability specifics** — span/trace design through the DAG **DECIDED** (per-job traces +
     span links + metrics-primary; §6 Observability). **Still open:** metrics facade (`metrics`-rs vs
     `prometheus-client`, exemplars?) and the counter/gauge taxonomy.
-12. **Time/scheduling** *(v1)* — timezone-aware `next_run_at` + DST; `chrono` vs `time`; injectable
-    clock (load-bearing — §6 Reliability); `window_end` = scheduled boundary (product §9.3). Timezone
-    correctness threaded through storage (UTC `timestamptz`), boundary math (subscriber tz), and
-    rendering — never reasoned about in UTC.
+12. **Time/scheduling** *(v1)* — **recurrence**: daily/weekly at a local `at_time` (+ `on_weekday`
+    for weekly), computed on the subscriber's wall clock then anchored to UTC (DST-safe); **monthly
+    dropped**. One boundary function backs signup, preference change ("snap to next earliest, lose
+    nothing"), and advance; advance **coalesces** missed boundaries into one catch-up (product §9.2).
+    Selection is a **freshness-scored lookback** over the durable log, not a window partition (product
+    §9.4). `chrono` vs `time`; injectable clock (load-bearing — §6 Reliability); `window_end` =
+    scheduled boundary (product §9.3). Timezone correctness threaded through storage (UTC
+    `timestamptz`), boundary math (subscriber tz), and rendering — never reasoned about in UTC.
     **Deferred — forward-looking** (§8.5 product): future-valued `event_time`, the signed-gap
     **salience curve** + global `lookahead`, **lazy RRULE expansion** (DST-correct), and `confidence`
     as a priority modulator + cached rollup. Re-adds without schema rework.

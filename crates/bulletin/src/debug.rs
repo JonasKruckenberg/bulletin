@@ -2,6 +2,7 @@
 //! pipeline stages inline, and dump state. Kept out of `main.rs` so it stays a thin dispatcher.
 
 use anyhow::{Context, Result};
+use bulletin_core::digest::subscriber::Recurrence;
 use bulletin_core::status::StatusReport;
 use bulletin_core::{cluster, digest, ingest, kind::SourceKind, status};
 use clap::Subcommand;
@@ -31,13 +32,22 @@ pub enum DebugCommand {
         #[arg(long, default_value = "20")]
         limit: i64,
     },
-    /// Seed a subscriber (first digest is due immediately)
+    /// Seed a subscriber (first digest fires at the next scheduled local time)
     SubscriberAdd {
         #[arg(long)]
         email: String,
-        /// Digest cadence in days (1 = daily, 7 = weekly)
-        #[arg(long, default_value_t = 1)]
-        interval_days: i32,
+        /// Recurrence frequency: daily | weekly
+        #[arg(long, default_value = "daily")]
+        freq: String,
+        /// Day of week for weekly digests: 0=Sun .. 6=Sat (required iff --freq weekly)
+        #[arg(long)]
+        weekday: Option<i32>,
+        /// IANA timezone the digest time is interpreted in, e.g. America/New_York
+        #[arg(long, default_value = "UTC")]
+        timezone: String,
+        /// Local time-of-day to deliver, HH:MM (24-hour)
+        #[arg(long, default_value = "09:00")]
+        digest_time: String,
     },
     /// List subscribers
     SubscriberList,
@@ -45,6 +55,14 @@ pub enum DebugCommand {
     BuildRun,
     /// Run GenerateDigest once for a subscriber, inline (select → render → deliver)
     DigestRun { subscriber: Uuid },
+    /// Dispatch a one-off digest NOW over the last N days, ignoring the subscriber's schedule.
+    /// Does not advance their watermark or freeze a scheduled digest — a manual preview/send.
+    DigestDispatch {
+        subscriber: Uuid,
+        /// Lookback window in days
+        #[arg(long, default_value_t = 7)]
+        lookback_days: i32,
+    },
     /// List recent digests with their state
     DigestList {
         #[arg(long, default_value = "20")]
@@ -114,12 +132,22 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> R
         }
         DebugCommand::SubscriberAdd {
             email,
-            interval_days,
+            freq,
+            weekday,
+            timezone,
+            digest_time,
         } => {
-            if interval_days < 1 {
-                anyhow::bail!("--interval-days must be >= 1");
-            }
-            let id = digest::subscriber::insert_subscriber(pool, &email, interval_days).await?;
+            let recurrence = Recurrence::new(&freq, weekday).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let digest_time = chrono::NaiveTime::parse_from_str(&digest_time, "%H:%M")
+                .context("--digest-time must be HH:MM (24-hour)")?;
+            let id = digest::subscriber::insert_subscriber(
+                pool,
+                &email,
+                recurrence,
+                &timezone,
+                digest_time,
+            )
+            .await?;
             println!("{id}");
         }
         DebugCommand::SubscriberList => {
@@ -129,10 +157,12 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> R
             }
             for s in rows {
                 println!(
-                    "{}\t{}\tevery {}d\tmax={}\tnext={}\tlast={}",
+                    "{}\t{}\t{}\t{} {}\tmax={}\tnext={}\tlast={}",
                     s.id,
                     s.email,
-                    s.interval_days,
+                    s.recurrence.label(),
+                    s.digest_time.format("%H:%M"),
+                    s.timezone,
                     s.max_items,
                     s.next_run_at.format("%Y-%m-%dT%H:%M:%SZ"),
                     s.last_run_at
@@ -152,6 +182,19 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> R
         DebugCommand::DigestRun { subscriber } => {
             let sender = email.build_sender()?;
             let outcome = digest::generate(pool, &sender, subscriber, &email.content()).await?;
+            println!("{outcome:?}");
+        }
+        DebugCommand::DigestDispatch {
+            subscriber,
+            lookback_days,
+        } => {
+            if lookback_days < 1 {
+                anyhow::bail!("--lookback-days must be >= 1");
+            }
+            let sender = email.build_sender()?;
+            let outcome =
+                digest::dispatch_now(pool, &sender, subscriber, lookback_days, &email.content())
+                    .await?;
             println!("{outcome:?}");
         }
         DebugCommand::DigestList { limit } => {
@@ -191,7 +234,7 @@ fn print_explain(rows: &[digest::ExplainRow]) {
     use bulletin_core::digest::select::Verdict;
 
     if rows.is_empty() {
-        println!("no candidate clusters in this subscriber's window");
+        println!("no candidate clusters in this subscriber's lookback");
         return;
     }
 
@@ -218,9 +261,10 @@ fn print_explain(rows: &[digest::ExplainRow]) {
     println!("\n{selected} selected · {over_cap} over cap");
 }
 
-/// Renders the `status` dashboard: each subsystem on its own line(s), with the watchpoints that
-/// usually explain "why is nothing happening?" (unbuilt events, build lag, due counts, queue
-/// backlog) called out inline.
+/// Renders the `status` dashboard: each subsystem on its own line(s). The watchpoints to scan are
+/// materialization freshness (unbuilt events, build lag, latest ingest), projection backlog
+/// (subscribers due now, pending digests), and queue depth. Build lag no longer gates digests —
+/// a due subscriber fires regardless; it just means very recent events may ride the next one.
 fn print_status(r: &StatusReport) {
     fn ts(t: Option<chrono::DateTime<chrono::Utc>>) -> String {
         t.map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
@@ -260,8 +304,10 @@ fn print_status(r: &StatusReport) {
 
     let s = &r.subscribers;
     println!(
-        "subscribers  {} total; {} due now; next run {}",
+        "subscribers  {} total ({} daily, {} weekly); {} due now; next run {}",
         s.total,
+        s.daily,
+        s.weekly,
         s.due_now,
         ts(s.next_run)
     );
