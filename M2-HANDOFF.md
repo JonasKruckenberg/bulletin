@@ -224,6 +224,11 @@ poll↔webhook dedup, lifecycle → status.
 >   scope_subscriber_id, source, group_key)` (the `NULLS NOT DISTINCT` is load-bearing — without it
 >   the public upsert's `ON CONFLICT` never fires); `cluster_scope_recency` index; `connection`
 >   gains owning `subscriber_id uuid NULL REFERENCES subscriber(id) ON DELETE CASCADE`.
+>   Follow-up `…013_scoped_fingerprint.sql`: `event` dedup key widened to
+>   `UNIQUE NULLS NOT DISTINCT (fingerprint, scope_kind, scope_subscriber_id)` — the fingerprint
+>   stays pure content identity (poll↔webhook still collapse within a scope), but two owners over the
+>   *same* private repo no longer cross-tenant-collide (the global `UNIQUE(fingerprint)` would have
+>   dropped the second owner's event). `insert_event` conflicts on the constraint by name.
 > - **Visibility-aware finalize**: `EventBuilder` gained `is_private` + `.private(bool)`;
 >   `finalize(scope)` became `finalize(owner: Option<Uuid>)` mapping `(is_private, owner)` →
 >   `Scope` (`private + owner → Private(owner)`, else `Public` — a private item on an ownerless

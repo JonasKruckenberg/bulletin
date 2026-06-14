@@ -192,8 +192,11 @@ pub async fn record_failure(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> 
 
 // ── Event log (append) ───────────────────────────────────────────────────
 
-/// Appends `ev` to the event log, deduplicating on fingerprint.
-/// Returns `Some(event)` if inserted, `None` if the fingerprint already existed.
+/// Appends `ev` to the event log, deduplicating on its scope-aware identity
+/// `(fingerprint, scope_kind, scope_subscriber_id)`. Returns `Some(event)` if inserted, `None` if
+/// that identity already existed. The fingerprint is pure content identity, so a poll and a webhook
+/// for the same activity *within one scope* still collapse; two owners seeing the same private
+/// activity stay distinct (the fingerprint alone would cross-tenant-collide).
 pub async fn insert_event(pool: &PgPool, ev: &NewEvent) -> Result<Option<Event>, sqlx::Error> {
     let (scope_kind, scope_subscriber_id) = ev.scope.to_columns();
 
@@ -204,7 +207,7 @@ pub async fn insert_event(pool: &PgPool, ev: &NewEvent) -> Result<Option<Event>,
             event_time, title, body, links, group_key, entities,
             content_kind, severity_hint, raw
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-        ON CONFLICT (fingerprint) DO NOTHING
+        ON CONFLICT ON CONSTRAINT event_fingerprint_unique DO NOTHING
         RETURNING
             id, fingerprint, source, scope_kind, scope_subscriber_id,
             event_time, title, body, links, group_key, entities,
