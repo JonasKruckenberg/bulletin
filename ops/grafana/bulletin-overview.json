@@ -955,8 +955,8 @@
     {
       "id": 19,
       "type": "timeseries",
-      "title": "Events ingested by source",
-      "description": "",
+      "title": "Events ingested by source & intake",
+      "description": "New events appended per second, split by intake: 'poll' (the reconciliation backstop) vs 'webhook' (the realtime path). A webhook line that goes flat while poll keeps climbing means the realtime path is down and the poll is silently covering for it.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -973,9 +973,9 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (source) (rate(bulletin_events_ingested_total[5m]))",
+          "expr": "sum by (source, intake) (rate(bulletin_events_ingested_total[5m]))",
           "refId": "A",
-          "legendFormat": "{{source}}"
+          "legendFormat": "{{source}} · {{intake}}"
         }
       ],
       "fieldConfig": {
