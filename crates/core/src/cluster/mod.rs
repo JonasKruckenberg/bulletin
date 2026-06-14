@@ -125,29 +125,58 @@ pub async fn build(pool: &PgPool) -> Result<Option<BuildStats>> {
     }))
 }
 
-/// PrivateBuild: (re)build one subscriber's private clusters just-in-time, ahead of their digest.
+/// PrivateBuild: drain one subscriber's new private events into their private clusters, ahead of
+/// their digest. The per-subscriber counterpart to [`build`], with the same shape — a transaction
+/// holding a per-subscriber advisory lock (concurrent builds for the same subscriber serialize; the
+/// loser returns `Ok(0)`), the half-open ingest range `(built_through, now()]` from the subscriber's
+/// own `private_build_watermark`, recompute each dirtied group's rollup, upsert, advance the cursor.
 ///
-/// Unlike [`build`] this carries **no watermark and no advisory lock**: a subscriber's private
-/// volume is small and the rollup is idempotent, so `GenerateDigest` simply recomputes the owner's
-/// private clusters each run, then selects over `public ∪ own-private` (design §9.1). Every private
-/// event is isolated by `scope_subscriber_id = subscriber_id` at the store boundary, so this can
-/// only ever touch the caller's own clusters. (Phase 4 runs it inside the subscriber RLS context,
-/// making that a DB-enforced guarantee rather than a query convention.)
+/// Watermark-bounded so it scales with *new* private activity, not lifetime history, and a quiet
+/// private cluster ages out of the candidate floor exactly like a public one (its `updated_at` is
+/// only bumped when a new event re-dirties its group). Every read/write is fenced by
+/// `scope_subscriber_id = subscriber_id`, so this can only touch the caller's own clusters — Phase 4
+/// makes that a DB-enforced (RLS) guarantee rather than a query convention. Returns the number of
+/// groups rebuilt this pass.
 pub async fn build_private(pool: &PgPool, subscriber_id: Uuid) -> Result<usize> {
-    let groups = store::dirty_private_groups(pool, subscriber_id)
+    let mut tx = pool.begin().await.context("begin private build txn")?;
+
+    if !store::try_private_build_lock(&mut *tx, subscriber_id)
         .await
-        .context("find private groups")?;
+        .context("acquire private build lock")?
+    {
+        tracing::debug!(%subscriber_id, "private build already in progress; skipping");
+        return Ok(0);
+    }
+
+    let (built_through, hwm) = store::private_build_bounds(&mut *tx, subscriber_id)
+        .await
+        .context("read private build bounds")?;
+    let groups = store::dirty_private_groups(&mut *tx, subscriber_id, built_through, hwm)
+        .await
+        .context("find dirty private groups")?;
 
     for (source, group_key) in &groups {
-        let events = store::list_private_group_events(pool, subscriber_id, *source, group_key)
+        let events = store::list_private_group_events(&mut *tx, subscriber_id, *source, group_key)
             .await
             .context("load private group events")?;
         if let Some(r) = rollup(&events) {
-            store::upsert_cluster(pool, &Scope::Private(subscriber_id), *source, group_key, &r)
-                .await
-                .context("upsert private cluster")?;
+            store::upsert_cluster(
+                &mut *tx,
+                &Scope::Private(subscriber_id),
+                *source,
+                group_key,
+                &r,
+            )
+            .await
+            .context("upsert private cluster")?;
         }
     }
+
+    store::advance_private_build_watermark(&mut *tx, subscriber_id, hwm)
+        .await
+        .context("advance private watermark")?;
+    tx.commit().await.context("commit private build txn")?;
+
     Ok(groups.len())
 }
 

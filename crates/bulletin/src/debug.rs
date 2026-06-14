@@ -94,6 +94,14 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> R
             let source = SourceKind::try_from(source.as_str()).map_err(|_| {
                 anyhow::anyhow!("unknown source '{}'; valid: rss, github, slack", source)
             })?;
+            // A private-capable source must be owned, or its private events would have no scope to
+            // bind to (the DB CHECK enforces this too; this is the friendly up-front error).
+            if source.can_emit_private() && owner.is_none() {
+                anyhow::bail!(
+                    "a {} connection can see private content and must be owned — pass --owner <subscriber-id>",
+                    source.as_str()
+                );
+            }
             let config: serde_json::Value =
                 serde_json::from_str(&config).context("--config is not valid JSON")?;
             let id = ingest::store::insert_connection(pool, source, config, poll_interval, owner)

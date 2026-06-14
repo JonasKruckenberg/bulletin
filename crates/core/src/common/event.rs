@@ -95,6 +95,12 @@ impl EventBuilder {
     /// owner, everything else stays public. This is the one place a subscriber binding is created
     /// from a `(is_private, owner)` pair — an adapter can neither name a subscriber nor force a
     /// private scope onto a shared (ownerless) source (design §12 risk #1).
+    ///
+    /// The `(is_private, None) => Public` arm is *not* a fallback for private items: a private-capable
+    /// source is required to have an owner at the connection layer (`SourceKind::can_emit_private` +
+    /// the `connection_private_source_owned` CHECK, with the FK's ON DELETE CASCADE keeping it owned
+    /// for life), so an ownerless private item is structurally unreachable. The arm only ever maps a
+    /// genuinely public item (`is_private == false`) from an ownerless or owned connection.
     pub fn finalize(self, owner: Option<Uuid>) -> NewEvent {
         let scope = match (self.is_private, owner) {
             (true, Some(subscriber_id)) => Scope::Private(subscriber_id),

@@ -379,6 +379,35 @@ async fn private_clusters_are_isolated_to_their_owner() {
     assert_eq!(cluster_count(&pool).await, 3);
 }
 
+// PrivateBuild is watermark-bounded like the public build: it processes only events ingested since
+// the subscriber's last build, so a re-run with nothing new is a no-op and a quiet private cluster's
+// updated_at is not bumped (so it ages out of the candidate floor the way a public cluster does).
+#[tokio::test]
+async fn private_build_is_watermark_incremental() {
+    let (pool, _pg) = setup().await;
+    let alice = insert_subscriber(
+        &pool,
+        "alice@x.com",
+        None,
+        Recurrence::Daily,
+        "UTC",
+        nine_am(),
+    )
+    .await
+    .unwrap();
+
+    insert_private(&pool, alice, "s1", "g1", "First", 100).await;
+    // First build (watermark = epoch) clusters the one group...
+    assert_eq!(build_private(&pool, alice).await.unwrap(), 1);
+    // ...and a re-run with nothing newly ingested is a no-op (watermark advanced past it).
+    assert_eq!(build_private(&pool, alice).await.unwrap(), 0);
+
+    // A new private event re-dirties only its own group; the settled one isn't rebuilt.
+    insert_private(&pool, alice, "s2", "g2", "Second", 200).await;
+    assert_eq!(build_private(&pool, alice).await.unwrap(), 1);
+    assert_eq!(cluster_count(&pool).await, 2);
+}
+
 // Signup schedules the first digest at the next occurrence of the local digest time in the
 // subscriber's own zone — in the future, at the chosen wall-clock hour (not "due immediately").
 #[tokio::test]

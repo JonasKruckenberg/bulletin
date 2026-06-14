@@ -144,25 +144,91 @@ pub async fn list_public_group_events(
     .await
 }
 
-// ── Private build (per subscriber, just-in-time) ──────────────────────────
+// ── Private build (per subscriber, watermark-bounded) ─────────────────────
 
-/// Distinct private `(source, group_key)` groups owned by `subscriber_id` — the groups the
-/// just-in-time private build recomputes before a subscriber's digest. Unlike the public build there
-/// is no watermark: private volume per subscriber is small and the rollup is idempotent, so each
-/// digest simply rebuilds the owner's private clusters (design §9.1).
+/// A 64-bit seed for the per-subscriber PrivateBuild advisory lock — combined with the subscriber
+/// id via `hashtextextended` so each subscriber's build serializes independently (mirrors the
+/// public build's single `BUILD_LOCK_KEY`). Auto-released at transaction end.
+const PRIVATE_BUILD_LOCK_SEED: i64 = 0x6275_6c6c_6574_6e02; // "bulletn\x02"
+
+/// Tries to take the PrivateBuild advisory lock for `subscriber_id` on `executor`'s transaction.
+/// Returns `false` if another build for the same subscriber holds it — the caller then no-ops (its
+/// events are covered by the holder), exactly like the public build.
+pub async fn try_private_build_lock(
+    executor: impl PgExecutor<'_>,
+    subscriber_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let row =
+        sqlx::query("SELECT pg_try_advisory_xact_lock(hashtextextended($1::text, $2)) AS locked")
+            .bind(subscriber_id)
+            .bind(PRIVATE_BUILD_LOCK_SEED)
+            .fetch_one(executor)
+            .await?;
+    Ok(row.get("locked"))
+}
+
+/// Reads `(built_through, now())` for one subscriber's private build. A missing watermark row is the
+/// epoch, so the first build covers all of the subscriber's private history; thereafter the
+/// half-open range `(built_through, hwm]` bounds the work (mirrors `build_bounds`).
+pub async fn private_build_bounds(
+    executor: impl PgExecutor<'_>,
+    subscriber_id: Uuid,
+) -> Result<(DateTime<Utc>, DateTime<Utc>), sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT coalesce(
+                  (SELECT built_through FROM private_build_watermark WHERE subscriber_id = $1),
+                  'epoch'::timestamptz
+                ) AS built_through,
+                now() AS hwm",
+    )
+    .bind(subscriber_id)
+    .fetch_one(executor)
+    .await?;
+    Ok((row.get("built_through"), row.get("hwm")))
+}
+
+/// Distinct private `(source, group_key)` groups owned by `subscriber_id` and touched by events
+/// ingested in `(lo, hi]` — the private groups PrivateBuild must recompute this pass. The
+/// `scope_subscriber_id = $1` predicate is the isolation boundary; the ingest-time range is what
+/// makes the build incremental rather than a full rescan of the owner's history.
 pub async fn dirty_private_groups(
     executor: impl PgExecutor<'_>,
     subscriber_id: Uuid,
+    lo: DateTime<Utc>,
+    hi: DateTime<Utc>,
 ) -> Result<Vec<(SourceKind, String)>, sqlx::Error> {
     sqlx::query(
         "SELECT DISTINCT source, group_key
          FROM event
-         WHERE scope_kind = 'private' AND scope_subscriber_id = $1",
+         WHERE scope_kind = 'private' AND scope_subscriber_id = $1
+           AND ingest_time > $2 AND ingest_time <= $3",
     )
     .bind(subscriber_id)
+    .bind(lo)
+    .bind(hi)
     .try_map(|row: PgRow| Ok((row.try_get("source")?, row.get::<String, _>("group_key"))))
     .fetch_all(executor)
     .await
+}
+
+/// Advances one subscriber's private build watermark to `hwm` (monotonic via GREATEST), creating the
+/// row on first build.
+pub async fn advance_private_build_watermark(
+    executor: impl PgExecutor<'_>,
+    subscriber_id: Uuid,
+    hwm: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO private_build_watermark (subscriber_id, built_through)
+         VALUES ($1, $2)
+         ON CONFLICT (subscriber_id) DO UPDATE
+            SET built_through = GREATEST(private_build_watermark.built_through, EXCLUDED.built_through)",
+    )
+    .bind(subscriber_id)
+    .bind(hwm)
+    .execute(executor)
+    .await?;
+    Ok(())
 }
 
 /// Loads every private event owned by `subscriber_id` in one within-source group, ordered by

@@ -231,21 +231,28 @@ poll↔webhook dedup, lifecycle → status.
 >   dropped the second owner's event). `insert_event` conflicts on the constraint by name.
 > - **Visibility-aware finalize**: `EventBuilder` gained `is_private` + `.private(bool)`;
 >   `finalize(scope)` became `finalize(owner: Option<Uuid>)` mapping `(is_private, owner)` →
->   `Scope` (`private + owner → Private(owner)`, else `Public` — a private item on an ownerless
->   connection can't be bound, so it stays public rather than inventing an owner). `ingest::poll`
->   and `process_webhook` finalize per-event with the connection's `subscriber_id` (from OUR row,
->   never the payload).
+>   `Scope` (`private + owner → Private(owner)`, else `Public`). `ingest::poll` and
+>   `process_webhook` finalize per-event with the connection's `subscriber_id` (from OUR row, never
+>   the payload). The `(private, None)` case is made **unreachable** rather than fail-open:
+>   `…014_connection_owner.sql` adds `CHECK (source = 'rss' OR subscriber_id IS NOT NULL)` and
+>   `SourceKind::can_emit_private` gates `connection-add`, so a private-capable source is always
+>   owned (FK CASCADE keeps it owned for life).
 > - **GitHub visibility**: `repos_to_poll` returns `RepoTarget { name, private }` (discovery reads
 >   `/installation/repositories`'s `private`; an allowlist can't, so it reports `private=false`);
 >   `GithubEvent` deserializes the feed's per-event `public` flag (default `true`) and `poll` folds
 >   the repo-list privacy onto each event (never a downgrade); `from_webhook` sets `public` from
 >   `repository.private`; `to_builder` passes `.private(!public)`.
-> - **PrivateBuild**: `cluster::build_private(pool, subscriber_id)` — **no watermark/lock**,
->   rebuilds the owner's private clusters just-in-time; `GenerateDigest` (and `dispatch_now`) call
->   it before selecting. `upsert_cluster` is now scope-aware; `cluster::store` gained
->   `dirty_private_groups` / `list_private_group_events`. `candidates_in_lookback` takes a
->   `subscriber_id` and filters `scope_kind = 'public' OR scope_subscriber_id = $1` (the isolation
->   boundary) — `explain` is scope-aware too but stays no-writes (doesn't build private).
+> - **PrivateBuild**: `cluster::build_private(pool, subscriber_id)` — a per-subscriber mirror of the
+>   public `build`: a txn holding a per-subscriber advisory lock, the half-open `(built_through,
+>   now()]` range from `…015_private_build_watermark.sql` (keyed per subscriber), recompute dirtied
+>   groups, upsert, advance the cursor. So it scales with *new* private activity (not lifetime
+>   history) and a quiet private cluster ages out of the candidate floor like a public one.
+>   `GenerateDigest` (and `dispatch_now`) call it before selecting. `upsert_cluster` is now
+>   scope-aware; `cluster::store` gained `try_private_build_lock` / `private_build_bounds` /
+>   `dirty_private_groups` (range-bounded) / `advance_private_build_watermark` /
+>   `list_private_group_events`. `candidates_in_lookback` takes a `subscriber_id` and filters
+>   `scope_kind = 'public' OR scope_subscriber_id = $1` (the isolation boundary) — `explain` is
+>   scope-aware too but stays no-writes (doesn't build private).
 > - **Scope-invariant proptests** (pure, `cluster::tests`): public build never clusters a private
 >   event (scope is part of `ClusterKey`); a subscriber's candidate set (`visible_to`) never holds
 >   another subscriber's private cluster. Plus DB-backed tests (Docker): `pipeline.rs`
@@ -253,8 +260,8 @@ poll↔webhook dedup, lifecycle → status.
 > - **Debug**: `debug connection-add --owner <subscriber>` binds a connection to its owner.
 > - **Seams left for later phases:** isolation is enforced at the *query* layer (the
 >   `scope_subscriber_id` predicates) — Phase 4 makes it DB-enforced via RLS so it holds against a
->   logic bug; private clusters are rebuilt every digest (no private watermark) — fine at M2 volume,
->   revisit if it bites. `cluster_entities` GIN (blocking) is still M3.
+>   logic bug. `cluster_entities` GIN (blocking) is still M3. (The earlier "no private watermark" and
+>   "ownerless-private fail-open" seams are now closed — see migrations 014/015.)
 > - **Tests:** `clippy --all-targets` clean; pure suites pass; Docker was unavailable in the build
 >   sandbox so the DB suites (`pipeline`/`webhook`/`event`/`connection`/`poll_rss`) compiled but did
 >   not run.

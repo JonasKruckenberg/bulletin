@@ -28,19 +28,12 @@ async fn setup() -> (sqlx::PgPool, testcontainers::ContainerAsync<Postgres>) {
     (pool, pg)
 }
 
-/// Seed a GitHub connection routed by its installation id (the webhook routing key).
+/// Seed a GitHub connection routed by its installation id (the webhook routing key). GitHub is a
+/// private-capable source, so it must be owned; these tests exercise public-repo deliveries, so the
+/// owner is incidental — `seed_github_owned` is used where the owner's scope is the point.
 async fn seed_github(pool: &sqlx::PgPool, installation_id: i64) -> Uuid {
-    let row: (Uuid,) = sqlx::query_as(
-        "INSERT INTO connection (source, config, provider_account_id)
-         VALUES ('github', $1::jsonb, $2)
-         RETURNING id",
-    )
-    .bind(json!({ "installation_id": installation_id }).to_string())
-    .bind(installation_id.to_string())
-    .fetch_one(pool)
-    .await
-    .unwrap();
-    row.0
+    let owner = seed_subscriber(pool, &format!("owner-{installation_id}@example.com")).await;
+    seed_github_owned(pool, installation_id, owner).await
 }
 
 /// Seed a GitHub connection owned by `owner` — its private-repo deliveries finalize to that scope.

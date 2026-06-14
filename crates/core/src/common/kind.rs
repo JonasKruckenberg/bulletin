@@ -15,6 +15,19 @@ impl SourceKind {
             SourceKind::Slack => "slack",
         }
     }
+
+    /// Whether this source can emit *private* (scope-restricted) events, and therefore requires an
+    /// owning subscriber on its connection — without one, `finalize` would have no scope to bind a
+    /// private item to. RSS is public-only (a feed URL is global); GitHub sees private repos. Keep in
+    /// sync with the `connection_private_source_owned` CHECK in the connection migration.
+    pub fn can_emit_private(self) -> bool {
+        match self {
+            SourceKind::Rss => false,
+            SourceKind::Github => true,
+            // Slack (M6) has private channels; revisit its owner policy when it lands.
+            SourceKind::Slack => true,
+        }
+    }
 }
 
 impl TryFrom<&str> for SourceKind {
