@@ -289,6 +289,16 @@ signal tables, object-storage raw offload, multi-channel delivery.
 > probabilistic `entity_edge` identity, and confidence-as-rendered-signal. It sequences *after* M3/M4
 > (it builds on linking + relevance) and is itself phased (identity → threads-shadow → thread-weighted
 > relevance → assignment/render → thread feedback). Milestone sequencing M1–M6 is otherwise unchanged.
+>
+> **Update (2026-06-14):** landed on top of M3 linking — `core::identity` (a graded resolver over M3's
+> namespaced tokens: lexical + `must_link` equivalence edges, components ≥ θ with confidence bands,
+> `cannot_link` vetoes), `core::thread` (the `thread_maintenance` job: co-occurrence over **stories** →
+> label-propagation communities → id-forwarded threads → affinity decay → entity-weight projection,
+> due-gated per subscriber), the fire-time relevance term + **best-effort** thread-assignment, a
+> confidence-banded thread chip on rendered items, and an entity/thread `feedback` log. Additive and
+> shadow-safe (inert until maintenance runs); the fire-time consumption is behind the **`thread-weighting`
+> cargo feature** (compile-time kill switch). Still deferred: the avatar / "?" correction UI,
+> thread-grouped render + delta lines, embedding edges, transitive `cannot_link`, `digest-explain` A/B.
 
 ---
 

@@ -8,6 +8,7 @@ use chrono_tz::Tz;
 use lettre::{message::MultiPart, Message};
 
 use crate::digest::store::RenderItem;
+use crate::identity::ConfidenceBand;
 
 /// The delivery seam: something that can send a rendered digest, and knows the From address to
 /// render it as. The binary implements this over its file/SMTP transports.
@@ -445,11 +446,38 @@ fn render_item_row(
         .unwrap_or_else(|| "—".into());
     let related = item.connections.len();
     let connections = render_connections(&item.connections);
+    let thread_chip = render_thread_chip(item.thread.as_ref());
+
+    // Decision-log fields (§10.2): the ranking basis is the Thread relevance term then recency — so a
+    // nonzero relevance promoted this item above pure recency; the entity spine is what it scored on;
+    // and the thread line records the assignment + its identity confidence band.
+    let relevance = item.reason.relevance;
+    let basis = if relevance > 0.0 {
+        format!("relevance {relevance:.2}, then recency")
+    } else {
+        "recency".to_string()
+    };
+    let spine = if item.reason.entities.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<div style="margin-top:4px;word-break:break-word;">entities {}</div>"#,
+            escape(&item.reason.entities.join(", "))
+        )
+    };
+    let thread_trace = match &item.thread {
+        Some(t) => format!(
+            r#"<div style="margin-top:4px;">thread <span style="font-weight:700;">{}</span> &middot; identity {}</div>"#,
+            escape(&t.label),
+            t.confidence.as_str()
+        ),
+        None => String::new(),
+    };
 
     format!(
         r#"<tr>
 <td class="bx" style="padding:30px 40px;">
-{headline}
+{thread_chip}{headline}
 <!-- PLACEHOLDER: per-item category — remove or replace once items carry a category -->
 <div class="meta" style="margin-top:9px;font-family:{SANS};font-size:13px;font-weight:500;letter-spacing:0.04em;color:{ACCENT};">{category}</div>
 <!-- /PLACEHOLDER -->
@@ -459,9 +487,9 @@ fn render_item_row(
 {connections}<!-- DEBUG: selection trace — debugging info, remove before launch -->
 <div style="margin-top:18px;padding:9px 12px;background-color:{DEBUG_BG};border:1px dashed {DEBUG_BORDER};border-radius:3px;font-family:{MONO};font-size:12px;line-height:1.6;color:{DEBUG_INK};">
 <span style="display:inline-block;padding:1px 6px;margin-right:8px;background-color:{DEBUG_BORDER};color:{DEBUG_BG};font-weight:700;text-transform:uppercase;letter-spacing:0.1em;border-radius:2px;">debug</span>
-<span style="font-weight:700;">selected #{rank}</span> <span>by recency</span>
+<span style="font-weight:700;">selected #{rank}</span> <span>by {basis}</span>
 <div style="margin-top:4px;">key {recency_key} &middot; source <span style="font-weight:700;">{source}</span> &middot; related {related}</div>
-<div style="margin-top:4px;word-break:break-all;">link {link}</div>
+{thread_trace}{spine}<div style="margin-top:4px;word-break:break-all;">link {link}</div>
 </div>
 <!-- /DEBUG -->
 </td>
@@ -513,6 +541,25 @@ fn render_connections(connections: &[crate::digest::store::Connection]) -> Strin
     )
 }
 
+/// The thread chip above a story's headline (design §5.2 thread-grouped render): the persistent
+/// thread it advances, prefixed "possibly" when the thread's identity is only `Probable`/`Uncertain`
+/// — confidence rendered as a product surface (§4). Empty when the story isn't assigned to a thread,
+/// so an un-threaded item renders exactly as before.
+fn render_thread_chip(thread: Option<&crate::digest::store::ThreadTag>) -> String {
+    let Some(tag) = thread.filter(|t| !t.label.trim().is_empty()) else {
+        return String::new();
+    };
+    let qualifier = match tag.confidence {
+        ConfidenceBand::Confirmed => "",
+        ConfidenceBand::Probable | ConfidenceBand::Uncertain => "possibly ",
+    };
+    format!(
+        r#"<div style="margin-bottom:8px;font-family:{SANS};font-size:11px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:{ACCENT};">&#9656;&nbsp;{qualifier}{}</div>
+"#,
+        escape(&tag.label)
+    )
+}
+
 /// Minimal HTML escaping for untrusted feed text, safe in both element-text and double-quoted
 /// attribute contexts (the two places we interpolate).
 fn escape(s: &str) -> String {
@@ -543,6 +590,8 @@ mod tests {
             source,
             last_event_time: Utc.with_ymd_and_hms(2026, 6, 13, 8, 30, 0).unwrap(),
             connections: Vec::new(),
+            thread: None,
+            reason: crate::digest::select::ItemReason::default(),
         }
     }
 

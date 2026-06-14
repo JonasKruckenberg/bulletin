@@ -51,7 +51,7 @@ Note are small but highly relevant. They represent events that do not warrant a 
 
 Notes are rendered in a compact format with one or two sentences max.
 
-## `Thread` *(designed; deferred — see `digest-thread-layer.md`)*
+## `Thread` *(first slice implemented — see `digest-thread-layer.md`)*
 
 Where a `Story` weaves sources together at one *moment*, a `Thread` weaves *stories together across
 time*: the persistent threads of a user's life (a project running for months, an on-call rotation, a
@@ -61,6 +61,30 @@ background job (`thread_maintenance`) off the digest hot path, fed by a **tiered
 resolves entities probabilistically (exact ids as a certain backbone; graded, revisable matches above)
 and carries a **confidence** that is rendered to the user — a guaranteed person shows their avatar, an
 uncertain one a question mark that doubles as the "is this the same?" correction control.
+
+**Status (2026-06-14).** Implemented on top of M3 linking, additive and shadow-safe:
+
+- **Tiered identity** (`core::identity`): a graded resolver over M3's namespaced entity tokens —
+  connected components over equivalence edges (lexical similarity now; user `must_link` feedback;
+  embedding later), with a max-spanning-tree **confidence band** per identity and stable id-forwarding.
+  `cannot_link` is a durable **veto** materialized in `entity_edge`, so identity is reconstructible
+  from the graph alone.
+- **`thread_maintenance`** (`core::thread`): a background job that builds the engaged co-occurrence
+  graph over the subscriber's **stories**, detects communities (deterministic label propagation),
+  id-forwards them onto the prior threads, decays affinity, runs the active/dormant/archived state
+  machine, and projects the per-entity weight map — due-gated per subscriber (a watermark query, not a
+  full scan), off the punctual path.
+- **Fire-time**: a Thread relevance term (`relevance += Σ entity_weight[e]` over a story's spine),
+  **best-effort** thread-assignment (a DB error never blocks the send), and a thread chip on rendered
+  items that reads its confidence band ("Acme migration" / "possibly …").
+- **Feedback** (`core::feedback`): an append-only log; `must_link`/`cannot_link` materialize into the
+  identity graph in the same transaction.
+
+The layer is **inert until `thread_maintenance` runs** (empty weight map ⇒ pure-recency selection),
+and the whole fire-time consumption path is behind the **`thread-weighting` cargo feature** (on by
+default; build with `--no-default-features` to compile it out). Deferred: the confidence-banded
+avatar / "?" correction UI, thread-grouped layout + delta lines, embedding edges, persisted
+entity-component id-forwarding, and transitive `cannot_link` (only direct vetoes are honoured today).
 
 # Deployment (NixOS)
 

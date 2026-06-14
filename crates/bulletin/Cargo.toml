@@ -8,8 +8,16 @@ publish = false
 name = "bulletin"
 path = "src/main.rs"
 
+[features]
+default = ["thread-weighting"]
+# Forwards to `bulletin-core/thread-weighting` and additionally gates the maintenance enqueue in the
+# worker tick. Build the binary with `--no-default-features` to disable the Thread layer entirely.
+thread-weighting = ["bulletin-core/thread-weighting"]
+
 [dependencies]
-bulletin-core   = { path = "../core" }
+# default-features = false so the binary's own `thread-weighting` feature is the single switch that
+# turns the layer on/off in core (otherwise core's default would force it on regardless).
+bulletin-core   = { path = "../core", default-features = false }
 anyhow          = { workspace = true }
 clap            = { workspace = true }
 tokio           = { workspace = true }

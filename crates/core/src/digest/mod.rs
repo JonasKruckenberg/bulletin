@@ -18,10 +18,10 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::common::db::{with_scope, ScopeCtx};
-use crate::digest::select::{select, Candidate, Decision, Verdict};
+use crate::digest::select::{select, Candidate, Decision, DecisionRecord, ItemReason, Verdict};
 use crate::digest::store::{
-    build_render_item, cluster_cards, create_with_items, mark_delivered, render_items,
-    render_items_for_stories, RenderItem,
+    build_render_item, cluster_cards, create_with_items, mark_delivered, record_decisions,
+    render_items, render_items_for_stories, RenderItem,
 };
 use crate::digest::subscriber::{load_subscriber, SubscriberRow};
 use crate::link::{self, LinkedStory};
@@ -71,7 +71,7 @@ async fn link_and_select(
     last_run: Option<DateTime<Utc>>,
     horizon_days: i32,
     persist: bool,
-) -> Result<(Vec<LinkedStory>, Vec<Decision>)> {
+) -> Result<(Vec<LinkedStory>, Vec<Decision>, HashMap<Uuid, Vec<String>>)> {
     let sub_id = sub.id;
     // Read the candidate clusters + the prior story assignment in the subscriber's RLS context: the
     // candidate set is `public ∪ own-private` (and the prior assignment is the subscriber's own
@@ -98,16 +98,174 @@ async fn link_and_select(
             .context("persist story assignment")?;
     }
 
-    let candidates = assignment
+    // Each story's entity spine = the union of its member clusters' entities (already in memory from
+    // the candidate load — no extra query). This feeds both the Thread relevance term and fire-time
+    // thread-assignment.
+    let cluster_entities: HashMap<Uuid, &[String]> = clusters
+        .iter()
+        .map(|c| (c.id, c.entities.as_slice()))
+        .collect();
+    let story_entities: HashMap<Uuid, Vec<String>> = assignment
         .stories
         .iter()
-        .map(|s| Candidate {
-            id: s.id,
-            last_event_time: s.last_event_time,
-        })
+        .map(|s| (s.id, story_spine(s, &cluster_entities)))
         .collect();
+
+    let mut candidates: Vec<Candidate> = assignment
+        .stories
+        .iter()
+        .map(|s| Candidate::new(s.id, s.last_event_time, story_entities[&s.id].clone()))
+        .collect();
+    // Add the Thread relevance term before ranking (compiled out when the feature is off; a no-op
+    // until thread_maintenance has projected weights).
+    apply_weighting(pool, sub.id, &mut candidates).await?;
     let decisions = select(candidates, sub.max_items as usize);
-    Ok((assignment.stories, decisions))
+    Ok((assignment.stories, decisions, story_entities))
+}
+
+/// The deduplicated, sorted union of a story's member-cluster entities.
+fn story_spine(story: &LinkedStory, cluster_entities: &HashMap<Uuid, &[String]>) -> Vec<String> {
+    let mut spine: Vec<String> = story
+        .clusters
+        .iter()
+        .filter_map(|c| cluster_entities.get(&c.cluster_id))
+        .flat_map(|ents| ents.iter().cloned())
+        .collect();
+    spine.sort();
+    spine.dedup();
+    spine
+}
+
+/// Add the Thread relevance term to the candidates (design §5.2). Compiled in only with the
+/// `thread-weighting` feature — the compile-time kill switch that takes the whole consumption path
+/// off the build when disabled. Even when on it's a no-op until `thread_maintenance` has projected a
+/// weight map (an empty map leaves selection at pure recency).
+#[cfg(feature = "thread-weighting")]
+async fn apply_weighting(
+    pool: &PgPool,
+    subscriber_id: Uuid,
+    candidates: &mut [Candidate],
+) -> Result<()> {
+    // `subscriber.affinity` lives on the (RLS-fenced) subscriber row, so read it in the subscriber's
+    // own context — the no-subscriber context is denied the control-plane tables outright.
+    let weights = with_scope(pool, ScopeCtx::Subscriber(subscriber_id), move |conn| {
+        Box::pin(async move {
+            crate::thread::store::load_entity_weights(&mut *conn, subscriber_id)
+                .await
+                .context("load entity weights")
+        })
+    })
+    .await?;
+    crate::digest::select::apply_thread_weights(candidates, &weights);
+    Ok(())
+}
+
+#[cfg(not(feature = "thread-weighting"))]
+async fn apply_weighting(_: &PgPool, _: Uuid, _: &mut [Candidate]) -> Result<()> {
+    Ok(())
+}
+
+/// Stamp each selected story with the thread it advances (design §5.2). **Best-effort**: a DB error
+/// is logged and swallowed, never propagated — the punctual digest must send regardless (the
+/// assignment is render metadata, not the deliverable). Compiled out without the feature.
+#[cfg(feature = "thread-weighting")]
+async fn assign_threads(
+    pool: &PgPool,
+    digest_id: Uuid,
+    subscriber_id: Uuid,
+    selected: &[Uuid],
+    story_entities: &HashMap<Uuid, Vec<String>>,
+) {
+    /// Minimum shared entities for a story→thread assignment (a single strong shared token suffices).
+    const MIN_OVERLAP: i64 = 1;
+    // All of `thread` and `digest_item` is RLS-fenced, so run in the subscriber's own context. The
+    // whole thing is best-effort: any error is logged and swallowed so the digest still sends.
+    let selected = selected.to_vec();
+    let story_entities = story_entities.clone();
+    let result = with_scope(pool, ScopeCtx::Subscriber(subscriber_id), move |conn| {
+        Box::pin(async move {
+            let mut assignments = Vec::with_capacity(selected.len());
+            for id in &selected {
+                let entities = story_entities.get(id).cloned().unwrap_or_default();
+                let thread_id = crate::thread::store::assign_thread(
+                    &mut *conn,
+                    subscriber_id,
+                    &entities,
+                    MIN_OVERLAP,
+                )
+                .await?;
+                assignments.push((*id, thread_id));
+            }
+            crate::thread::store::assign_thread_ids(&mut *conn, digest_id, &assignments).await?;
+            Ok(())
+        })
+    })
+    .await;
+    if let Err(e) = result {
+        tracing::warn!(error = %e, "thread assignment failed (non-fatal); digest unaffected");
+    }
+}
+
+#[cfg(not(feature = "thread-weighting"))]
+async fn assign_threads(_: &PgPool, _: Uuid, _: Uuid, _: &[Uuid], _: &HashMap<Uuid, Vec<String>>) {}
+
+/// One candidate's `ItemReason` — the Thread relevance term + the entity spine it scored on.
+fn reason_of(d: &Decision, story_entities: &HashMap<Uuid, Vec<String>>) -> ItemReason {
+    ItemReason {
+        relevance: d.relevance,
+        entities: story_entities.get(&d.id).cloned().unwrap_or_default(),
+    }
+}
+
+/// The digest's full decision log (design §10.2): a structured record per candidate — *including the
+/// over-cap drops* — with its verdict and reasoning. Persisted on the `digest` row; the foundation a
+/// later explain UI / feedback reads.
+fn decision_log(
+    decisions: &[Decision],
+    story_entities: &HashMap<Uuid, Vec<String>>,
+) -> Vec<DecisionRecord> {
+    decisions
+        .iter()
+        .map(|d| DecisionRecord {
+            story_id: d.id,
+            verdict: d.verdict,
+            reason: reason_of(d, story_entities),
+        })
+        .collect()
+}
+
+/// The per-item reasons for the *selected* stories, keyed by story id — the render-facing slice of
+/// the decision log (the dry-run paths build it in-memory; the frozen path re-reads it from storage).
+fn selected_reasons(
+    decisions: &[Decision],
+    story_entities: &HashMap<Uuid, Vec<String>>,
+) -> HashMap<Uuid, ItemReason> {
+    decisions
+        .iter()
+        .filter(|d| matches!(d.verdict, Verdict::Selected { .. }))
+        .map(|d| (d.id, reason_of(d, story_entities)))
+        .collect()
+}
+
+/// Persist the digest's decision log (best-effort; never blocks the send) as structured records on
+/// the `digest` row. Recorded regardless of the thread-weighting feature.
+async fn record_decision_log(
+    pool: &PgPool,
+    digest_id: Uuid,
+    subscriber_id: Uuid,
+    log: Vec<DecisionRecord>,
+) {
+    let result = with_scope(pool, ScopeCtx::Subscriber(subscriber_id), move |conn| {
+        Box::pin(async move {
+            record_decisions(&mut *conn, digest_id, &log)
+                .await
+                .map_err(Into::into)
+        })
+    })
+    .await;
+    if let Err(e) = result {
+        tracing::warn!(error = %e, "recording decision log failed (non-fatal)");
+    }
 }
 
 /// The story ids that made the cut, in render order.
@@ -152,7 +310,7 @@ pub async fn generate(
 
     // Link the candidate clusters into stories (persisting the assignment so ids stay stable), then
     // rank the stories by recency. The story is the unit the digest freezes and renders (§8.2).
-    let (_, decisions) =
+    let (_, decisions, story_entities) =
         link_and_select(pool, &sub, sub.last_run_at, CONTEXT_HORIZON_DAYS, true).await?;
     log_selection(sub.id, sub.max_items as usize, &decisions);
     let selected = selected_ids(&decisions);
@@ -164,6 +322,18 @@ pub async fn generate(
     if digest.delivered_at.is_some() {
         return Ok(DigestOutcome::AlreadyDelivered);
     }
+
+    // Persist the per-item decision log onto the frozen items (always; best-effort), then thread-assign
+    // them (best-effort, compiled out without the feature) — both metadata for the debug trace +
+    // thread-grouped render, neither ever fails the digest (the email is the deliverable).
+    record_decision_log(
+        pool,
+        digest.id,
+        sub.id,
+        decision_log(&decisions, &story_entities),
+    )
+    .await;
+    assign_threads(pool, digest.id, sub.id, &selected, &story_entities).await;
 
     let digest_id = digest.id;
     let items = with_scope(pool, ScopeCtx::Subscriber(sub.id), move |conn| {
@@ -242,20 +412,23 @@ pub async fn dispatch_now(
     // Explicit lookback floor = now − lookback_days (last_run_at is ignored — this is off-schedule).
     // A preview links in-memory but persists nothing (`false`): it must not disturb the real story
     // cache, schedule, or de-dup history.
-    let (stories, decisions) = link_and_select(pool, &sub, None, lookback_days, false).await?;
+    let (stories, decisions, story_entities) =
+        link_and_select(pool, &sub, None, lookback_days, false).await?;
     log_selection(sub.id, sub.max_items as usize, &decisions);
     let selected = selected_ids(&decisions);
 
     // Reassemble the selected stories (in render order) from the in-memory assignment, rendering
-    // their cluster cards in the subscriber's RLS context.
+    // their cluster cards in the subscriber's RLS context. The decision log is built in-memory (the
+    // preview persists nothing) so the debug trace reads identically to a delivered digest.
     let by_id: HashMap<Uuid, &LinkedStory> = stories.iter().map(|s| (s.id, s)).collect();
     let selected_stories: Vec<LinkedStory> = selected
         .iter()
         .filter_map(|id| by_id.get(id).map(|s| (*s).clone()))
         .collect();
+    let reasons = selected_reasons(&decisions, &story_entities);
     let items = with_scope(pool, ScopeCtx::Subscriber(sub.id), move |conn| {
         Box::pin(async move {
-            render_items_for_stories(&mut *conn, &selected_stories)
+            render_items_for_stories(&mut *conn, &selected_stories, &reasons)
                 .await
                 .context("load render items")
         })
@@ -330,7 +503,7 @@ pub async fn explain(pool: &PgPool, subscriber_id: Uuid) -> Result<Vec<ExplainRo
         .await
         .context("build private clusters")?;
 
-    let (stories, decisions) =
+    let (stories, decisions, story_entities) =
         link_and_select(pool, &sub, sub.last_run_at, CONTEXT_HORIZON_DAYS, false).await?;
 
     let by_id: HashMap<Uuid, &LinkedStory> = stories.iter().map(|s| (s.id, s)).collect();
@@ -347,15 +520,27 @@ pub async fn explain(pool: &PgPool, subscriber_id: Uuid) -> Result<Vec<ExplainRo
     })
     .await?;
 
+    // Attach the decision log to every candidate (including the over-cap drops), so the dry-run
+    // explains the full reasoning — relevance term + entity spine — not just what was selected.
     Ok(decisions
         .into_iter()
-        .map(|d| ExplainRow {
-            verdict: d.verdict,
-            story_id: d.id,
-            last_event_time: d.last_event_time,
-            item: by_id
-                .get(&d.id)
-                .and_then(|s| build_render_item(&s.clusters, &cards)),
+        .map(|d| {
+            let reason = ItemReason {
+                relevance: d.relevance,
+                entities: story_entities.get(&d.id).cloned().unwrap_or_default(),
+            };
+            let item = by_id.get(&d.id).and_then(|s| {
+                build_render_item(&s.clusters, &cards).map(|mut item| {
+                    item.reason = reason;
+                    item
+                })
+            });
+            ExplainRow {
+                verdict: d.verdict,
+                story_id: d.id,
+                last_event_time: d.last_event_time,
+                item,
+            }
         })
         .collect())
 }

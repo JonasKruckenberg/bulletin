@@ -151,10 +151,7 @@ async fn select_stories(
     let candidates: Vec<Candidate> = assignment
         .stories
         .iter()
-        .map(|s| Candidate {
-            id: s.id,
-            last_event_time: s.last_event_time,
-        })
+        .map(|s| Candidate::new(s.id, s.last_event_time, Vec::new()))
         .collect();
     select(candidates, max_items)
         .into_iter()
@@ -197,10 +194,7 @@ async fn build_groups_events_into_clusters() {
     let cands: Vec<Candidate> = assignment
         .stories
         .iter()
-        .map(|s| Candidate {
-            id: s.id,
-            last_event_time: s.last_event_time,
-        })
+        .map(|s| Candidate::new(s.id, s.last_event_time, Vec::new()))
         .collect();
     let selected = select(cands, 2)
         .into_iter()
