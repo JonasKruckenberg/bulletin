@@ -301,27 +301,30 @@ fn recency_decay(now: DateTime<Utc>, t: DateTime<Utc>, half_life_days: f64) -> f
     0.5_f64.powf(age_days / half_life_days)
 }
 
-/// A story's relevance: `base + scope_bonus (own-private) + the thread term`. Base 1.0 makes
-/// subscription match implicit (everything in the candidate set is something you subscribed to), so a
-/// default floor of 0 admits everything until feedback drives a thread term negative.
+/// The recency-bound part of relevance: `base (1.0) + scope_bonus (own-private)`. Base 1.0 makes
+/// subscription match implicit (everything in the candidate set is something you subscribed to). This
+/// is the part that ages on the recency cadence; the thread term (`c.relevance`) ages slower.
+fn base_relevance(c: &Candidate, cfg: &ScoringConfig) -> f32 {
+    1.0 + if c.has_private { cfg.scope_bonus } else { 0.0 }
+}
+
+/// A story's relevance — `base_relevance + the thread term` — the gate key and primary ranking input.
+/// A default floor of 0 admits everything until feedback drives a thread term negative.
 fn relevance(c: &Candidate, cfg: &ScoringConfig) -> f32 {
-    1.0 + if c.has_private { cfg.scope_bonus } else { 0.0 } + c.relevance
+    base_relevance(c, cfg) + c.relevance
 }
 
 /// Priority — relevance-led, boosted by `max_severity`, aged by recency decay at read time
-/// (design §8.3). The recency-bound part (base relevance + scope bonus + severity) decays on the
-/// recency half-life; the **thread** term (`c.relevance`) decays on the slower `thread_half_life_days`
-/// so an invested thread stays promoted for weeks yet still eventually ages out (§9.4). With no thread
-/// term this is exactly the single-decay form (`relevance × recency_decay`).
-fn priority(c: &Candidate, relevance: f32, cfg: &ScoringConfig, now: DateTime<Utc>) -> f32 {
+/// (design §8.3). The recency-bound part (`base_relevance` + severity) decays on the recency
+/// half-life; the **thread** term (`c.relevance`) decays on the slower `thread_half_life_days`, so an
+/// invested thread stays promoted for weeks yet still eventually ages out (§9.4). The two components
+/// are kept explicit (no reconstructing one from the total), so adding a relevance term later can't
+/// silently mis-split the decay. With no thread term this is the single-decay form.
+fn priority(c: &Candidate, cfg: &ScoringConfig, now: DateTime<Utc>) -> f32 {
     let sev = c.max_severity.unwrap_or(0) as f32;
     let recency = recency_decay(now, c.last_event_time, cfg.recency_half_life_days) as f32;
     let thread_decay = recency_decay(now, c.last_event_time, cfg.thread_half_life_days) as f32;
-    // `relevance` = base + scope_bonus + thread term; split the thread term back out so it can age on
-    // its own slower cadence.
-    let thread = c.relevance;
-    let recency_bound = relevance - thread + cfg.severity_weight * sev;
-    recency_bound * recency + thread * thread_decay
+    (base_relevance(c, cfg) + cfg.severity_weight * sev) * recency + c.relevance * thread_decay
 }
 
 /// Richness → render format + a human phrase (design §8.4). Story when multi-source, multi-event, or a
@@ -394,7 +397,7 @@ pub fn select(
             });
             continue;
         }
-        let mut p = priority(c, r, cfg, now);
+        let mut p = priority(c, cfg, now);
         let mut format = natural_format;
         let mut richness_phrase = natural_phrase;
         // Re-surface suppression (design §9.4): a story already shown to this subscriber with no new

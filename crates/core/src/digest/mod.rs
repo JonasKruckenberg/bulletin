@@ -130,7 +130,10 @@ async fn link_and_select(
     // overall `max_items`. `now` is read-time so the decay reflects when the digest fires; config is
     // the global `digest_config` row.
     let cfg = load_config(pool).await.context("load scoring config")?;
-    let decisions = select(candidates, &cfg, sub.max_items as usize, Utc::now());
+    // `.max(0)` guards the `i32 → usize` cast: a stray non-positive max_items yields an empty digest
+    // (the safe direction), never a sign-wrapped, effectively-unbounded ceiling.
+    let max_items = sub.max_items.max(0) as usize;
+    let decisions = select(candidates, &cfg, max_items, Utc::now());
     Ok((assignment.stories, decisions, story_entities))
 }
 
