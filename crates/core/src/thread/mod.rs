@@ -1,6 +1,6 @@
 //! Threads — durable, recomputable, per-subscriber state: the persistent weave that runs the full
 //! height of time (the Acme migration over months; an on-call rotation), the system's *memory*
-//! (design `digest-thread-layer.md` §2).
+//! (design `docs/thread-layer.md` §2).
 //!
 //! This module owns the **pure** maintenance algorithms — everything `thread_maintenance` computes
 //! off the punctual path, all DB-free and deterministic so they can be proptested in isolation:

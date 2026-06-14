@@ -49,7 +49,7 @@ pub struct GenerateDigestJob {
     pub subscriber_id: Uuid,
 }
 
-/// thread_maintenance for one subscriber (design `digest-thread-layer.md` §5.1): the write-side,
+/// thread_maintenance for one subscriber (design `docs/thread-layer.md` §5.1): the write-side,
 /// best-effort job that rebuilds the subscriber's identity graph + threads and projects the
 /// entity-weight map. Coalesced to a relaxed cadence by an hourly idempotency key, and never on the
 /// punctual digest path.

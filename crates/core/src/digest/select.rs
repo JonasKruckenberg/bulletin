@@ -42,7 +42,7 @@ impl Candidate {
     }
 }
 
-/// The Thread relevance term (design `digest-thread-layer.md` §5.2): set each candidate's `relevance`
+/// The Thread relevance term (design `docs/thread-layer.md` §5.2): set each candidate's `relevance`
 /// to `Σ_{e ∈ entities} entity_weight[e]` over the weights `thread_maintenance` projected — the
 /// *rescue for the missed-because-split* case (a story advancing a thread you've invested in clears
 /// the bar). Purely additive: an empty `weights` map leaves every relevance at `0`, so selection

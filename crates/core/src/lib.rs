@@ -8,7 +8,7 @@
 //! - [`digest`] — link a subscriber's candidate clusters into stories, select by recency, render, send.
 //! - [`thread`] — the cross-time weave: a background `thread_maintenance` job that turns the
 //!   subscriber's stories into persistent `Thread`s and a projected entity-weight map the digest's
-//!   relevance term reads (`digest-thread-layer.md`).
+//!   relevance term reads (`docs/thread-layer.md`).
 //! - [`identity`] — tiered, probabilistic entity-identity resolution that feeds the thread layer.
 //! - [`feedback`] — the append-only correction log (care/less, must/cannot-link).
 //!

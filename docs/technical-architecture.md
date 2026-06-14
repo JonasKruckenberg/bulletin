@@ -1,21 +1,29 @@
 # Digest System — Technical Architecture (Working Snapshot)
 
-**Status:** Living snapshot of an in-progress design conversation — not final.
-**Last updated:** 2026-06-08
-**Companion to:** `digest-system-design.md` (product thesis + data model). That doc owns
+**Status:** As-built technical reference for the shipped runtime (M1–M3 + the Thread layer), with
+forward-looking notes for M4–M6. Library versions are research snapshots — see below.
+**Last updated:** 2026-06-14
+**Companion to:** `system-design.md` (product thesis + data model). That doc owns
 *what* we build and the data model; **this** doc owns *how* we build it — the Rust
 runtime, the process topology, and the cross-cutting concerns (observability, reliability,
 testing, reproducibility, security mechanisms).
-**To resume:** jump to **§10 Open threads**. The `core` modeling pass is underway — `Event`,
-`Cluster`/`Story` (revised to the **per-subscriber linking** model — product §4/§6/§8, Proposal B),
-and the **`Connector`/`Connection` two-layer trait family** are DECIDED (§5.2–5.4); reason records +
-the pure selection function are next (§5.5).
 
-**Deferred layer (designed 2026-06-14 — product §8.6–§8.7, §10.4; full design `digest-thread-layer.md`):**
+> **As-built reconciliation (2026-06-14).** The `core` modeling described here is **implemented**:
+> `Event` + the fingerprint recipe (§5.2), `Cluster`/`Story` in the per-subscriber linking model
+> (§5.3), and the **`Connector`/`Connection` two-layer trait family** (§5.4) all ship in
+> `crates/{core,bulletin}`. The runtime topology (§2), ingestion/cursors (§3), webhook auth (§3A),
+> two-context RLS (§6, `system-design.md` §12) and at-rest envelope encryption (§6) are all built.
+> **Connectors built: RSS + GitHub** — the `ConnDispatch`/`RealtimeDispatch` enums name `Rss`/`Github`
+> only; **Slack is deferred to roadmap M6** (the trait family already accommodates it). The Thread
+> layer below is no longer "deferred" — its first slice is implemented (see `thread-layer.md` §9). §10
+> ("Open threads") is the remaining design/scope work, now read as the **M4–M6 backlog**.
+
+**Thread layer (designed 2026-06-14 — product §8.6–§8.7, §10.4; full design `thread-layer.md`):**
 a fourth content-graph phase **`Thread`** (the persistent per-subscriber weave) fed by **tiered
 probabilistic identity** (`entity_edge` graph) with **confidence as a rendered signal**. Adds one
-write-side job, **`thread_maintenance`** (off the punctual path), and is schema-additive. Lands after
-linking + relevance; modeled here only as forward-compatibility notes (§5.3, §5.5, §10).
+write-side job, **`thread_maintenance`** (off the punctual path), and is schema-additive. Built on top
+of M3 linking (first slice shipped, behind the `thread-weighting` cargo feature); modeled here as
+§5.3, §5.5, §10 notes.
 
 All library versions below are research snapshots as of **2026-06** — treat as "latest known
 good," re-verify before locking `Cargo.toml`.
@@ -123,7 +131,7 @@ Key properties:
 - **Deferred job kind:** the Thread layer adds **`thread_maintenance`** (per-subscriber, relaxed
   cadence: enqueued post-`GenerateDigest` + a nightly sweep, `unique-jobs` key = `subscriber_id`,
   coalescing). Write-side, best-effort, **off the punctual path** — it never blocks a fire; projection
-  only reads the weights/threads it produced (product §8.6, `digest-thread-layer.md` §5).
+  only reads the weights/threads it produced (product §8.6, `thread-layer.md` §5).
 
 ### Durable execution / Temporal  *(DECIDED — defer)*
 
@@ -308,7 +316,7 @@ granularity.**
 
 ---
 
-## 5. Type modeling — `core`  *(IN PROGRESS — Event DECIDED; `Cluster` next; Source/reasons/selection pending)*
+## 5. Type modeling — `core`  *(IMPLEMENTED — `Event`, `Cluster`/`Story`, the connector family, and per-subscriber linking all ship; reason-records-as-types and the config-table thresholds are the M4 remainder, §5.5)*
 
 `core` is the pure domain crate: no tokio/sqlx/apalis at runtime. Deps are runtime-agnostic
 (`serde`, `uuid`, `time`, `sha2`, …) plus **feature-gated** `sqlx` + `proptest` (so
@@ -406,7 +414,7 @@ Three phases: **`Event`** (deduplicated) → **`Cluster`** (grouped within one s
 is **per-subscriber** (product §4/§8.2). The product doc's self-referential `cluster` (`parent_id`) is
 gone; so is a single shared story object. *(Deferred 4th phase — `Thread`: the persistent per-subscriber
 weave over many stories across time, plus a `canonical_entities` field on `Cluster`/`Story` from tiered
-identity resolution. Types sketched in `digest-thread-layer.md` §8; product §8.6–§8.7. All additive.)*
+identity resolution. Types sketched in `thread-layer.md` §8; product §8.6–§8.7. All additive.)*
 
 **Clusters are a recomputed batch artifact (materialization side); stories are the per-subscriber read-model, rebuilt at fire time from a snapshot of the cluster caches (projection side).**
 - `PublicBuild` recomputes **public** cluster rollups as public events arrive (shared, amortized; decoupled from generate).
@@ -567,7 +575,7 @@ installation token; Slack: bot token, or 12h access + single-use refresh if rota
   product). `now` is injected (§6 Reliability), never ambient.
 - **Per-subscriber linking** — connected-components over the candidate-cluster edge graph + the
   id-forwarding/`merged_into` rule (product §8.2). Pure over `(clusters, edges, prior assignment)`.
-- **Deferred — Thread layer & tiered identity** (`digest-thread-layer.md` §8): `Thread` +
+- **Deferred — Thread layer & tiered identity** (`thread-layer.md` §8): `Thread` +
   `ConfidenceBand { Confirmed, Probable, Uncertain }` + the `entity_edge` graph; the `thread_maintenance`
   job logic (identity resolution → community detection → id-forwarding → state/decay → weight
   projection) is pure over `(entity_edges, prior threads, feedback, now)` and reuses the §8.2
@@ -721,11 +729,19 @@ sources deferred.**
 
 ## 10. Open threads — what's left to design & scope
 
+> **As-built (2026-06-14):** items 1–3 and 5–6 below shipped with M1–M3 (the `core` modeling pass,
+> the connection/poll spec, the build + linking SQL, secrets-at-rest, and two-context RLS). The Thread
+> layer (item 14) has its first slice implemented (`thread-layer.md` §9). What remains is the
+> **M4–M6 backlog**: the config-table thresholds + reason-records-as-types (item 1 remainder, M4), the
+> read API + connect flow (item 7, M5), KPIs/eval harness (item 9), full observability wiring (item 11),
+> timezone/DST + prospective events (item 12), and data lifecycle/GDPR (item 13). The list is kept below
+> as the design backlog; treat the "in progress / next-up" framing as historical.
+
 Proposed sequence (next-up first):
 
-1. **`core` modeling pass** *(in progress)* — finalize `TokenProvider` + the `connect_pull`/`connect_push` factory shape; 
-   reason records as types; the pure selection function. (§5.5, §3A)
-2. **Connection/poll spec finalize** — `connection` DDL deltas, concrete backoff policy values,
+1. **`core` modeling pass** *(shipped; reason-records-as-types is the M4 remainder)* — `TokenProvider` +
+   the `connect_pull`/`connect_push` factory shape; the pure selection function. (§5.5, §3A)
+2. **Connection/poll spec finalize** *(shipped)* — `connection` DDL deltas, concrete backoff policy values,
    `PollConnection` as a written spec, the three sweep queries + `unique-jobs` keys. (§3)
 3. **Build + linking SQL** (product §15 open) — `PublicBuild`: group public events into `cluster`
    rows by `(scope, source, group_key)` + rollups. Per-subscriber linking: blocking-seeded candidate
@@ -760,7 +776,7 @@ Proposed sequence (next-up first):
     as a priority modulator + cached rollup. Re-adds without schema rework.
 13. **Data lifecycle/retention** — inline raw-payload horizon (`event.raw`, TOASTed; object-storage
     offload via `raw_ref` deferred), GDPR per-subscriber deletion cascading to `raw` + reasons.
-14. **Deferred — Thread layer & tiered identity** (sequences after linking/relevance; `digest-thread-layer.md`):
+14. **Deferred — Thread layer & tiered identity** (sequences after linking/relevance; `thread-layer.md`):
     the `thread`/`entity_edge` schema + the `thread_maintenance` job (community detection w/ LPA-vs-Louvain
     choice, id-forwarding, dormancy/decay, weight projection); the pure resolution + thread-formation
     functions (proptest determinism + id-stability, like linking); `ConfidenceBand` + the render contract;

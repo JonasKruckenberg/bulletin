@@ -1,4 +1,4 @@
-//! The persistence seam for the `entity_edge` identity graph (design `digest-thread-layer.md` §3, §8).
+//! The persistence seam for the `entity_edge` identity graph (design `docs/thread-layer.md` §3, §8).
 //!
 //! The graph holds both directions of the feedback channel as durable rows, so identity is
 //! reconstructible from the graph alone: a `must_link` is a positive row (confidence ≥ 0), a
