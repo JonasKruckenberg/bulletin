@@ -206,6 +206,11 @@ firehose*). Milliseconds; relaxed cadence; best-effort; coalescing. Never blocks
 > off the punctual path. A locally-hosted, all-Apache, no-egress model stack is viable on modest
 > hardware; see **`digest-local-ml-options.md`** for the mid-2026 serving stack (`llama-server` + TEI)
 > and per-task model picks. This keeps the §12 trust property: no private content ever leaves the box.
+> Per the **ground-truth-first doctrine** (`digest-local-ml-options.md` §0), this ML is *additive* over
+> the deterministic backbone above — exact-id resolution, structured co-occurrence, and rule-based
+> scoring do the grounding and pre-ranking; the models only fill the blind spots (semantic edges, fuzzy
+> identity, comprehension, summaries), confidence-banded and behind flags. Disable them and the layer
+> degrades to its deterministic baseline.
 
 ### 5.2 Projection (fire-time) changes
 

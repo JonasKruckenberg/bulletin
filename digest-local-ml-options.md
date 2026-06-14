@@ -14,6 +14,58 @@ with **no data egress** (the §12 trust property)?
 
 ---
 
+## 0. Governing principle — ground-truth-first; ML as a thin, constrained layer
+
+**The backbone is deterministic and traditional; ML is a thin augmentation "for smarts," kept cheap,
+constrained, and inspectable.** Bulletin's heavy lifting is done by methods that are exact, cheap, and
+explainable — ML is added *only* where those methods are structurally blind.
+
+- **Traditional methods ground, aggregate, and pre-rank.** Exact within-source grouping (§8.1),
+  structured cross-source linking on shared ids/URLs/entities (§8.2), authority-minted identity (the
+  §8.7 exact tier), and rule-based scoring — relevance/affinity, severity, recency decay, cross-source
+  **corroboration** (§8.3) — produce *strongly grounded, pre-ranked, aggregated* candidates with no
+  model in the loop.
+- **ML augments only the blind spots** — four narrow jobs where determinism can't reach: semantic
+  similarity (the "same meaning, no shared token" linking/identity bridge), fuzzy identity edges,
+  event-type/state comprehension, and short grounded summaries.
+- **ML never grounds, gates, or ranks alone.** Every model output is *one more signal* fed into the
+  deterministic, inspectable scorer — never the sole decider — and is constrained at every turn: small
+  models, grammar-constrained JSON, confidence-banded (§10.4), source-grounded, behind feature flags,
+  evaluated read-only via `digest-explain`.
+
+**Why this is the doctrine, not a compromise:** **cost** stays low (small models, off the hot path,
+cacheable, no cloud spend); **failure is bounded** (an ML miss degrades one signal — it can never
+corrupt the grounded backbone or cross a scope boundary); **trust is preserved** (deterministic +
+explainable core, §10.2/§12; ML uncertainty is *rendered*, not hidden, §10.4); and **everything stays
+swappable** (disable any model and the digest degrades gracefully to the deterministic baseline).
+
+### 0.1 The staged plan — how the "light ML" layers go on, one at a time
+
+Each phase is **additive over the deterministic backbone**, behind a config flag, and evaluated
+read-only via `digest-explain` before it touches a delivered digest. (This supersedes the earlier
+chat sketch of the "go all the way" sequence, refined by the principle above.)
+
+- **Phase 0 — Make the traditional backbone strong first (NO ML).** Deterministic grouping/linking,
+  exact-id identity, rule-based relevance/severity/recency/**corroboration** scoring, pre-ranking +
+  caps, and the **eval harness** over the feedback log (story precision / FP rate). Nothing below is
+  tunable without this. *This is the "strong ground data, pre-ranked and aggregated through traditional
+  means" that everything else leans on.*
+- **Phase 1 — Embeddings (the thinnest ML).** Sentence/cluster embeddings as an *additive*,
+  confidence-weighted edge source for §8.2 linking and §8.7 identity — the no-shared-token bridge —
+  never a hard merge. Cheapest, highest-leverage, privacy-critical; start here.
+- **Phase 2 — Extraction / comprehension (encoder + tiny constrained LLM).** GLiNER-class encoder for
+  entity spans + a small grammar-constrained LLM for event-type/state (detected→resolved), feeding
+  Story state and Thread deltas. Scratchpad-then-constrain to dodge the grammar tax (§6).
+- **Phase 3 — Reranking.** A cross-encoder *re-orders the already-pre-ranked* candidate set —
+  refinement on top of the deterministic ranker, never the sole ranker.
+- **Phase 4 — Grounded summarization.** A 4B constrained model writes headlines + "what changed"
+  deltas, extract-then-summarize over Phase-2 facts, with the §7 faithfulness guardrails.
+- **Phase 5 (later) — Learned ranking & prospective events.** Once eval + feedback data exist, let
+  ranking learn from engagement (design §14); add prospective/calendar sources (design §8.5). Both
+  remain augmentations over the grounded core.
+
+---
+
 ## 1. Verdict (TL;DR)
 
 1. **The box is the binding constraint, and worse on Linux than hoped.** A base M2 is
