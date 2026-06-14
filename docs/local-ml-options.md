@@ -1,14 +1,14 @@
 # Digest System — Local ML Options (mid-2026 research)
 
 **Status:** Research snapshot (14 June 2026). Verify fast-moving items before committing (§9).
-**Companion to:** `digest-thread-layer.md` (the ML described here runs inside `thread_maintenance`/build —
-write-side, best-effort, **off the punctual path**, §3.1 of `digest-system-design.md`).
+**Companion to:** `thread-layer.md` (the ML described here runs inside `thread_maintenance`/build —
+write-side, best-effort, **off the punctual path**, §3.1 of `system-design.md`).
 **Question answered:** what locally-hostable ML (mid-2026) can power Bulletin's comprehension /
 embedding / summarization, on a **Mac Mini M2 running NixOS**, as a **local sidecar** called from Rust,
 with **no data egress** (the §12 trust property)?
 
 > **Why local-only:** Bulletin ingests private Slack/GitHub/email content. LLM summarization is data
-> egress with consent/security implications (`digest-system-design.md` §12). Running ML locally keeps
+> egress with consent/security implications (`system-design.md` §12). Running ML locally keeps
 > the no-egress invariant intact — and an **all-Apache model stack** exists for every task, so there is
 > no licensing compromise either.
 

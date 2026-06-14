@@ -1,13 +1,14 @@
 # Bulletin — Implementation Roadmap
 
-**Status:** In progress — M1 completed (2026-06-13); M2 phases 1–5 implemented (2026-06-14)
+**Status:** In progress — **M1–M3 implemented** + the Thread layer & tiered identity landed on top of M3
+(all 2026-06-13/14). **M4 (relevance/trust), M5 (hardening), M6 (Slack & backlog) are pending.**
 **Last updated:** 2026-06-14
-**Reads against:** `digest-system-design.md` (product + data model), `digest-technical-architecture.md` (Rust runtime), `digest-data-sources.md` (source backlog).
+**Reads against:** `system-design.md` (product + data model), `technical-architecture.md` (Rust runtime), `data-sources.md` (source backlog).
 
 > **Note (2026-06-13):** the design docs were revised to the **read/write split** (CQRS) — decoupled
 > materialization (best-effort, durable) vs projection (per-subscriber, punctual), **freshness-scored
 > lookback** selection over the durable log (no exactly-once window), **coalescing** catch-up, and
-> **daily/weekly** recurrence at a local time (monthly dropped). See `digest-system-design.md` §3.0,
+> **daily/weekly** recurrence at a local time (monthly dropped). See `system-design.md` §3.0,
 > §9.2–§9.4. The milestone *sequencing* below is unchanged; the M1 tick may stay a simple chained
 > build→generate and decouple later — the architecture permits both since generate just reads the
 > latest materialized snapshot.
@@ -175,9 +176,9 @@ the product's reason to exist; it gets its own milestone because it is the highe
 > asymmetric-merge guard → stable-id forwarding — is property-tested for determinism + id-stability;
 > the `story` table, `cluster.entities` (GIN) blocking substrate, namespaced entity extraction
 > (`crates/core/src/common/entity.rs`), and a story-based selection/render path are wired into
-> `GenerateDigest`. See `M3-HANDOFF.md` for the full design + the seams left for M4. Docker was
-> unavailable in the build sandbox, so the DB-backed suites compiled (clippy `--all-targets`) but
-> did not run.
+> `GenerateDigest`. The linking design lives in `system-design.md` §8.2 and `technical-architecture.md`
+> §5.3; the seams left for M4 are tracked in M4 below. Docker was unavailable in the build sandbox, so
+> the DB-backed suites compiled (clippy `--all-targets`) but did not run.
 
 **Build** (design §8.2, tech §5.3)
 - **`story`** table (per-subscriber, `clusters` jsonb of `{cluster_id, link_reason}`, cached rollups,
@@ -278,14 +279,14 @@ data is already provably RLS-confined since M2.)
   **Hacker News** + the broad RSS layer, **package registries** filtered against the user's manifests.
 
 **Other deferred-by-design upgrades** (each schema-additive, with split-triggers in design §6):
-the **Thread layer & tiered identity** (`digest-thread-layer.md` — depends on M3 linking + M4 relevance;
+the **Thread layer & tiered identity** (`thread-layer.md` — depends on M3 linking + M4 relevance;
 its own phased plan; one new background job `thread_maintenance`, no fire-path cost), embedding/ANN
 linking, the shared public-story cache, teams/shared scopes, learned scoring, LLM summarization, the
 entropy/variety budget, engagement ("already dealt-with") suppression, event partitioning + normalized
 signal tables, object-storage raw offload, multi-channel delivery.
 
 > **Note (2026-06-14):** the design docs gained a deferred **Thread layer & tiered identity**
-> (`digest-thread-layer.md`; design §8.6–§8.7, §10.4) — the persistent per-subscriber `Thread` weave,
+> (`thread-layer.md`; design §8.6–§8.7, §10.4) — the persistent per-subscriber `Thread` weave,
 > probabilistic `entity_edge` identity, and confidence-as-rendered-signal. It sequences *after* M3/M4
 > (it builds on linking + relevance) and is itself phased (identity → threads-shadow → thread-weighted
 > relevance → assignment/render → thread feedback). Milestone sequencing M1–M6 is otherwise unchanged.
@@ -347,4 +348,4 @@ attaches to the milestone that surfaces them:
 - Crate-graph names & granularity → revisit end of **M2** once real dependencies exist.
 - Data lifecycle / GDPR delete cascade, KPI definitions + eval harness over the feedback log → **M5**.
 - Thread-layer & identity tuning (community detection, edge `θ`/confidence bands, dormancy/decay,
-  cold-start) → its own phased rollout **after M3/M4** (`digest-thread-layer.md` §9–§10).
+  cold-start) → its own phased rollout **after M3/M4** (`thread-layer.md` §9–§10).

@@ -1,10 +1,22 @@
 # Digest System — Architecture & Design
 
-**Status:** Draft
+**Status:** Living design doc — owns the *target* product design and data model. For what is actually
+built vs. pending, see `roadmap.md`.
 **Last updated:** 14 June 2026
 **Scope:** End-to-end design for v1 (purely scheduled digests), plus forward-compatible decisions that let later features slot in without rework.
 
-**Revision (14 June 2026) — the Thread layer & tiered identity.** A designed-for, deferred layer that turns the aggregator from a *stateless topical filter* into a *stateful model of the user*. The content graph gains a fourth phase — **`Thread`**: the persistent, per-subscriber weave that runs the full height of time (the Acme migration over months; the on-call rotation), of which a `Story` is one moment. Feeding it is a **tiered probabilistic identity** layer (authority-minted ids as the exact backbone; graded, revisable `entity_edge`s above), and **confidence becomes a first-class signal** that flows to rendering (real avatar vs question-mark) and back through feedback. It lands *after* per-subscriber linking and relevance (roadmap M3/M4); everything is schema-additive. Full design: **`digest-thread-layer.md`**. Touchpoints below: §1, §2, §6, §8.3–§8.4, §8.6–§8.7, §9.5, §10.3–§10.4, §11, §13.
+> **As-built reconciliation (2026-06-14).** This doc describes the full v1 *design*; the build is staged
+> by `roadmap.md`. Shipped so far: the canonical event + fingerprint dedup, the connector family,
+> deterministic grouping, two decoupled pipelines (materialization/projection), recurrence scheduling +
+> lookback selection, **per-subscriber linking** (§8.2), **two-context RLS** (§12) and
+> envelope-encrypted credentials at rest (§6) — and a first slice of the **Thread layer & tiered
+> identity** (§8.6–§8.7, below). Where this doc says "v1 source set = RSS + GitHub + **Slack**," that is
+> the design target: the build ships **RSS + GitHub** first (GitHub is the private-scope exemplar) and
+> **Slack is deferred to roadmap M6** — every mechanism Slack needs already exists. Relevance/trust
+> scoring (§8.3–§8.4, §10) is the next milestone (M4) and is not yet built.
+
+**Revision (14 June 2026) — the Thread layer & tiered identity.** A designed-for layer (first slice now
+implemented, see `thread-layer.md` §9) that turns the aggregator from a *stateless topical filter* into a *stateful model of the user*. The content graph gains a fourth phase — **`Thread`**: the persistent, per-subscriber weave that runs the full height of time (the Acme migration over months; the on-call rotation), of which a `Story` is one moment. Feeding it is a **tiered probabilistic identity** layer (authority-minted ids as the exact backbone; graded, revisable `entity_edge`s above), and **confidence becomes a first-class signal** that flows to rendering (real avatar vs question-mark) and back through feedback. It builds *on* per-subscriber linking (roadmap M3) and is fed thread-aware relevance as M4 lands; everything is schema-additive. Full design: **`thread-layer.md`**. Touchpoints below: §1, §2, §6, §8.3–§8.4, §8.6–§8.7, §9.5, §10.3–§10.4, §11, §13.
 
 **Revision (13 June 2026) — read/write split.** The runtime is reframed as two decoupled pipelines — **materialization** (write side; durable, best-effort) and **projection** (read side; per-subscriber, punctual) — communicating only through durable shared state (CQRS / materialized-view). This supersedes the earlier *chained* `public-build → generate` tick (§3.1) and the hard *window-partition* selection (§9.4): selection is now a **freshness-scored lookback** over a durable event log, "no loss" is a **durability** guarantee on that log rather than a property of window partitioning, and missed boundaries **coalesce** into one catch-up digest. Cadence is **daily/weekly** at a local time (monthly dropped). Stories are the **per-subscriber read-model** at the head of the projection side.
 
@@ -15,10 +27,10 @@
 The job is to *suppress noise and elevate the few things that matter* — in a way the user **trusts**. Two consequences shape the whole design:
 
 - **Draw connections across sources.** Surface things the user would have missed because the signal was split across GitHub, Slack, email, RSS, etc. with no obvious link between them.
-- **Weave events into the threads of a user's life.** Beyond one cross-source *happening*, the persistent things a life is made of — projects, roles, relationships — span *many* happenings over *time*. **`Thread`s** (§8.6) model these as durable, per-subscriber state, so relevance becomes "does this advance a thread you've invested in?" rather than "does this match a keyword?" — a designed-for, deferred layer (`digest-thread-layer.md`).
+- **Weave events into the threads of a user's life.** Beyond one cross-source *happening*, the persistent things a life is made of — projects, roles, relationships — span *many* happenings over *time*. **`Thread`s** (§8.6) model these as durable, per-subscriber state, so relevance becomes "does this advance a thread you've invested in?" rather than "does this match a keyword?" — a designed-for, deferred layer (`thread-layer.md`).
 - **Earn trust through transparency and control.** A filter that hides things is only useful if the user can see *why* a decision was made, drill into the data behind it, and correct it — *including its own uncertainty*: identity/link confidence is rendered (a guaranteed person vs a question mark, §10.4), and the rendered doubt is itself the correction affordance.
 
-**Method doctrine — ground-truth-first; ML is a thin, constrained layer.** The heavy lifting is deterministic and traditional: exact grouping (§8.1), structured linking on shared ids/URLs/entities (§8.2), authority-minted identity (§8.7), and rule-based pre-ranking (relevance, severity, recency, corroboration — §8.3) produce *strongly grounded, pre-ranked, aggregated* candidates with no model in the loop. ML is added **only** where determinism is blind (semantic similarity, fuzzy identity, comprehension, summarization), kept cheap, grammar-constrained, confidence-banded, and **off the hot path** — and it never grounds, gates, or ranks alone; each model output is one more signal into the inspectable deterministic scorer. Disable any model and the digest degrades to the deterministic baseline. Full doctrine + the staged "light ML" rollout: `digest-local-ml-options.md` §0.
+**Method doctrine — ground-truth-first; ML is a thin, constrained layer.** The heavy lifting is deterministic and traditional: exact grouping (§8.1), structured linking on shared ids/URLs/entities (§8.2), authority-minted identity (§8.7), and rule-based pre-ranking (relevance, severity, recency, corroboration — §8.3) produce *strongly grounded, pre-ranked, aggregated* candidates with no model in the loop. ML is added **only** where determinism is blind (semantic similarity, fuzzy identity, comprehension, summarization), kept cheap, grammar-constrained, confidence-banded, and **off the hot path** — and it never grounds, gates, or ranks alone; each model output is one more signal into the inspectable deterministic scorer. Disable any model and the digest degrades to the deterministic baseline. Full doctrine + the staged "light ML" rollout: `local-ml-options.md` §0.
 
 Everything in a **Digest** has cleared the same per-user **relevance** bar. Within that set, each item renders as either a **Story** (rich and expandable: many related events, or one substantive item like a followed author's new article) or a **Note** (compact: relevant but atomic — a followed library's release, an album drop). Story vs Note is about *how much material backs the item*, not how much it matters; a Note can outrank a Story in priority. Digests are delivered on a configurable recurrence — **daily or weekly at a chosen local time** (e.g. "weekly, Tuesdays at 17:00"), in the subscriber's timezone.
 
@@ -28,7 +40,7 @@ Everything in a **Digest** has cleared the same per-user **relevance** bar. With
 
 **v1 (this doc):**
 - Purely scheduled digests. No live/real-time feed.
-- Sources: RSS/podcasts, GitHub, plus **Slack** as the one private source — to exercise both visibility scopes and the signal→hydrate path.
+- Sources: RSS/podcasts, GitHub, plus **Slack** as the one private source — to exercise both visibility scopes and the signal→hydrate path. *(As built: RSS + GitHub ship first; GitHub's private repos are the private-scope exemplar. Slack is deferred to roadmap M6 — see the reconciliation note at the top.)*
 - Single delivery channel (email, as notification + authenticated deep-link).
 - Deterministic grouping (global for public, per-subscriber for private) + **structured, per-subscriber** cross-source linking (shared entity / shared link / temporal). Embedding-based semantic linking is an additive upgrade, not v1.
 - Relevance-led scoring (gate + priority) with hand-tuned floor/thresholds. `confidence` and `velocity` are **deferred** (every v1 source is deterministic and retrospective, so both would be near-constant).
@@ -44,7 +56,7 @@ Everything in a **Digest** has cleared the same per-user **relevance** bar. With
 - Gmail / email (cost — the `gmail.readonly` restricted scope requires annual Google verification + a CASA security assessment, commonly $15k–$75k/yr; **Slack is the v1 private source instead** — see §7 matrix).
 - Forward-looking (prospective) events — calendar, delivery ETAs, later ML-predicted patterns. **Deferred including the model support** (future-valued `event_time`, the signed-gap salience curve, `confidence`); v1 events are all retrospective and the priority time-term is plain recency decay (§8.5). Forward-compatible: re-add without schema rework.
 - A **shared public-story cache** — v1 derives every story per-subscriber (§4, §6); memoizing pure-public stories across subscribers is the scale optimization (split-trigger: per-subscriber linking cost / embeddings).
-- **The Thread layer & tiered identity** (`digest-thread-layer.md`) — the persistent per-subscriber `Thread` weave (§8.6), the probabilistic `entity_edge` identity graph (§8.7), and confidence-as-rendered-signal (§10.4). **Designed-for, deferred** to *after* linking + relevance (roadmap M3/M4); schema-additive, one new background job (`thread_maintenance`) off the punctual path. v1 entities stay freeform `Vec<String>` matched exactly; v1 relevance is flat per-entity affinity with no thread memory.
+- **The Thread layer & tiered identity** (`thread-layer.md`) — the persistent per-subscriber `Thread` weave (§8.6), the probabilistic `entity_edge` identity graph (§8.7), and confidence-as-rendered-signal (§10.4). **Designed-for, deferred** to *after* linking + relevance (roadmap M3/M4); schema-additive, one new background job (`thread_maintenance`) off the punctual path. v1 entities stay freeform `Vec<String>` matched exactly; v1 relevance is flat per-entity affinity with no thread memory.
 - Scale-only persistence (event partitioning, dedup gate, normalized blocking signals, normalized `story_cluster` membership, multi-channel delivery table) — see split-triggers in §6.
 
 ---
@@ -54,7 +66,7 @@ Everything in a **Digest** has cleared the same per-user **relevance** bar. With
 Three logical layers:
 
 - **Ingress** — interfaces with every source (push + pull), normalizes everything into a canonical event.
-- **Aggregation** — dedupes, groups, links, scores, and selects events into stories/notes. *(Deferred extension: weaves stories into persistent per-subscriber `Thread`s — §8.6 / `digest-thread-layer.md`.)*
+- **Aggregation** — dedupes, groups, links, scores, and selects events into stories/notes. *(Deferred extension: weaves stories into persistent per-subscriber `Thread`s — §8.6 / `thread-layer.md`.)*
 - **Generation** — produces and delivers per-subscriber digests on schedule.
 
 ```
@@ -188,7 +200,7 @@ Eight domain tables in three groups, plus the library-provided work queue:
 - **`subscriber`** — `kind`, delivery prefs (**recurrence**: `freq` daily|weekly, `at_time` local time-of-day, `timezone`, `on_weekday` for weekly; `max_stories`, `max_notes`, channels, quiet hours), plus `filters` jsonb (sources, mutes, keywords) and `affinity` jsonb (relevance weights, updated by feedback).
 - **`connection`** — a linked source: owning `subscriber_id`, `source_type`, `creds_ref` (KMS reference, **not** the secret), `config`, poll `cursor`, `status`. Declares whether its events are public or private.
 
-**Shared content graph** (3 phases: dedup → group → aggregate; append-only, only upward FKs). *(Deferred 4th phase: per-subscriber `Thread`s weave stories across time — adds `thread` + `entity_edge` tables, `canonical_entities` on `cluster`/`story`, and `story.thread_id`; all additive, see `digest-thread-layer.md` §8.)*
+**Shared content graph** (3 phases: dedup → group → aggregate; append-only, only upward FKs). *(Deferred 4th phase: per-subscriber `Thread`s weave stories across time — adds `thread` + `entity_edge` tables, `canonical_entities` on `cluster`/`story`, and `story.thread_id`; all additive, see `thread-layer.md` §8.)*
 - **`event`** — canonical event (§5). `UNIQUE(fingerprint)` for dedup. Unpartitioned in v1.
 - **`cluster`** — a within-source group: events sharing `(scope, source, group_key)` (one PR, one Slack thread). **Public clusters are shared** (materialization side; rebuilt as public events arrive, decoupled from generate); **private clusters are per-subscriber**. Carries a build-maintained rollup (`event_count`, `max_severity`, `content_depth`, `entities`). Membership is by `group_key` — no per-event pointer. Carries **no `story_id`** (a public cluster belongs to many subscribers' stories).
 - **`story`** — the **per-subscriber** cross-source aggregation a digest references: a set of linked clusters, **owned by one subscriber** (`subscriber_id`). Holds members as `clusters` jsonb (`[{cluster_id, link_reason}]`) plus **cached signals** (`event_count`, `source_diversity`, `content_depth`, `max_severity`, `entities`). Stable `id`; `merged_into` forwards a retro-merged story to its survivor (§8.2).
@@ -385,7 +397,7 @@ v1 events are all **retrospective** (`event_time ≤ ingest_time`). The model is
 - **`confidence`** (§8.3) carries a prospective item's certainty (calendar high, ETA medium, ML low). An ML predictor is then just another connector emitting prospective, low-confidence events.
 - **Recurrence (RRULE)** expands lazily inside the lookahead horizon against the subscriber's wall clock (DST-correct; technical architecture doc §13).
 
-### 8.6 Threads — the persistent weave  *(DESIGNED — deferred; full design in `digest-thread-layer.md`)*
+### 8.6 Threads — the persistent weave  *(DESIGNED — deferred; full design in `thread-layer.md`)*
 
 A **`Thread`** is the fourth phase of the content graph (`Event → Cluster → Story → Thread`): the persistent, per-subscriber weave that runs the *full height of time*, of which a `Story` is one moment. It is what turns the aggregator from a stateless topical filter into a **stateful model of the user** — the projects, roles, and relationships a life is made of, each spanning many stories over weeks and months.
 
@@ -527,7 +539,7 @@ Hotspots, by risk:
 - Two-context row-level security + KMS-backed credential storage + SSRF-guarded fetching.
 
 **Defer (designed-for, with split-triggers in §6):**
-- **The Thread layer & tiered identity** (`digest-thread-layer.md`) — per-subscriber `Thread`s (§8.6) + the probabilistic `entity_edge` identity graph (§8.7) + confidence-as-rendered-signal (§10.4). Lands after linking + relevance (M3/M4); one new background job (`thread_maintenance`), no fire-path cost (§11).
+- **The Thread layer & tiered identity** (`thread-layer.md`) — per-subscriber `Thread`s (§8.6) + the probabilistic `entity_edge` identity graph (§8.7) + confidence-as-rendered-signal (§10.4). Lands after linking + relevance (M3/M4); one new background job (`thread_maintenance`), no fire-path cost (§11).
 - `confidence` + forward-looking/prospective events (future-valued `event_time`, signed-gap salience curve) + `velocity`.
 - Embedding/ANN semantic linking (`vector` column + HNSW) — also an additive `entity_edge` source for identity (§8.7).
 - **Shared public-story cache** — memoize pure-public stories across subscribers (promote the shareable slice of projection into materialization — §3.0).
@@ -587,4 +599,4 @@ Engagement is a *private-scope* feature.
 - Initial weight/threshold values and the eval harness that uses the feedback log.
 - Email rendering: how much content in the body vs behind the authenticated link.
 - The B→A trigger: at what per-subscriber-linking cost (or when embeddings land) to add the shared public-story cache.
-- **Thread layer & tiered identity** (`digest-thread-layer.md` §10): community-detection choice (LPA vs Louvain) + the story→thread overlap `k`; per-edge-source `θ` and the confidence-band thresholds; dormancy/archive horizons + affinity decay; single-primary `thread_id` vs a `story_thread` join; cold-start bootstrap; the visible-doubt budget per digest; where the shared public co-occurrence baseline is amortized.
+- **Thread layer & tiered identity** (`thread-layer.md` §10): community-detection choice (LPA vs Louvain) + the story→thread overlap `k`; per-edge-source `θ` and the confidence-band thresholds; dormancy/archive horizons + affinity decay; single-primary `thread_id` vs a `story_thread` join; cold-start bootstrap; the visible-doubt budget per digest; where the shared public co-occurrence baseline is amortized.

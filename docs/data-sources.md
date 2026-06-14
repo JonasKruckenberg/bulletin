@@ -2,12 +2,12 @@
 
 **Status:** Research backlog — not committed scope.
 **Last updated:** 2026-06-08
-**Companion to:** `digest-system-design.md` (product + data model) and
-`digest-technical-architecture.md` (Rust runtime). Those docs own v1 scope
-(**RSS + GitHub + Slack**, with Notion / Gmail / Bluesky / Mastodon / Twitter-X
-already triaged). **This** doc is the long list of *everything else we could add
-later*, evaluated against the same source model so each one drops into the
-existing `Source` trait without rework.
+**Companion to:** `system-design.md` (product + data model) and
+`technical-architecture.md` (Rust runtime). Those docs own v1 scope (designed as
+**RSS + GitHub + Slack**; as built, **RSS + GitHub** ship first and **Slack is deferred to roadmap
+M6** — with Notion / Gmail / Bluesky / Mastodon / Twitter-X already triaged). **This** doc is the long
+list of *everything else we could add later*, evaluated against the same source model so each one drops
+into the existing connector trait family without rework.
 
 > **API specifics below are a 2026-06 research snapshot — re-verify before building any
 > connector.** Pricing, scopes, and rate limits move constantly (several sources
@@ -148,7 +148,7 @@ newsletter. Proton/iCloud have no usable cloud API.
 
 | Source | Push | Pull | Auth/cost gate | Scope | group_key | Linking entities | Engagement | Notes |
 |---|---|---|---|---|---|---|---|---|
-| **Slack** (already v1) | Events API / Socket Mode | `conversations.history/.replies` (cursor) | user token; **non-Marketplace apps tightened Mar 2026**; history cut to 15/call | both (user token sees the real person) | channel+`thread_ts` | channels, users, files, URLs, reactions | read: `last_read`; acted: reactions, replies | Best-in-class personal signal |
+| **Slack** (designed v1; deferred to M6) | Events API / Socket Mode | `conversations.history/.replies` (cursor) | user token; **non-Marketplace apps tightened Mar 2026**; history cut to 15/call | both (user token sees the real person) | channel+`thread_ts` | channels, users, files, URLs, reactions | read: `last_read`; acted: reactions, replies | Best-in-class personal signal |
 | **Matrix** | `/sync` long-poll (`since` cursor) | `/sync` + `/messages` | access token; **open/self-hostable, no vendor gate** | personal (all joined rooms) | room + `m.thread` | room, mxid, URL, media | **native `m.receipt` receipts** + reactions | Cleanest open protocol; E2EE decryption is the gotcha |
 | **Zulip** | event queue + `/events` long-poll | `GET /messages` anchor | API key (user key = personal view); self-hostable | both | stream + **topic** | stream, topic, user, URL | **per-msg `read` flag** + reactions | Topic = free thread `group_key`; explicit read state |
 | **MS Teams (Graph)** | change notifications (**data inline**) | `/getAllMessages` (`@odata.nextLink`) | Azure AD; **export APIs unmetered since Aug 2025**; delegated token = real chats | both | chat/channel id | team, channel, chat, user, URL | no clean read marker; reactions/replies | Much cheaper post-2025; notification delays reported |
@@ -378,7 +378,7 @@ A few things this research surfaced that affect the *core* design, not just the 
 5. **The generic-webhook envelope is itself a mini canonical-event contract.** Designing it
    well (§9) is essentially extending the `Event` model to untrusted external callers —
    same scope-assignment and SSRF/auth concerns as any connector (§12 of the design doc).
-6. **Source-native ids are the backbone of tiered identity** (`digest-thread-layer.md` §3 /
+6. **Source-native ids are the backbone of tiered identity** (`thread-layer.md` §3 /
    design §8.7). Most sources mint authoritative, exact identifiers for people/orgs/objects —
    GitHub node ids, Slack `U…`/`C…` ids, email addresses, DOIs, CVE ids — which form the
    `confidence = 1.0` tier of the resolver and, crucially, **carry their own avatars** (the

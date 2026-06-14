@@ -1,4 +1,45 @@
-## Data Flow
+# Bulletin
+
+**Bulletin is a self-hosted digest engine: it ingests your sources (RSS today, your GitHub repos
+including private ones), suppresses the noise, draws the connections you'd have missed, and emails you
+a scheduled digest of the few things that actually matter.** The product thesis is *suppress noise,
+elevate the few things that matter, earn trust*; the architecture thesis is *a Postgres-orchestrated
+scheduled batch pipeline, not a service mesh*.
+
+It runs as one Rust binary (`bulletin <serve|worker|migrate|all|debug>`) over a single PostgreSQL 18
+database, deployed via a Nix flake with a NixOS module.
+
+## Status
+
+Built and running: the end-to-end pipeline (**M1**), GitHub + webhooks + private scope + two-context
+RLS + envelope-encrypted credentials (**M2**), per-subscriber cross-source linking (**M3**), and a
+first slice of the **Thread layer & tiered identity** (additive, shadow-safe, behind the
+`thread-weighting` cargo feature). Sources today are **RSS + GitHub**.
+
+Pending: relevance/trust scoring + feedback (**M4**), production hardening — OAuth connect flow,
+managed-KMS, SSRF guard, timezone/DST, the web frontend (**M5**), and Slack + the broader source
+backlog (**M6**). See [`docs/roadmap.md`](docs/roadmap.md) for the full milestone plan and current
+state.
+
+## Documentation
+
+The design and reference docs live in [`docs/`](docs/) — start at [`docs/README.md`](docs/README.md)
+for the index and reading order. In brief:
+
+| Doc | What it owns |
+|---|---|
+| [`docs/system-design.md`](docs/system-design.md) | Product thesis, data model, the full target design |
+| [`docs/technical-architecture.md`](docs/technical-architecture.md) | The Rust runtime, topology, and cross-cutting mechanisms |
+| [`docs/roadmap.md`](docs/roadmap.md) | Milestone sequencing M1–M6 and what's built |
+| [`docs/thread-layer.md`](docs/thread-layer.md) | The persistent Thread layer & tiered identity |
+| [`docs/data-sources.md`](docs/data-sources.md) | The source backlog (everything beyond v1) |
+| [`docs/local-ml-options.md`](docs/local-ml-options.md) | Locally-hostable ML for the deferred ML layer |
+| [`docs/web-frontend.md`](docs/web-frontend.md) | The web surface scoping (M5) |
+| [`docs/github-events.md`](docs/github-events.md) | GitHub webhook/event surface reference |
+
+The rest of this README is the operator's guide: the concepts, then deployment.
+
+## Data flow
 
 ### `Scope`
 
@@ -51,7 +92,7 @@ Note are small but highly relevant. They represent events that do not warrant a 
 
 Notes are rendered in a compact format with one or two sentences max.
 
-## `Thread` *(first slice implemented — see `digest-thread-layer.md`)*
+## `Thread` *(first slice implemented — see [`docs/thread-layer.md`](docs/thread-layer.md))*
 
 Where a `Story` weaves sources together at one *moment*, a `Thread` weaves *stories together across
 time*: the persistent threads of a user's life (a project running for months, an on-call rotation, a

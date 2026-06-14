@@ -1,9 +1,9 @@
 # Bulletin — Web Frontend Scope
 
 **Status:** Scoping / design only (no code) — 2026-06-13
-**Reads against:** `digest-system-design.md` (§10 transparency & control, §9 scheduling, §3A auth),
-`digest-technical-architecture.md` (§3 roles, §3A connect/verify, §5.3 data model, §10.7 read API),
-`IMPLEMENTATION-ROADMAP.md` (M2 current, M5 = read API + connect flow + deep-link view).
+**Reads against:** `system-design.md` (§10 transparency & control, §9 scheduling, §3A auth),
+`technical-architecture.md` (§3 roles, §3A connect/verify, §5.3 data model, §10.7 read API),
+`roadmap.md` (M2 current, M5 = read API + connect flow + deep-link view).
 
 > **Why this doc, when the design track said "frontend is out of scope" (tech §1).** It still is, as a
 > *rendering* track — this doc does not design pixels. It scopes the **web surface as a product and

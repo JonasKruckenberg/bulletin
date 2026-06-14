@@ -1,5 +1,5 @@
 //! Tiered, probabilistic entity-identity resolution for the Thread layer (design
-//! `digest-thread-layer.md` §3).
+//! `docs/thread-layer.md` §3).
 //!
 //! M3 gives every event **namespaced exact tokens** (`repo:`/`user:`/`url:`/`cve:`/`domain:`,
 //! `common::entity`) — exact *by construction*, the certain backbone. This module adds the **graded,

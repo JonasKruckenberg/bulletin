@@ -1,16 +1,18 @@
 # Digest System — The Thread Layer & Tiered Identity
 
-**Status:** Draft (design conversation, 14 June 2026)
-**Companion to:** `digest-system-design.md` (§4 scopes, §6 data model, §8 aggregation, §9–§10),
-`digest-technical-architecture.md` (§2 topology, §5 type modeling).
+**Status:** Design doc — **first slice implemented (2026-06-14)** on top of M3 linking; see the §9
+implementation-status note for exactly what landed vs. what's still deferred.
+**Companion to:** `system-design.md` (§4 scopes, §6 data model, §8 aggregation, §9–§10),
+`technical-architecture.md` (§2 topology, §5 type modeling).
 **What it owns:** the extension that turns the aggregator from a *stateless topical filter* into a
 *stateful model of the user* — **Threads** (the persistent threads of a user's life), the **tiered
 probabilistic identity** layer that feeds them, and **confidence as a first-class signal** that flows
 all the way to rendering and back through feedback.
 
-This is a **designed-for, deferred** layer: it lands *after* per-subscriber linking (roadmap M3) and
-relevance/trust (M4), and every piece below is schema-additive with split-triggers, in the same spirit
-as the embedding / shared-public-story-cache deferrals.
+This layer **builds on** per-subscriber linking (roadmap M3, shipped) and is fed by relevance/trust as
+M4 lands. Its first slice is implemented and **shadow-safe** (inert until `thread_maintenance` runs;
+fire-time consumption behind the `thread-weighting` cargo feature). Every piece below is schema-additive
+with split-triggers, in the same spirit as the embedding / shared-public-story-cache deferrals.
 
 ---
 
@@ -204,9 +206,9 @@ firehose*). Milliseconds; relaxed cadence; best-effort; coalescing. Never blocks
 > no-shared-token linking/identity bridge), reranking, entity/state extraction, and Story/Thread-delta
 > summarization — runs **here, inside `thread_maintenance`/build**, exactly because it is write-side and
 > off the punctual path. A locally-hosted, all-Apache, no-egress model stack is viable on modest
-> hardware; see **`digest-local-ml-options.md`** for the mid-2026 serving stack (`llama-server` + TEI)
+> hardware; see **`local-ml-options.md`** for the mid-2026 serving stack (`llama-server` + TEI)
 > and per-task model picks. This keeps the §12 trust property: no private content ever leaves the box.
-> Per the **ground-truth-first doctrine** (`digest-local-ml-options.md` §0), this ML is *additive* over
+> Per the **ground-truth-first doctrine** (`local-ml-options.md` §0), this ML is *additive* over
 > the deterministic backbone above — exact-id resolution, structured co-occurrence, and rule-based
 > scoring do the grounding and pre-ranking; the models only fill the blind spots (semantic edges, fuzzy
 > identity, comprehension, summaries), confidence-banded and behind flags. Disable them and the layer

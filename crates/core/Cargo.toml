@@ -7,7 +7,7 @@ publish = false
 [features]
 default = ["thread-weighting"]
 # The compile-time kill switch for the Thread layer's *consumption* on the digest hot path: the
-# relevance term and fire-time thread-assignment (digest-thread-layer.md §5.2). Build with
+# relevance term and fire-time thread-assignment (docs/thread-layer.md §5.2). Build with
 # `--no-default-features` to take that path off the build entirely; the deterministic recency digest
 # is unaffected. (The `thread_maintenance` write side is harmless either way.)
 thread-weighting = []

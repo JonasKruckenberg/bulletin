@@ -1,4 +1,4 @@
-//! Integration coverage for the Thread layer & tiered identity (`digest-thread-layer.md`) against a
+//! Integration coverage for the Thread layer & tiered identity (`docs/thread-layer.md`) against a
 //! real Postgres, post-M3: that `thread_maintenance` turns a subscriber's stories into threads and a
 //! projected entity-weight map, that fire-time thread-assignment finds the right thread, and that
 //! must/cannot-link feedback materializes into the identity graph. The pure algorithms (resolve,
