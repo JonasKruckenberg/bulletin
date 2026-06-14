@@ -289,7 +289,7 @@ fn print_explain(rows: &[digest::ExplainRow]) {
         return;
     }
 
-    let (mut selected, mut over_cap) = (0, 0);
+    let (mut selected, mut over_cap, mut dropped) = (0, 0, 0);
     for r in rows {
         let (verdict, slot) = match r.verdict {
             Verdict::Selected { position } => {
@@ -300,16 +300,26 @@ fn print_explain(rows: &[digest::ExplainRow]) {
                 over_cap += 1;
                 ("OVER_CAP", format!("rank={rank}"))
             }
+            Verdict::Dropped { cause } => {
+                dropped += 1;
+                ("DROPPED", format!("{cause:?}"))
+            }
         };
         let (source, title) = match &r.item {
             Some(item) => (item.source.as_str(), item.title.as_str()),
             None => ("?", "<empty story>"),
         };
+        // The M4 scoring outcome (design §10.2): format · richness · relevance · priority.
+        let reason = &r.reason;
         println!(
-            "{verdict}\t{slot}\t{}\t{}\t{}\t{}",
+            "{verdict}\t{slot}\t{}\t{}\t{}\t[{} {} rel={:.2} pri={:.3}]\t{}",
             r.last_event_time.format("%Y-%m-%dT%H:%M:%SZ"),
             source,
             r.story_id,
+            reason.format.as_str(),
+            reason.richness,
+            reason.relevance,
+            reason.priority,
             title,
         );
         for conn in r.item.iter().flat_map(|i| i.connections.iter()) {
@@ -321,7 +331,7 @@ fn print_explain(rows: &[digest::ExplainRow]) {
             );
         }
     }
-    println!("\n{selected} selected · {over_cap} over cap");
+    println!("\n{selected} selected · {over_cap} over cap · {dropped} dropped");
 }
 
 /// Renders the `status` dashboard: each subsystem on its own line(s). The watchpoints to scan are

@@ -2,12 +2,32 @@ use std::collections::HashMap;
 
 use crate::common::db::{begin_scope, ScopeCtx};
 use crate::common::kind::SourceKind;
-use crate::digest::select::{DecisionRecord, ItemReason};
+use crate::digest::select::{DecisionRecord, ItemReason, ScoringConfig};
 use crate::identity::ConfidenceBand;
 use crate::link::ClusterRef;
 use chrono::{DateTime, Utc};
 use sqlx::{postgres::PgRow, PgConnection, PgPool, Row};
 use uuid::Uuid;
+
+/// Loads the global scoring config (the singleton `digest_config` row). The table carries no
+/// per-subscriber data, so (like `build_watermark`) it is un-RLS'd and readable in any context.
+pub async fn load_config(pool: &PgPool) -> Result<ScoringConfig, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT relevance_floor, scope_bonus, severity_weight, recency_half_life_days,
+                story_cap, note_cap
+         FROM digest_config WHERE id = true",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(ScoringConfig {
+        relevance_floor: row.get::<f64, _>("relevance_floor") as f32,
+        scope_bonus: row.get::<f64, _>("scope_bonus") as f32,
+        severity_weight: row.get::<f64, _>("severity_weight") as f32,
+        recency_half_life_days: row.get("recency_half_life_days"),
+        story_cap: row.get::<i32, _>("story_cap") as usize,
+        note_cap: row.get::<i32, _>("note_cap") as usize,
+    })
+}
 
 pub struct DigestRow {
     pub id: Uuid,

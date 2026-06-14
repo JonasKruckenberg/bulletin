@@ -6,7 +6,7 @@
 use bulletin_core::cluster::store::{
     advance_build_watermark, build_bounds, dirty_groups, list_group_events, upsert_cluster,
 };
-use bulletin_core::digest::select::{select, Candidate, Verdict};
+use bulletin_core::digest::select::{select, Candidate, Format, ScoringConfig, Verdict};
 use bulletin_core::digest::store::{create_with_items, mark_delivered, render_items};
 use bulletin_core::digest::subscriber::{
     advance_after_delivery, due_subscribers, insert_subscriber, load_subscriber,
@@ -23,7 +23,7 @@ use bulletin_core::{
     connect,
     event::EventBuilder,
     grant_runtime_role,
-    kind::SourceKind,
+    kind::{ContentKind, SourceKind},
     migrate,
     scope::Scope,
     ScopeCtx, RUNTIME_ROLE,
@@ -84,6 +84,28 @@ async fn insert_public(pool: &PgPool, stable_id: &str, group_key: &str, title: &
         group_key,
     )
     .links(vec![format!("https://example.com/{stable_id}")])
+    .finalize(None);
+    insert_event(pool, &ev).await.unwrap();
+}
+
+/// Inserts a public event with an explicit `content_kind` (the depth signal richness reads).
+async fn insert_public_kind(
+    pool: &PgPool,
+    stable_id: &str,
+    group_key: &str,
+    title: &str,
+    secs: i64,
+    kind: ContentKind,
+) {
+    let ev = EventBuilder::new(
+        SourceKind::Rss,
+        stable_id,
+        Utc.timestamp_opt(secs, 0).single().unwrap(),
+        title,
+        group_key,
+    )
+    .links(vec![format!("https://example.com/{stable_id}")])
+    .content_kind(kind)
     .finalize(None);
     insert_event(pool, &ev).await.unwrap();
 }
@@ -153,7 +175,12 @@ async fn select_stories(
         .iter()
         .map(|s| Candidate::new(s.id, s.last_event_time, Vec::new()))
         .collect();
-    select(candidates, max_items)
+    let cfg = ScoringConfig {
+        story_cap: max_items,
+        note_cap: max_items,
+        ..Default::default()
+    };
+    select(candidates, &cfg, Utc::now())
         .into_iter()
         .filter(|d| matches!(d.verdict, Verdict::Selected { .. }))
         .map(|d| d.id)
@@ -196,7 +223,12 @@ async fn build_groups_events_into_clusters() {
         .iter()
         .map(|s| Candidate::new(s.id, s.last_event_time, Vec::new()))
         .collect();
-    let selected = select(cands, 2)
+    // Three longform singletons → all Story format; a story_cap of 2 selects the freshest two.
+    let cfg = ScoringConfig {
+        story_cap: 2,
+        ..Default::default()
+    };
+    let selected = select(cands, &cfg, Utc::now())
         .into_iter()
         .filter(|d| matches!(d.verdict, Verdict::Selected { .. }))
         .count();
@@ -1063,4 +1095,69 @@ async fn advance_coalesces_missed_boundaries() {
     );
     assert!(sub.next_run_at <= Utc::now() + Duration::days(1));
     assert_eq!(local_run_time(&pool, id, "UTC").await, nine_am());
+}
+
+// M4 scoring & selection (design §8.3–§8.4): richness classifies a longform article as a Story and a
+// thin announcement as a Note; the relevance gate keeps both (default floor 0), priority orders them,
+// and the per-format caps apply. A pure store-level check over a real candidate set, mirroring the
+// digest flow's `select` call.
+#[tokio::test]
+async fn scoring_classifies_story_and_note() {
+    let (pool, _pg) = setup().await;
+    let sub = insert_subscriber(&pool, "s@x.com", None, Recurrence::Daily, "UTC", nine_am())
+        .await
+        .unwrap();
+
+    // A longform article (→ Story) and a thin announcement (→ Note): distinct groups + urls, so they
+    // stay two singleton stories (no linking).
+    insert_public_kind(
+        &pool,
+        "long",
+        "long",
+        "A deep dive",
+        200,
+        ContentKind::Longform,
+    )
+    .await;
+    insert_public_kind(
+        &pool,
+        "ann",
+        "ann",
+        "v2.0 released",
+        100,
+        ContentKind::Announcement,
+    )
+    .await;
+    build_all(&pool).await;
+
+    let clusters = candidate_clusters(&pool, sub, None, 30).await.unwrap();
+    let assignment = link(&clusters, &[], Uuid::now_v7);
+    // Mirror the digest flow's candidate construction (its rollups drive richness).
+    let cands: Vec<Candidate> = assignment
+        .stories
+        .iter()
+        .map(|s| Candidate {
+            id: s.id,
+            last_event_time: s.last_event_time,
+            entities: Vec::new(),
+            relevance: 0.0,
+            event_count: s.event_count,
+            source_diversity: s.source_diversity,
+            content_depth: s.content_depth,
+            max_severity: s.max_severity,
+            has_private: s.has_private,
+        })
+        .collect();
+    let decisions = select(cands, &ScoringConfig::default(), Utc::now());
+
+    let sel_fmt = |f: Format| {
+        decisions
+            .iter()
+            .filter(|d| matches!(d.verdict, Verdict::Selected { .. }) && d.format == f)
+            .count()
+    };
+    assert_eq!(sel_fmt(Format::Story), 1, "the longform article is a Story");
+    assert_eq!(sel_fmt(Format::Note), 1, "the announcement is a Note");
+    // Every candidate carries a structured richness phrase (the reason record's "why this format").
+    assert!(decisions.iter().all(|d| !d.richness.is_empty()));
 }

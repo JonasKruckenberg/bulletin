@@ -79,14 +79,18 @@ pub async fn upsert_cluster(
     let row = sqlx::query(
         "INSERT INTO cluster
             (scope_kind, scope_subscriber_id, source, group_key, title, link,
-             first_event_time, last_event_time, entities, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
+             first_event_time, last_event_time, entities,
+             event_count, content_depth, max_severity, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
          ON CONFLICT ON CONSTRAINT cluster_identity DO UPDATE SET
             title = EXCLUDED.title,
             link = EXCLUDED.link,
             first_event_time = EXCLUDED.first_event_time,
             last_event_time = EXCLUDED.last_event_time,
             entities = EXCLUDED.entities,
+            event_count = EXCLUDED.event_count,
+            content_depth = EXCLUDED.content_depth,
+            max_severity = EXCLUDED.max_severity,
             updated_at = now()
          RETURNING id",
     )
@@ -99,6 +103,9 @@ pub async fn upsert_cluster(
     .bind(r.first_event_time)
     .bind(r.last_event_time)
     .bind(&r.entities)
+    .bind(r.event_count)
+    .bind(r.content_depth)
+    .bind(r.max_severity)
     .fetch_one(executor)
     .await?;
     Ok(row.get("id"))

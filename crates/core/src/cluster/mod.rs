@@ -12,13 +12,15 @@ use uuid::Uuid;
 use crate::common::{
     db::{begin_scope, ScopeCtx},
     event::Event,
-    kind::SourceKind,
+    kind::{ContentKind, SourceKind},
     scope::Scope,
 };
 
 /// The recomputed rollup the build upserts onto a cluster row: the latest event's title/link, the
-/// group's recency span, and the union of its events' `entities` — the blocking substrate M3 linking
-/// runs on (§8.2). Richer rollups (counts, severity, depth) re-add in M4, when scoring consumes them.
+/// group's recency span, the union of its events' `entities` (the blocking substrate M3 linking runs
+/// on, §8.2), and the M4 scoring signals — `event_count` + `content_depth` (richness) and
+/// `max_severity` (priority). All folded from the same group scan, so the richer signals are free
+/// (design §8.3, M3-handoff seam #1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterRollup {
     /// Representative title — the latest event's title.
@@ -31,6 +33,12 @@ pub struct ClusterRollup {
     pub last_event_time: DateTime<Utc>,
     /// Sorted, de-duplicated union of the group's event entities — the linking blocking key.
     pub entities: Vec<String>,
+    /// Number of events folded into this cluster — the breadth half of richness (design §8.3).
+    pub event_count: i32,
+    /// Max `content_kind` over the group (`Message < Announcement < Longform`) — the depth signal.
+    pub content_depth: ContentKind,
+    /// Max source-provided `severity_hint` over the group, or `None` — a priority boost input.
+    pub max_severity: Option<i16>,
 }
 
 /// Pure rollup: fold a within-source group of events into a cluster rollup. The representative
@@ -40,12 +48,18 @@ pub fn rollup(events: &[Event]) -> Option<ClusterRollup> {
     let mut representative = events.first()?;
     let mut first = representative.event_time;
     let mut entities: Vec<String> = Vec::new();
+    // Depth is the max content_kind; the conservative floor is the lowest variant (Message), lifted
+    // by every event. Severity is the max over the events that carried a hint (None if none did).
+    let mut content_depth = ContentKind::Message;
+    let mut max_severity: Option<i16> = None;
     for ev in events {
         if ev.event_time >= representative.event_time {
             representative = ev;
         }
         first = first.min(ev.event_time);
         entities.extend(ev.entities.iter().cloned());
+        content_depth = content_depth.max(ev.content_kind);
+        max_severity = max_severity.max(ev.severity_hint);
     }
     entities.sort();
     entities.dedup();
@@ -55,6 +69,9 @@ pub fn rollup(events: &[Event]) -> Option<ClusterRollup> {
         first_event_time: first,
         last_event_time: representative.event_time,
         entities,
+        event_count: events.len() as i32,
+        content_depth,
+        max_severity,
     })
 }
 
@@ -280,6 +297,23 @@ mod tests {
     #[test]
     fn empty_group_has_no_cluster() {
         assert!(rollup(&[]).is_none());
+    }
+
+    #[test]
+    fn rollup_folds_scoring_signals() {
+        // event_count = group size; content_depth = max content_kind; max_severity = max over hints.
+        let mut a = ev(100, "a");
+        a.content_kind = ContentKind::Message;
+        a.severity_hint = Some(2);
+        let mut b = ev(200, "b");
+        b.content_kind = ContentKind::Longform; // the depth ceiling
+        let mut c = ev(150, "c");
+        c.content_kind = ContentKind::Announcement;
+        c.severity_hint = Some(5); // the severity ceiling
+        let r = rollup(&[a, b, c]).unwrap();
+        assert_eq!(r.event_count, 3);
+        assert_eq!(r.content_depth, ContentKind::Longform);
+        assert_eq!(r.max_severity, Some(5));
     }
 
     #[test]

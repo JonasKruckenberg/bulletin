@@ -20,8 +20,8 @@ use uuid::Uuid;
 use crate::common::db::{with_scope, ScopeCtx};
 use crate::digest::select::{select, Candidate, Decision, DecisionRecord, ItemReason, Verdict};
 use crate::digest::store::{
-    build_render_item, cluster_cards, create_with_items, mark_delivered, record_decisions,
-    render_items, render_items_for_stories, RenderItem,
+    build_render_item, cluster_cards, create_with_items, load_config, mark_delivered,
+    record_decisions, render_items, render_items_for_stories, RenderItem,
 };
 use crate::digest::subscriber::{load_subscriber, SubscriberRow};
 use crate::link::{self, LinkedStory};
@@ -114,12 +114,26 @@ async fn link_and_select(
     let mut candidates: Vec<Candidate> = assignment
         .stories
         .iter()
-        .map(|s| Candidate::new(s.id, s.last_event_time, story_entities[&s.id].clone()))
+        .map(|s| Candidate {
+            id: s.id,
+            last_event_time: s.last_event_time,
+            entities: story_entities[&s.id].clone(),
+            relevance: 0.0,
+            event_count: s.event_count,
+            source_diversity: s.source_diversity,
+            content_depth: s.content_depth,
+            max_severity: s.max_severity,
+            has_private: s.has_private,
+        })
         .collect();
     // Add the Thread relevance term before ranking (compiled out when the feature is off; a no-op
-    // until thread_maintenance has projected weights).
+    // until thread_maintenance has projected weights) — it folds into the M4 relevance score.
     apply_weighting(pool, sub.id, &mut candidates).await?;
-    let decisions = select(candidates, sub.max_items as usize);
+    // M4 scoring + selection (design §8.4): relevance gates, richness classifies Story/Note, priority
+    // (relevance + severity, recency-decayed) orders + per-format caps. `now` is read-time so the
+    // decay reflects when the digest fires; config is the global `digest_config` row.
+    let cfg = load_config(pool).await.context("load scoring config")?;
+    let decisions = select(candidates, &cfg, Utc::now());
     Ok((assignment.stories, decisions, story_entities))
 }
 
@@ -209,11 +223,15 @@ async fn assign_threads(
 #[cfg(not(feature = "thread-weighting"))]
 async fn assign_threads(_: &PgPool, _: Uuid, _: Uuid, _: &[Uuid], _: &HashMap<Uuid, Vec<String>>) {}
 
-/// One candidate's `ItemReason` — the Thread relevance term + the entity spine it scored on.
+/// One candidate's `ItemReason` — the M4 scoring outcome (relevance, format + the richness phrase that
+/// chose it, priority) plus the entity spine it scored on (design §10.2).
 fn reason_of(d: &Decision, story_entities: &HashMap<Uuid, Vec<String>>) -> ItemReason {
     ItemReason {
         relevance: d.relevance,
         entities: story_entities.get(&d.id).cloned().unwrap_or_default(),
+        format: d.format,
+        richness: d.richness.clone(),
+        priority: d.priority,
     }
 }
 
@@ -312,7 +330,7 @@ pub async fn generate(
     // rank the stories by recency. The story is the unit the digest freezes and renders (§8.2).
     let (_, decisions, story_entities) =
         link_and_select(pool, &sub, sub.last_run_at, CONTEXT_HORIZON_DAYS, true).await?;
-    log_selection(sub.id, sub.max_items as usize, &decisions);
+    log_selection(sub.id, &decisions);
     let selected = selected_ids(&decisions);
 
     let digest = create_with_items(pool, sub.id, window_end, &selected)
@@ -414,7 +432,7 @@ pub async fn dispatch_now(
     // cache, schedule, or de-dup history.
     let (stories, decisions, story_entities) =
         link_and_select(pool, &sub, None, lookback_days, false).await?;
-    log_selection(sub.id, sub.max_items as usize, &decisions);
+    log_selection(sub.id, &decisions);
     let selected = selected_ids(&decisions);
 
     // Reassemble the selected stories (in render order) from the in-memory assignment, rendering
@@ -463,20 +481,23 @@ pub async fn dispatch_now(
 /// Emits the selection audit trail: a one-line summary at INFO, then a per-candidate line at
 /// DEBUG (`RUST_LOG=bulletin=debug`) so "why is this cluster in/out of the digest?" is answerable
 /// from the worker logs. Mirrors `debug digest-explain` (which dry-runs it).
-fn log_selection(subscriber_id: Uuid, cap: usize, decisions: &[Decision]) {
+fn log_selection(subscriber_id: Uuid, decisions: &[Decision]) {
     let count = |f: fn(&Verdict) -> bool| decisions.iter().filter(|d| f(&d.verdict)).count();
     tracing::info!(
         %subscriber_id,
         candidates = decisions.len(),
         selected = count(|v| matches!(v, Verdict::Selected { .. })),
         over_cap = count(|v| matches!(v, Verdict::OverCap { .. })),
-        cap,
+        dropped = count(|v| matches!(v, Verdict::Dropped { .. })),
         "selection complete"
     );
     for d in decisions {
         tracing::debug!(
             story_id = %d.id,
             last_event_time = %d.last_event_time,
+            format = d.format.as_str(),
+            relevance = d.relevance,
+            priority = d.priority,
             verdict = ?d.verdict,
             "selection decision"
         );
@@ -490,6 +511,8 @@ pub struct ExplainRow {
     pub verdict: Verdict,
     pub story_id: Uuid,
     pub last_event_time: DateTime<Utc>,
+    /// The structured scoring rationale (design §10.2) — present even for a dropped/empty story.
+    pub reason: ItemReason,
     pub item: Option<RenderItem>,
 }
 
@@ -525,13 +548,10 @@ pub async fn explain(pool: &PgPool, subscriber_id: Uuid) -> Result<Vec<ExplainRo
     Ok(decisions
         .into_iter()
         .map(|d| {
-            let reason = ItemReason {
-                relevance: d.relevance,
-                entities: story_entities.get(&d.id).cloned().unwrap_or_default(),
-            };
+            let reason = reason_of(&d, &story_entities);
             let item = by_id.get(&d.id).and_then(|s| {
                 build_render_item(&s.clusters, &cards).map(|mut item| {
-                    item.reason = reason;
+                    item.reason = reason.clone();
                     item
                 })
             });
@@ -539,6 +559,7 @@ pub async fn explain(pool: &PgPool, subscriber_id: Uuid) -> Result<Vec<ExplainRo
                 verdict: d.verdict,
                 story_id: d.id,
                 last_event_time: d.last_event_time,
+                reason,
                 item,
             }
         })
