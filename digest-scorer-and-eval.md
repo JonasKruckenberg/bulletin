@@ -45,11 +45,13 @@ same "verdict for every candidate" contract, same purity/`now`-injection. It onl
 reason record and the eval harness fall out for free). M1's recency-only behaviour stays reachable
 as the degenerate config (§3.6) — a golden-equivalence test pins it.
 
-**What is M1-shaped and stays:** `select` is pure, `now` is injected, the candidate set comes from
-the freshness-scored lookback (`candidates_in_lookback`), and selection is *frozen* into the digest
-on first run (idempotent re-run reads the frozen view).
+**What is M1-shaped and stays:** `select` is pure and deterministic, the candidate set comes from the
+freshness-scored lookback (`candidates_in_lookback`), and selection is *frozen* into the digest on
+first run (idempotent re-run reads the frozen view). The clock is already captured (not ambient) in
+`digest::mod` (`snapshot_at`); the scorer threads that instant into the pure function as `now` (today's
+recency-sort doesn't take one — the scorer's recency term is the first use of an injected `now` here).
 
-**What this spec needs that M1 doesn't have yet** (dependencies, §6):
+**What this spec needs that M1 doesn't have yet** (dependencies, §7):
 - **Cluster/Story rollups** — `event_count`, `max_severity`, `content_depth`, `entities`
   (tech §5.3; the `cluster` table is bare today). Severity & corroboration read these.
 - **Per-subscriber relevance inputs** — `subscriber.affinity` (entity weights) + `subscriber.filters`
@@ -119,12 +121,15 @@ relevance =
 the floor to mean "subscribed but must earn its way in via affinity" (the warmed-up posture). The
 eval harness (§5) is exactly how you choose between these.
 
-> **Deferred — the Thread term** (system-design §8.6, `digest-thread-layer.md`): relevance also sums
-> the precomputed weight of the active **threads** a story advances — the rescue for the
-> missed-because-split case (a story whose pieces each fall below the floor still clears it by
-> advancing a thread you've invested in). It re-adds as **one more additive term in the `clamp01`
-> above**, fed from a cached per-story thread-weight — no structural change. Seam: keep relevance an
-> additive sum so the term slots in.
+> **Deferred — the Thread term** (system-design §8.6; `digest-thread-layer.md` §5.2/§6): the
+> missed-because-split rescue is **not a new term** — `thread_maintenance` *projects* each active
+> thread's affinity down onto its canonical entities and folds the result into the very `affinity`
+> map this sum already reads ("the fire-time relevance input … lives in `subscriber.affinity` as an
+> `entity_weight` map"). So the entity-affinity sum above *becomes* the thread term once those weights
+> encode thread membership — a story whose pieces each fall below the floor clears it by advancing a
+> thread you've invested in. Two seams to honour now (§9): keep relevance an **additive sum over an
+> opaque `entity → weight` map** (projected thread weights drop in with no formula change), and read
+> entities through a field that can later resolve to `canonical_entities`.
 
 ### 2.2 Severity — a priority **boost** (global; never gates)
 
@@ -153,7 +158,9 @@ recency = 0.5 ^ ( age_seconds / recency_half_life_seconds )      // exponential,
 
 Exponential half-life (config `recency_half_life`, e.g. 36 h for daily, scaled for weekly) — smooth,
 bounded, monotone-decreasing in age, and **deterministic because `now` is injected** (so it is
-replayable in the harness and testable to the second). System-design §8.5 notes this is the
+replayable in the harness and testable to the second). `age` is clamped at 0, so a clock-skewed
+future stamp can't push `recency > 1`; genuine future-valued events are the deferred salience case.
+System-design §8.5 notes this is the
 *retrospective* special case of a future-general `salience(Δ)` curve; the signed-gap generalization
 (prospective events) is deferred and re-adds as a swap of this one term — keep recency a single
 pluggable function of one time delta.
@@ -177,9 +184,11 @@ corroboration = 1 - 1 / (1 + corr_k * (source_diversity - 1))      // ∈ [0, 1)
 > corroboration term forward** as one of the four ground-truth pre-ranking signals — the framing of
 > the method-doctrine line (§1, line 21: "rule-based pre-ranking — relevance, severity, recency,
 > corroboration"). It is cheap, model-free, and reads an already-cached rollup (`source_diversity`),
-> so there is no reason to gate it behind Threads. It is *defined* now and *inert* until M3 linking
-> gives `source_diversity > 1`. (The Threads-era **reactivation/novelty** term, §8.6, stays deferred
-> — that one genuinely needs Thread state.)
+> so there is no reason to gate it behind Threads. It is *defined* now and switches on the moment M3
+> linking gives `source_diversity > 1` (before M4, so it is live, not inert, when this scorer ships).
+> (The Threads-era **reactivation/novelty** term, §8.6, stays deferred — that one genuinely needs
+> Thread state. Because corroboration is pulled forward here, the Thread rollout adds *only*
+> reactivation/novelty — see §9 for the no-double-count rule.)
 
 ## 3. Combination, gate, and the selection pipeline
 
@@ -225,21 +234,25 @@ Exactly system-design §8.4, with the scorer feeding step 2:
 ### 3.3 Types (extends `digest/select.rs`)
 
 ```rust
-/// Precomputed, per-candidate features the scorer is pure over. Sourced from the cluster/story
-/// rollups (severity, corroboration, recency) + the subscriber's affinity/filters (relevance).
-/// Story-shaped; an M1 cluster is the degenerate one-source story (source_diversity = 1).
+/// Per-candidate features the scorer is pure over: the cluster/story rollups plus the *raw* relevance
+/// inputs (source/entities/scope). ALL subscription/mute/affinity logic lives in the scorer — a
+/// Candidate is just facts about the item, never a pre-judged relevance. Story-shaped; an M1 cluster
+/// is the degenerate one-source story (source_diversity = 1).
 pub struct Candidate {
     pub id:               Uuid,                 // cluster_id (M1) / story_id (M3)
+    pub source:           SourceKind,           // subscription / mute matching
     pub last_event_time:  DateTime<Utc>,
     pub max_severity:     Option<i16>,
     pub source_diversity: i16,                  // = 1 for a bare cluster
     pub event_count:      i32,
     pub content_depth:    ContentKind,
-    pub entities:         Vec<String>,
-    pub scope_is_own:     bool,                 // candidate is this subscriber's own private content
-    pub source_subscribed: bool,               // subscription hard-filter input
-    pub muted:            bool,                 // any mute hit (source/entity/keyword)
+    pub entities:         Vec<String>,          // affinity + mute matching (→ canonical_entities, §9)
+    pub title:            Option<String>,       // keyword matching
+    pub scope_is_own:     bool,                 // own private content → scope bonus
 }
+
+pub type Affinity = HashMap<String, f64>;       // entity → weight (subscriber.affinity; thread-projected later, §9)
+// Filters { sources, mutes, keywords } from subscriber.filters — the hard subscription/mute inputs.
 
 /// The four signals + derived priority + format — the reason record, computed once, serialized free.
 pub struct Signals {
@@ -263,17 +276,24 @@ pub enum DropReason {
     Unsubscribed,
 }
 
-/// Pure: features in, fully-explained decisions out. `now` injected; no I/O.
+pub struct Decision { pub id: Uuid, pub verdict: Verdict }   // signals / drop-reason live inside the Verdict
+
+/// Pure: features in, fully-explained decisions out. ALL four signals computed here; `now` injected;
+/// no I/O. The in-place generalization of M1's `select`.
 pub fn score_and_select(
     candidates: Vec<Candidate>,
-    affinity:   &Affinity,        // entity -> weight, from subscriber.affinity
+    filters:    &Filters,         // hard: subscription match, mutes, keywords (subscriber.filters)
+    affinity:   &Affinity,        // soft: entity weights (subscriber.affinity)
     config:     &ScoringConfig,   // weights/floor/half-life/caps (§3.5)
-    now:        DateTime<Utc>,
-) -> Vec<Decision>;               // Decision { id, signals?/drop, verdict } — verdict for EVERY candidate
+    now:        DateTime<Utc>,    // the fire instant — frozen as digest.scored_at for faithful replay (§5)
+) -> Vec<Decision>;               // a Verdict for EVERY candidate
 ```
 
 `score_and_select` is the in-place generalization of today's `select`; `digest::mod` keeps the
-`Selected` ids and freezes `Signals` into `digest_item.reasons`.
+`Selected` ids, freezes `Signals` into `digest_item.reasons`, and records the injected `now` as
+`digest.scored_at` (§5.3). Keeping subscription/mute/affinity *inside* the pure function (rather than
+pre-judging relevance into the `Candidate`) is what lets the harness replay a different `filters`/
+`affinity`/`config` faithfully — there is exactly one place relevance is decided.
 
 ### 3.4 Reason records — free, and load-bearing for eval
 
@@ -333,7 +353,7 @@ all exist:
 | + severity rollup | severity boost switches on |
 | + affinity/filters (M4) | relevance gates & ranks; mutes/subscriptions apply |
 | + cross-source stories (M3) | `source_diversity > 1` ⇒ corroboration switches on |
-| + Threads (deferred) | relevance Thread term + reactivation/novelty re-add as terms |
+| + Threads (deferred) | thread weights fold into `affinity` (relevance, *via projection* — no new term); reactivation/novelty add as one boost; confidence becomes a per-entity multiplier (§9) |
 
 Each rung is a config/feature change, **not** a rewrite of `score_and_select`.
 
@@ -479,12 +499,19 @@ so you tune `relevance_floor` / weights / half-life and *see the precision/FP tr
 
 ```
 for each historical digest D in the eval window:
-    features  = load_frozen_candidate_features(D)        // §5.3 — the features AS AT fire time
-    decisions = score_and_select(features, D.affinity_snapshot, candidate_config, D.window_end)
-    labels    = join_feedback_to(D's targets)            // §4.2
+    features  = load_frozen_candidate_features(D)                       // §5.3 — features AS AT fire time
+    decisions = score_and_select(features, D.filters_snapshot,
+                                 D.affinity_snapshot, candidate_config,
+                                 D.scored_at)                           // the *exact* injected now (§5.3)
+    labels    = join_feedback_to(D's targets)                          // §4.2
     accumulate(decisions ⋈ labels)
 report EvalReport { precision, fp_rate, drop_regret, agg_error, coverage, confusion, deltas-vs-actual }
 ```
+
+Replay must use the **frozen `scored_at`** (the `now` the live scorer was handed), not `window_end` —
+recency decays over `now − last_event_time`, so a different instant would silently change the ranking
+and the counterfactual-identity test (below) would never hold. `scored_at` ≈ the fire boundary but is
+the *actual* instant captured at selection, so it is the only faithful clock.
 
 Because `score_and_select` is **the same pure function** the live path runs, replay is *faithful* —
 no separate "eval model" to drift from production. The harness can sweep a grid of configs and report
@@ -503,7 +530,7 @@ over-cap candidates too**, *as they were at fire time* (clusters get recomputed 
 the one that fired).
 
 So the harness requires freezing, per digest, the `Candidate` features + `Verdict` for the **whole
-candidate set** (selected + over-cap + dropped), plus the **affinity snapshot** used:
+candidate set** (selected + over-cap + dropped), plus the **inputs** the scorer was run with:
 
 ```
 digest_candidate(
@@ -513,13 +540,20 @@ digest_candidate(
   verdict        jsonb      -- Selected{pos,signals} | OverCap{rank,signals} | Dropped{reason}
   primary key (digest_id, candidate_id)
 )
--- + digest.affinity_snapshot jsonb : the Affinity used for this fire
+-- on the digest row, the rest of the pure scorer's inputs as at fire time:
+--   digest.scored_at         timestamptz  -- the injected `now` (recency clock — §5.2)
+--   digest.affinity_snapshot jsonb        -- the Affinity used
+--   digest.filters_snapshot  jsonb        -- the Filters used (subscription/mutes/keywords)
+--   digest.config_id / config_snapshot    -- the ScoringConfig that actually fired
 ```
+
+Together these are the *complete* argument list of `score_and_select` (§3.3) frozen at fire time —
+which is precisely what makes a faithful counterfactual possible: change one argument, hold the rest.
 
 Notes:
 - **It is the reason record, persisted for the full candidate set** — `digest_item.reasons` is the
   selected-subset of exactly this. So the marginal cost is the dropped/over-cap rows, bounded by the
-  lookback candidate count (small — tens, per §11). Optionally **sample** drops (keep all
+  lookback candidate count (small — tens, per system-design §11). Optionally **sample** drops (keep all
   selected/over-cap + the top-K near-miss drops) if volume bites; the counterfactual is then exact
   for re-ranking and approximate only for deep-floor recoveries — state that in the report.
 - **Privacy/retention** (system-design §12, tech §13): this table holds `entities`/titles ⇒ it is
@@ -539,15 +573,15 @@ Same architecture discipline as the scorer:
 // PURE core — fixture-testable, deterministic, no DB:
 pub struct LabeledDigest { /* frozen candidates + verdicts + the feedback labels joined in */ }
 pub struct EvalReport {
-    pub precision: f64, pub fp_rate: f64, pub drop_regret: u64,
-    pub aggregation_error_rate: f64, pub label_coverage: f64,
+    pub precision: Option<f64>, pub fp_rate: Option<f64>,   // None when no labels — never a divide-by-zero 1.0
+    pub drop_regret: u64, pub aggregation_error_rate: Option<f64>, pub label_coverage: f64,
     pub confusion: Confusion, pub per_subscriber: Vec<(Uuid, EvalReport)>,
     pub n_labeled: u64, pub n_delivered: u64,
 }
 pub fn evaluate(digests: &[LabeledDigest]) -> EvalReport;                       // Mode A math
-pub fn evaluate_counterfactual(digests: &[LabeledDigest], cfg: &ScoringConfig,
-                               now_of: impl Fn(&LabeledDigest)->DateTime<Utc>)  // Mode B (re-runs score_and_select)
-    -> EvalReport;
+pub fn evaluate_counterfactual(digests: &[LabeledDigest], cfg: &ScoringConfig)  // Mode B: re-runs score_and_select
+    -> EvalReport;                                                              // per-digest scored_at/filters/affinity
+                                                                               // come frozen in each LabeledDigest (§5.3)
 
 // I/O shell (the bulletin binary):
 pub async fn run(pool, window, config: Option<ScoringConfig>, subscriber: Option<Uuid>) -> Result<EvalReport>;
@@ -622,3 +656,54 @@ that resolves them empirically rather than by argument:
 - Whether to fold **engagement** (open/click) into the label model as additional positive signal —
   re-adds as more `feedback.kind`s, no schema change (§4.2).
 - Drop sampling vs full freeze for `digest_candidate` (§5.3) — decided by measured row volume.
+
+---
+
+## 9. Plays-nice-with-the-Thread-redesign  *(deferred — `digest-thread-layer.md`)*
+
+The Thread layer + tiered identity (system-design §8.6–§8.7; full design `digest-thread-layer.md`)
+sequences *after* this scorer — it builds on M4 relevance and is itself phased (identity →
+thread-weighted relevance → assignment/salience/render → thread feedback). This spec is written so
+**every Thread touchpoint is a schema-additive drop-in, never a rewrite of `score_and_select`**. The
+contracts that guarantee that, point by point:
+
+- **Relevance is projection, not a new term.** Thread weighting works by `thread_maintenance`
+  *distributing* each active thread's affinity across its canonical entities into the **same**
+  `subscriber.affinity` map the scorer already sums (`digest-thread-layer.md` §5.2/§6). So the
+  entity-affinity sum (§2.1) *becomes* the missed-because-split rescue once the weights encode thread
+  membership — the formula is unchanged. **Do not add a second relevance term**, or thread weight is
+  counted twice. (This is why §2.1/§3.3 insist relevance is an additive sum over an *opaque* weight
+  map.)
+- **Entity input resolves in place.** v1 reads raw `entities`; the identity layer writes
+  `cluster.canonical_entities` / `story.canonical_entities` at build time (`digest-thread-layer.md`
+  §4/§8). `Candidate.entities` (affinity + mute matching) switches to the resolved field with no logic
+  change — "`entities`" is just *whichever identity field is populated*.
+- **Corroboration is already live — Threads add only reactivation/novelty.** `digest-thread-layer.md`
+  §5.2 lists *two* new priority terms for its Phase 3 (corroboration + reactivation/novelty). Because
+  this spec pulls **corroboration forward** (§2.4), the Thread rollout must add **only
+  reactivation/novelty** — re-adding corroboration double-counts `source_diversity`. Both are boosts
+  in the §3.1 envelope, which is an extensible sum by design:
+  `priority = relevance · (1 + w_sev·sev + w_corr·corr  [+ w_react·reactivation]) · recency`.
+- **The thread-diversity cap drops into the cap step** (§3.2 step 5) as an in-memory bound
+  (stories-per-thread ≈ ≤2) over already-selected items — no change to scoring or to the pure
+  function's signature.
+- **Confidence attenuates, never gates** (`digest-thread-layer.md` §5.3/§147; system-design §8.3/§10.4
+  — all deferred). A soft identity edge (confidence < 1) must *weight and render from the same
+  number*. Seam: the entity-affinity term generalizes to `Σ confidence(e) · weight(e)`, and
+  `Signals` / the reason record (§3.4) is forward-compatible with the
+  `{ …, confidence_band, … }` render contract — it is that same reason record reshaped. Every v1 edge
+  is `confidence = 1.0`, so the multiplier is a no-op until identity resolution lands.
+- **The eval harness already carries thread feedback.** `feedback.target_type` includes `'thread'`
+  (§4.1) and the label model (§4.2) attributes a target's feedback to the items that surfaced it — a
+  thread target attributes through `digest_item.thread_id` (`digest-thread-layer.md` §8). No harness
+  change; the KPIs (§4.3) just gain a thread slice.
+- **`affinity` may promote to a table without touching the scorer.** `digest-thread-layer.md` §6's
+  split-trigger moves the `entity_weight` map to `relevance_weight(subscriber_id, canonical_id,
+  weight)`. The scorer is pure over the `Affinity` *abstraction* (a lookup), so this is a loader-only
+  change — and the harness's frozen `affinity_snapshot` (§5.3) is whatever shape that loader returns.
+
+**Net:** the Thread redesign requires **no new term and no signature change** in the scorer
+(relevance arrives via projection; corroboration is already present), only (a) reactivation/novelty as
+one more boost, (b) a field-name resolution for entities, and (c) a confidence multiplier that is a
+no-op until identity edges exist — and the eval harness needs **nothing**. The one thing this spec
+must *not* do, and doesn't, is bake thread weight in as a separate additive relevance term.
