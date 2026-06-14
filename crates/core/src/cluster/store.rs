@@ -78,12 +78,15 @@ pub async fn upsert_cluster(
     let (scope_kind, scope_subscriber_id) = scope.to_columns();
     let row = sqlx::query(
         "INSERT INTO cluster
-            (scope_kind, scope_subscriber_id, source, group_key, title, link, last_event_time, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+            (scope_kind, scope_subscriber_id, source, group_key, title, link,
+             first_event_time, last_event_time, entities, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
          ON CONFLICT ON CONSTRAINT cluster_identity DO UPDATE SET
             title = EXCLUDED.title,
             link = EXCLUDED.link,
+            first_event_time = EXCLUDED.first_event_time,
             last_event_time = EXCLUDED.last_event_time,
+            entities = EXCLUDED.entities,
             updated_at = now()
          RETURNING id",
     )
@@ -93,7 +96,9 @@ pub async fn upsert_cluster(
     .bind(group_key)
     .bind(&r.title)
     .bind(r.link.as_deref())
+    .bind(r.first_event_time)
     .bind(r.last_event_time)
+    .bind(&r.entities)
     .fetch_one(executor)
     .await?;
     Ok(row.get("id"))

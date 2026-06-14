@@ -256,14 +256,15 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> R
     Ok(())
 }
 
-/// Renders a `digest-explain` dry-run: one tab-separated row per candidate (verdict, position or
-/// recency rank, time, source, title), then a one-line tally. Read top-down to see where the cap
-/// fell.
+/// Renders a `digest-explain` dry-run: one tab-separated row per candidate **story** (verdict,
+/// position or recency rank, time, representative source + title), and — indented beneath a fused
+/// story — each connected cluster with the `link_reason` for why it joined (the M3 cross-source
+/// value). Closes with a one-line tally. Read top-down to see where the cap fell.
 fn print_explain(rows: &[digest::ExplainRow]) {
     use bulletin_core::digest::select::Verdict;
 
     if rows.is_empty() {
-        println!("no candidate clusters in this subscriber's lookback");
+        println!("no candidate stories in this subscriber's lookback");
         return;
     }
 
@@ -279,13 +280,25 @@ fn print_explain(rows: &[digest::ExplainRow]) {
                 ("OVER_CAP", format!("rank={rank}"))
             }
         };
+        let (source, title) = match &r.item {
+            Some(item) => (item.source.as_str(), item.title.as_str()),
+            None => ("?", "<empty story>"),
+        };
         println!(
             "{verdict}\t{slot}\t{}\t{}\t{}\t{}",
             r.last_event_time.format("%Y-%m-%dT%H:%M:%SZ"),
-            r.source.map(|s| s.as_str()).unwrap_or("?"),
-            r.cluster_id,
-            r.title.as_deref().unwrap_or("<missing cluster>"),
+            source,
+            r.story_id,
+            title,
         );
+        for conn in r.item.iter().flat_map(|i| i.connections.iter()) {
+            println!(
+                "    ↳ [{}] {} — {}",
+                conn.source.as_str(),
+                conn.title,
+                conn.link_reason.as_deref().unwrap_or("linked"),
+            );
+        }
     }
     println!("\n{selected} selected · {over_cap} over cap");
 }

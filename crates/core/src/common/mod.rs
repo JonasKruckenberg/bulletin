@@ -3,6 +3,7 @@
 //! `common`; `common` depends on no flow.
 
 pub mod db;
+pub mod entity;
 pub mod event;
 pub mod fingerprint;
 pub mod kind;

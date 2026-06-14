@@ -96,7 +96,14 @@ fn to_events_maps_fields_correctly() {
     assert_eq!(ev.body, None);
     assert_eq!(ev.links, vec!["https://example.com/post-1"]);
     assert_eq!(ev.group_key, "https://example.com/post-1");
-    assert_eq!(ev.entities, Vec::<String>::new());
+    // RSS supplies no structural entities; `finalize` derives `url:`/`domain:` from the link.
+    assert_eq!(
+        ev.entities,
+        vec![
+            "domain:example.com".to_string(),
+            "url:https://example.com/post-1".to_string(),
+        ]
+    );
     assert_eq!(ev.scope, Scope::Public);
 }
 

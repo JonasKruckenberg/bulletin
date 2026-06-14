@@ -165,10 +165,19 @@ passes. Your GitHub App key is never stored or logged in plaintext.
 
 ---
 
-### M3 — The headline feature: per-subscriber linking
+### M3 — The headline feature: per-subscriber linking — ✅ Implemented (2026-06-14)
 
 *Goal:* a story fuses clusters **across sources** — the "connections you would have missed." This is
 the product's reason to exist; it gets its own milestone because it is the highest-complexity piece.
+
+> **Status:** Implemented 2026-06-14 (branch `claude/m3-milestone-work-bw39id`). The pure linking
+> core (`crates/core/src/link/`) — blocking → edge scoring → connected-components with the
+> asymmetric-merge guard → stable-id forwarding — is property-tested for determinism + id-stability;
+> the `story` table, `cluster.entities` (GIN) blocking substrate, namespaced entity extraction
+> (`crates/core/src/common/entity.rs`), and a story-based selection/render path are wired into
+> `GenerateDigest`. See `M3-HANDOFF.md` for the full design + the seams left for M4. Docker was
+> unavailable in the build sandbox, so the DB-backed suites compiled (clippy `--all-targets`) but
+> did not run.
 
 **Build** (design §8.2, tech §5.3)
 - **`story`** table (per-subscriber, `clusters` jsonb of `{cluster_id, link_reason}`, cached rollups,

@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
 use crate::common::kind::SourceKind;
-use crate::digest::select::Candidate;
+use crate::link::ClusterRef;
 use chrono::{DateTime, Utc};
-use sqlx::{postgres::PgRow, PgExecutor, PgPool, Row};
+use sqlx::{postgres::PgRow, PgPool, Row};
 use uuid::Uuid;
 
 pub struct DigestRow {
@@ -23,100 +23,106 @@ fn row_to_digest(row: PgRow) -> Result<DigestRow, sqlx::Error> {
     })
 }
 
-/// One rendered row of a digest: a selected cluster's representative fields, in position order.
+/// One rendered row of a digest: a selected **story**, in position order. The headline is its
+/// representative (the latest member cluster); `connections` are the *other* clusters fused into it —
+/// the M3 cross-source value, each with the `link_reason` for why it belongs (design §8.2/§10.2).
+/// A singleton story has no connections and renders exactly like a pre-M3 cluster item.
 pub struct RenderItem {
     pub title: String,
     pub link: Option<String>,
     pub source: SourceKind,
     pub last_event_time: DateTime<Utc>,
+    pub connections: Vec<Connection>,
 }
 
-/// Maps a `(title, link, source, last_event_time)` row to a [`RenderItem`] — shared by the frozen
-/// (`render_items`) and ad-hoc (`render_items_for_clusters`) render paths so they can't drift.
-fn map_render_item(row: &PgRow) -> Result<RenderItem, sqlx::Error> {
-    Ok(RenderItem {
-        title: row.get("title"),
-        link: row.get("link"),
-        source: row.try_get("source")?,
-        last_event_time: row.get("last_event_time"),
-    })
-}
-
-/// The digest's candidate set for `subscriber_id`: clusters in their **scope** — `public ∪
-/// own-private` — built/updated since the **consideration floor** `min(last_run, now −
-/// horizon_days)`. A freshness-scored lookback, not a window partition. The floor always reaches
-/// back to the last delivery (so nothing since then is missed, even a backdated event, since the
-/// bound is on `cluster.updated_at` = ingest/build recency) and pulls in older context up to the
-/// horizon. Ordered newest-first; the pure `select()` applies the cap. A cluster may legitimately
-/// appear in consecutive digests (design §9.4). `last_run = None` ⇒ floor is just `now −
-/// horizon_days`.
-///
-/// The `scope_kind = 'public' OR scope_subscriber_id = $1` predicate is the **isolation boundary**:
-/// a subscriber's candidates are only ever public clusters or their own private ones — never another
-/// subscriber's private cluster. (Phase 4 backs this with RLS so it holds even against a logic bug.)
-pub async fn candidates_in_lookback(
-    executor: impl PgExecutor<'_>,
-    subscriber_id: Uuid,
-    last_run: Option<DateTime<Utc>>,
-    horizon_days: i32,
-) -> Result<Vec<Candidate>, sqlx::Error> {
-    sqlx::query(
-        // LEAST ignores NULL, so a null last_run ($2) yields just `now() - horizon`.
-        "SELECT id, last_event_time
-         FROM cluster
-         WHERE (scope_kind = 'public' OR scope_subscriber_id = $1)
-           AND updated_at >= LEAST($2, now() - make_interval(days => $3))
-         ORDER BY last_event_time DESC",
-    )
-    .bind(subscriber_id)
-    .bind(last_run)
-    .bind(horizon_days)
-    .try_map(|row: PgRow| {
-        Ok(Candidate {
-            cluster_id: row.get("id"),
-            last_event_time: row.get("last_event_time"),
-        })
-    })
-    .fetch_all(executor)
-    .await
-}
-
-/// Human-readable identity (source, title) of a cluster — the display half of a selection
-/// `Decision`, which carries only the id.
-pub struct ClusterDisplay {
-    pub id: Uuid,
-    pub source: SourceKind,
+/// A non-representative member of a story, rendered beneath the headline as "connected" context.
+pub struct Connection {
     pub title: String,
+    pub link: Option<String>,
+    pub source: SourceKind,
+    pub link_reason: Option<String>,
 }
 
-/// Display fields for a set of clusters by id, for `debug digest-explain` to pair each
-/// selection verdict with a human-readable cluster. Order is unspecified — callers index by id.
-pub async fn cluster_display(
-    executor: impl PgExecutor<'_>,
+/// The display fields of one cluster, keyed by id — the building block both render paths (and the
+/// `digest-explain` dry-run) assemble a story's `RenderItem` from.
+pub(crate) struct ClusterCard {
+    title: String,
+    link: Option<String>,
+    source: SourceKind,
+    last_event_time: DateTime<Utc>,
+}
+
+/// Fetch the display card for each cluster id (order unspecified; callers index by id).
+pub(crate) async fn cluster_cards(
+    pool: &PgPool,
     ids: &[Uuid],
-) -> Result<Vec<ClusterDisplay>, sqlx::Error> {
-    sqlx::query("SELECT id, source, title FROM cluster WHERE id = ANY($1)")
+) -> Result<HashMap<Uuid, ClusterCard>, sqlx::Error> {
+    sqlx::query("SELECT id, title, link, source, last_event_time FROM cluster WHERE id = ANY($1)")
         .bind(ids)
         .try_map(|row: PgRow| {
-            Ok(ClusterDisplay {
-                id: row.get("id"),
-                source: row.try_get("source")?,
-                title: row.get("title"),
-            })
+            Ok((
+                row.get::<Uuid, _>("id"),
+                ClusterCard {
+                    title: row.get("title"),
+                    link: row.get("link"),
+                    source: row.try_get("source")?,
+                    last_event_time: row.get("last_event_time"),
+                },
+            ))
         })
-        .fetch_all(executor)
+        .fetch_all(pool)
         .await
+        .map(|rows| rows.into_iter().collect())
+}
+
+/// Assemble a story's `RenderItem` from its member refs and the cluster cards: the representative is
+/// the latest member (tie-broken by cluster id for determinism); the rest become `connections`,
+/// newest-first, carrying their `link_reason`. Returns `None` if no member resolves to a card (a
+/// tombstoned/empty story).
+pub(crate) fn build_render_item(
+    members: &[ClusterRef],
+    cards: &HashMap<Uuid, ClusterCard>,
+) -> Option<RenderItem> {
+    // Resolve members to cards, keeping the ref alongside (for link_reason), newest-first.
+    let mut resolved: Vec<(&ClusterRef, &ClusterCard)> = members
+        .iter()
+        .filter_map(|m| cards.get(&m.cluster_id).map(|c| (m, c)))
+        .collect();
+    resolved.sort_by(|(ma, ca), (mb, cb)| {
+        cb.last_event_time
+            .cmp(&ca.last_event_time)
+            .then(ma.cluster_id.cmp(&mb.cluster_id))
+    });
+
+    let (_, rep) = *resolved.first()?;
+    let connections = resolved[1..]
+        .iter()
+        .map(|(m, c)| Connection {
+            title: c.title.clone(),
+            link: c.link.clone(),
+            source: c.source,
+            link_reason: m.link_reason.clone(),
+        })
+        .collect();
+
+    Some(RenderItem {
+        title: rep.title.clone(),
+        link: rep.link.clone(),
+        source: rep.source,
+        last_event_time: rep.last_event_time,
+        connections,
+    })
 }
 
 /// Idempotently gets-or-creates the digest for `(subscriber, window_end)` with its selected
-/// clusters frozen as `digest_item` rows — digest and items commit together, so the digest is
+/// **stories** frozen as `digest_item` rows — digest and items commit together, so the digest is
 /// never observed without its selection. On a retry the row already exists; the unique window
 /// constraint makes the insert a no-op and the existing (frozen) items are returned untouched.
 pub async fn create_with_items(
     pool: &PgPool,
     subscriber_id: Uuid,
     window_end: DateTime<Utc>,
-    cluster_ids: &[Uuid],
+    story_ids: &[Uuid],
 ) -> Result<DigestRow, sqlx::Error> {
     let mut tx = pool.begin().await?;
 
@@ -134,12 +140,12 @@ pub async fn create_with_items(
 
     let row = match created {
         Some(row) => {
-            for (position, cluster_id) in cluster_ids.iter().enumerate() {
+            for (position, story_id) in story_ids.iter().enumerate() {
                 sqlx::query(
-                    "INSERT INTO digest_item (digest_id, cluster_id, position) VALUES ($1, $2, $3)",
+                    "INSERT INTO digest_item (digest_id, story_id, position) VALUES ($1, $2, $3)",
                 )
                 .bind(row.id)
-                .bind(cluster_id)
+                .bind(story_id)
                 .bind(position as i32)
                 .execute(&mut *tx)
                 .await?;
@@ -164,40 +170,51 @@ pub async fn create_with_items(
     Ok(row)
 }
 
-/// The digest's items joined to their clusters, in render order.
+/// The digest's frozen stories, each assembled into a [`RenderItem`] (representative + connections),
+/// in render order. Walks `digest_item → story.clusters → cluster cards`.
 pub async fn render_items(pool: &PgPool, digest_id: Uuid) -> Result<Vec<RenderItem>, sqlx::Error> {
-    sqlx::query(
-        "SELECT c.title, c.link, c.source, c.last_event_time
-         FROM digest_item di
-         JOIN cluster c ON c.id = di.cluster_id
+    let stories: Vec<(i32, Vec<ClusterRef>)> = sqlx::query(
+        "SELECT di.position, s.clusters
+         FROM digest_item di JOIN story s ON s.id = di.story_id
          WHERE di.digest_id = $1
          ORDER BY di.position",
     )
     .bind(digest_id)
-    .try_map(|row: PgRow| map_render_item(&row))
+    .try_map(|row: PgRow| {
+        let clusters: serde_json::Value = row.get("clusters");
+        let members: Vec<ClusterRef> =
+            serde_json::from_value(clusters).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+        Ok((row.get::<i32, _>("position"), members))
+    })
     .fetch_all(pool)
-    .await
+    .await?;
+
+    assemble_items(pool, stories.into_iter().map(|(_, m)| m).collect()).await
 }
 
-/// Render items for an explicit, ordered set of cluster ids — the ad-hoc dispatch path, whose
-/// selection isn't frozen into `digest_item` rows. Preserves the given order; silently skips ids
-/// with no matching cluster.
-pub async fn render_items_for_clusters(
+/// Render items for an explicit, ordered set of linked stories — the ad-hoc dispatch / preview path,
+/// whose selection isn't frozen into `digest_item` rows. Preserves the given order.
+pub async fn render_items_for_stories(
     pool: &PgPool,
-    cluster_ids: &[Uuid],
+    stories: &[crate::link::LinkedStory],
 ) -> Result<Vec<RenderItem>, sqlx::Error> {
-    let mut by_id: HashMap<Uuid, RenderItem> = sqlx::query(
-        "SELECT id, title, link, source, last_event_time FROM cluster WHERE id = ANY($1)",
-    )
-    .bind(cluster_ids)
-    .try_map(|row: PgRow| Ok((row.get::<Uuid, _>("id"), map_render_item(&row)?)))
-    .fetch_all(pool)
-    .await?
-    .into_iter()
-    .collect();
-    Ok(cluster_ids
+    assemble_items(pool, stories.iter().map(|s| s.clusters.clone()).collect()).await
+}
+
+/// Shared assembler: fetch every referenced cluster's card once, then build a `RenderItem` per story
+/// (in input order). Stories that resolve to no card (tombstoned/empty) are skipped.
+async fn assemble_items(
+    pool: &PgPool,
+    stories: Vec<Vec<ClusterRef>>,
+) -> Result<Vec<RenderItem>, sqlx::Error> {
+    let ids: Vec<Uuid> = stories
         .iter()
-        .filter_map(|id| by_id.remove(id))
+        .flat_map(|members| members.iter().map(|m| m.cluster_id))
+        .collect();
+    let cards = cluster_cards(pool, &ids).await?;
+    Ok(stories
+        .iter()
+        .filter_map(|members| build_render_item(members, &cards))
         .collect())
 }
 
@@ -216,6 +233,9 @@ pub async fn mark_delivered(
         .bind(digest_id)
         .execute(&mut *tx)
         .await?;
+    // Stamp the carried stories as delivered (gates the asymmetric-merge rule, §8.2) in the same
+    // transaction, so "delivered ⇒ story seen" can't tear across a crash.
+    crate::link::store::mark_stories_delivered(&mut *tx, digest_id).await?;
     crate::digest::subscriber::advance_after_delivery(&mut *tx, subscriber_id, delivered_through)
         .await?;
     tx.commit().await?;
