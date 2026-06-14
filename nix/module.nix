@@ -64,6 +64,12 @@ let
 
   httpPort = lib.toInt (lib.last (lib.splitString ":" cfg.http.addr));
 
+  # Root-readable secret env files loaded via systemd `EnvironmentFile` (SMTP creds + the sealed
+  # GitHub App credentials), so neither enters the Nix store.
+  envSecretFiles =
+    lib.optional (cfg.email.smtpSecretFile != null) cfg.email.smtpSecretFile
+    ++ lib.optional (cfg.github.secretFile != null) cfg.github.secretFile;
+
   # systemd hardening shared by both units. Verified not to break the PG unix socket (AF_UNIX),
   # outbound HTTPS for RSS polling, or future SMTP (AF_INET*). Plain Rust has no JIT, so
   # MemoryDenyWriteExecute is safe.
@@ -213,6 +219,26 @@ in
       };
     };
 
+    github = {
+      secretFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = null;
+        example = "/run/agenix/bulletin-github";
+        description = ''
+          Path to a root-readable env file (e.g. an agenix secret) holding the GitHub App
+          credentials, one `KEY=value` per line. Loaded via systemd `EnvironmentFile` (read as root
+          before the service drops to the bulletin user), so it never enters the Nix store.
+
+          The two real secrets are sealed at rest (envelope-encrypted under the master key) — produce
+          them offline with `bulletin secrets keygen` + `bulletin secrets seal`. Recognized keys:
+          `BULLETIN_MASTER_KEY` (base64 32-byte master key), `BULLETIN_GITHUB_APP_ID` (numeric, not a
+          secret), `BULLETIN_GITHUB_APP_PRIVATE_KEY` (sealed envelope),
+          `BULLETIN_GITHUB_WEBHOOK_SECRET_SEALED` (sealed envelope). Omit this and GitHub ingestion
+          stays disabled (RSS is unaffected).
+        '';
+      };
+    };
+
     openFirewall = lib.mkOption {
       type = lib.types.bool;
       default = false;
@@ -336,8 +362,10 @@ in
           # Mark the unit failed if /health doesn't come up → deploy-rs (or any rollback) reverts.
           ExecStartPost = "${pkgs.curl}/bin/curl --fail --silent --max-time 5 --retry 15 --retry-delay 1 --retry-connrefused http://${cfg.http.addr}/health";
         }
-        // lib.optionalAttrs (cfg.email.smtpSecretFile != null) {
-          EnvironmentFile = [ cfg.email.smtpSecretFile ];
+        // lib.optionalAttrs (envSecretFiles != [ ]) {
+          # Both secret env files (SMTP creds + the sealed GitHub App credentials) are read as root
+          # before the unit drops to the bulletin user, so neither lands in the Nix store.
+          EnvironmentFile = envSecretFiles;
         };
     };
   };

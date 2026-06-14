@@ -23,6 +23,14 @@ chrono-tz   = "0.10"  # IANA tz lookup for rendering a digest's date in the subs
 sha2        = "0.10"
 hmac        = "0.12"  # webhook HMAC-SHA256 signature verification (GitHub X-Hub-Signature-256)
 hex         = "0.4"   # decode the hex-encoded webhook signature
+# Credential-at-rest (M2 Phase 5). In-memory redaction/zeroize + interim envelope encryption
+# (single app master key + XChaCha20-Poly1305 over a per-secret DEK), and the real GitHub App
+# JWT→installation-token mint (RS256). `creds_ref` + wrapped-DEK indirection survives a managed-KMS swap.
+secrecy           = "0.10"  # redacted Debug + zeroize-on-drop secret wrappers; explicit .expose_secret()
+zeroize           = "1.8"   # scrub plaintext key material from memory on drop
+chacha20poly1305  = "0.10"  # XChaCha20-Poly1305 AEAD for the at-rest envelope (24-byte nonce, misuse-resistant)
+jsonwebtoken      = "9"     # RS256 app JWT for the GitHub App → installation-token exchange
+base64            = "0.22"  # encode the sealed envelope + master key as transportable text
 ulid        = "1"  # read enqueue time from the apalis TaskId for job wait/run timing
 clap        = { version = "4", features = ["derive", "env"] }
 axum        = "0.7"

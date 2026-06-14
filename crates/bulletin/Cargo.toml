@@ -29,3 +29,4 @@ cron            = { workspace = true }
 chrono          = { workspace = true }
 lettre          = { workspace = true }
 ulid            = { workspace = true }
+secrecy         = { workspace = true }  # expose unsealed secret bytes at the startup wiring seam

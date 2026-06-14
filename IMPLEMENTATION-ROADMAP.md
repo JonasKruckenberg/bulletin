@@ -1,7 +1,7 @@
 # Bulletin — Implementation Roadmap
 
-**Status:** In progress — M1 completed (2026-06-13); M2 next
-**Last updated:** 2026-06-13
+**Status:** In progress — M1 completed (2026-06-13); M2 phases 1–5 implemented (2026-06-14)
+**Last updated:** 2026-06-14
 **Reads against:** `digest-system-design.md` (product + data model), `digest-technical-architecture.md` (Rust runtime), `digest-data-sources.md` (source backlog).
 
 > **Note (2026-06-13):** the design docs were revised to the **read/write split** (CQRS) — decoupled

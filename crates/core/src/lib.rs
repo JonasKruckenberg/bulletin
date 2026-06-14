@@ -20,4 +20,4 @@ pub mod link;
 pub use common::db::{
     begin_scope, connect, grant_runtime_role, migrate, with_scope, ScopeCtx, RUNTIME_ROLE,
 };
-pub use common::{event, fingerprint, kind, scope, status};
+pub use common::{event, fingerprint, kind, scope, secret, status};

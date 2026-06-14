@@ -98,7 +98,7 @@ runtime role and the RLS policies); both fall back per the option docs if omitte
 
 Options: `database.createLocally` / `database.url` / `database.migrationUrl`, `http.addr`, `metrics.addr`,
 `log.format` / `log.level`, `email.transport` / `email.from` / `email.smtpSecretFile`,
-`openFirewall`.
+`github.secretFile` (sealed GitHub App credentials — see below), `openFirewall`.
 
 ### Real email (Proton SMTP submission)
 
@@ -117,6 +117,48 @@ Point `email.smtpSecretFile` at it (loaded via systemd `EnvironmentFile`, never 
 store), set `email.from` to the same custom-domain address, and set `email.transport = "smtp"`.
 The transport enforces TLS (STARTTLS on 587 by default, or `BULLETIN_SMTP_TLS=implicit` for
 465), so the token is never sent in cleartext.
+
+### GitHub source (App credentials, encrypted at rest)
+
+GitHub ingestion needs a GitHub App: its numeric **App id** (not a secret), its **RSA private
+key**, and the **webhook signing secret**. The two real secrets are never stored or logged in
+plaintext — they're sealed with **envelope encryption** under a single app **master key** and
+unsealed once at startup.
+
+One-time setup (offline; needs no database):
+
+```sh
+# 1. Mint a master key — store as BULLETIN_MASTER_KEY (sealed file / agenix), never the Nix store.
+bulletin secrets keygen
+
+# 2. Seal each secret under it (stdin → an envelope blob to paste into config):
+BULLETIN_MASTER_KEY=<key> bulletin secrets seal < app-private-key.pem   # → BULLETIN_GITHUB_APP_PRIVATE_KEY
+printf '%s' "$WEBHOOK_SECRET" | BULLETIN_MASTER_KEY=<key> bulletin secrets seal  # → BULLETIN_GITHUB_WEBHOOK_SECRET_SEALED
+```
+
+Then provide, via a root-readable `EnvironmentFile` (`github.secretFile` below — like the SMTP
+secret, it never enters the Nix store):
+
+```
+BULLETIN_MASTER_KEY=<base64 master key>
+BULLETIN_GITHUB_APP_ID=<numeric app id>
+BULLETIN_GITHUB_APP_PRIVATE_KEY=<sealed envelope>
+BULLETIN_GITHUB_WEBHOOK_SECRET_SEALED=<sealed envelope>
+```
+
+With all four present the worker mints installation tokens (RS256 app JWT → 1 h installation
+token, cached per connection) and the `/webhooks/github` edge verifies signatures with the
+unsealed secret. Omit them and GitHub stays disabled (RSS is unaffected); GitHub connections skip
+with a clear log. Seed a connection (the installation id is the webhook routing key, not a secret):
+
+```sh
+sudo -u bulletin bulletin debug connection-add --source github \
+  --config '{"installation_id": 12345678}' --owner <subscriber-id>
+```
+
+The interim master key is deliberately swap-ready: the envelope wraps a per-secret data key, so a
+managed KMS (M5) replaces only the wrap/unwrap step — no re-encryption, no migration. For dev, a
+plaintext `BULLETIN_GITHUB_WEBHOOK_SECRET` is still accepted as a fallback when nothing is sealed.
 
 ## Build cache
 

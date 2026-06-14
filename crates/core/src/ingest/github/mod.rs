@@ -12,6 +12,7 @@
 //! events feed is exactly the "capture everything, classify in one place" surface
 //! ([`event_map`]).
 
+pub mod app;
 pub mod event_map;
 pub mod token;
 pub mod webhook;

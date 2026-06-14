@@ -112,7 +112,7 @@ or `cargo nextest run`.
 | **2** | Webhook catcher + `ProcessWebhook` job + HMAC verify + realtime traits | ✅ implemented (branch `claude/m1-phase-2-c1tvgu`) |
 | **3** | Private scope load-bearing + per-subscriber private clusters + scope-invariant proptest | ✅ implemented (branch `claude/m2-phase-3-s5ewh9`) |
 | **4** | Two-context RLS (two roles, two URLs) | ✅ implemented (branch `claude/m2-phase-4-reso5w`) |
-| **5** | Credential-at-rest (interim XChaCha20-Poly1305 envelope) + real GitHub token minting | ⬜ |
+| **5** | Credential-at-rest (interim XChaCha20-Poly1305 envelope) + real GitHub token minting | ✅ implemented (branch `claude/m2-phase-5-milestone-vzqeji`) |
 
 ---
 
@@ -398,6 +398,44 @@ shared; the proptest passes.
 ---
 
 ## 9. Phase 5 — Credential-at-rest (interim envelope) + real GitHub tokens
+
+> **Status: implemented** (branch `claude/m2-phase-5-milestone-vzqeji`). What landed, vs. the plan below:
+> - **`common/secret.rs`** — the credential primitives. In memory: secrets ride in `secrecy`'s
+>   `SecretBox`/`SecretSlice` (redacted `Debug`, zeroize-on-drop, explicit `.expose_secret()`); the
+>   `MasterKey` newtype scrubs every stack copy. At rest: **envelope encryption** — `seal(master,
+>   plaintext)` mints a fresh random **DEK**, encrypts the plaintext under it, then *wraps* the DEK
+>   under the app master key (both legs XChaCha20-Poly1305, fresh 24-byte random nonces). The
+>   `SealedSecret` is framed `version ‖ wrap-nonce ‖ wrapped-DEK ‖ payload-nonce ‖ payload`, base64
+>   for transport / `creds_ref`. `unseal` unwraps the DEK then opens the payload; the plaintext DEK
+>   never escapes the fn. The **DEK-per-secret indirection is the whole point** — swapping the interim
+>   master key for a managed-KMS wrap/unwrap (M5) or adding per-connection secrets (Slack, M6) is a
+>   *backend* change to the wrap leg, not a re-encryption migration. Pure tests: round-trip (incl.
+>   through text + a reloaded key), wrong-key/tamper/short/misversioned rejection, key-length guard.
+> - **`ingest/github/app.rs`** — the real two-hop mint. `GithubApp::new(base_url, app_id, pem)` loads
+>   the App private key into a `jsonwebtoken` RS256 `EncodingKey`. `installation_tokens(id)` yields a
+>   per-installation `GithubAppTokens` (`TokenProvider`) that signs a short-lived app JWT (`iat-60s`,
+>   `exp+9m`, `iss=app_id`), exchanges it at `POST /app/installations/{id}/access_tokens`, and
+>   **caches** the ~1 h installation token behind a `tokio::Mutex` (re-mints only inside a 60 s expiry
+>   skew). Tests (mock REST): one mint per poll then cache reuse, expired-token re-mint, non-PEM
+>   rejection — the seam that flips `ConnectorCtx.github` from `None` to a live factory.
+> - **Binary wiring (`secrets.rs` + `main.rs`)** — a flattened `SecretConfig` resolves the at-rest
+>   secrets once at startup: `connector_ctx()` unseals the App key (needs `--github-app-id` +
+>   `--github-app-private-key` + `--master-key`) and builds the `GithubCtx { base_url, token_factory =
+>   |id| app.installation_tokens(id) }`; `webhook_secret()` prefers the sealed
+>   `BULLETIN_GITHUB_WEBHOOK_SECRET_SEALED` (unsealed) over the plaintext dev fallback and feeds the
+>   Phase-2 edge verifier. With no App configured the ctx stays `github = None` (RSS unaffected, GitHub
+>   skips with a log) — the Phase-1 seam, now closeable by config alone. A new offline
+>   **`bulletin secrets`** command group (`keygen` → a base64 master key; `seal` → seal stdin under the
+>   master key) produces the config blobs and needs no database (`--database-url` became optional).
+> - **Deps:** `secrecy`, `zeroize`, `chacha20poly1305`, `jsonwebtoken`, `base64` (licenses all
+>   MIT/Apache-2.0/ISC — in the `deny.toml` allow set; `ring`/`base64`/`zeroize` were already transitive).
+> - **Seams left for M5 (not this milestone):** the managed-KMS backend (swap the master-key wrap leg
+>   for `aws-sdk-kms`, key never in-process), the OAuth `/connect` install flow (operators still
+>   hand-seed `connection` rows + the sealed App key), and per-connection `creds_ref` population (Slack,
+>   M6) — all *backend* changes the envelope indirection already accommodates.
+> - **Tests:** `clippy --all-targets` clean; `cargo fmt` clean; pure suites pass (secret round-trips +
+>   the App-token mock); `secrets keygen`/`seal` exercised by hand. Docker-backed suites are unchanged
+>   by this phase; Docker was unavailable in the sandbox so they compiled but did not run.
 
 **Goal:** secrets encrypted at rest; GitHub token minting becomes real.
 

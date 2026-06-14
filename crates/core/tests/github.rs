@@ -1,14 +1,17 @@
 //! GitHub connector coverage: the central event-map normalization + dedup identity (pure, no DB),
 //! and a poll/reconciliation cycle against a local mock of the REST API (no DB, mirrors poll_rss).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use axum::{
+    extract::State,
     http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
     Router,
 };
+use bulletin_core::ingest::github::app::GithubApp;
 use bulletin_core::ingest::github::event_map::{self, GithubEvent};
 use bulletin_core::ingest::github::token::StaticTokenProvider;
 use bulletin_core::ingest::github::webhook::{self, GithubWebhook};
@@ -458,4 +461,107 @@ async fn second_poll_is_conditional_and_returns_nothing() {
         second.items.is_empty(),
         "unchanged feed yields nothing on a conditional re-poll"
     );
+}
+
+// ── GitHub App: real installation-token minting (RS256 JWT → access token) ─
+//
+// A throwaway 2048-bit RSA key (generated for the test, never a real App key) signs the app JWT;
+// the mock asserts the exchange presents a bearer JWT and counts mints to prove the per-connection
+// expiry cache. This is the Phase 5 seam that flips `ConnectorCtx.github` from `None` to a live
+// token factory — "a real (operator-seeded) install ingests end-to-end via poll".
+const TEST_APP_KEY: &[u8] = include_bytes!("fixtures/github_app_test_key.pem");
+
+#[derive(Clone)]
+struct AppMockState {
+    mints: Arc<AtomicUsize>,
+    expires_at: String,
+}
+
+async fn access_token_handler(
+    State(state): State<AppMockState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    // The exchange must authenticate with a signed app JWT as a bearer token (JWTs start "ey…").
+    let auth = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        auth.starts_with("Bearer ey"),
+        "token exchange must present a JWT bearer, got {auth:?}"
+    );
+    state.mints.fetch_add(1, Ordering::SeqCst);
+    let body = format!(
+        r#"{{"token":"ghs_minted_token","expires_at":"{}"}}"#,
+        state.expires_at
+    );
+    (StatusCode::CREATED, body).into_response()
+}
+
+async fn serve_github_app(mints: Arc<AtomicUsize>, expires_at: &str) -> String {
+    let state = AppMockState {
+        mints,
+        expires_at: expires_at.to_string(),
+    };
+    let app = Router::new()
+        .route(
+            "/app/installations/42/access_tokens",
+            post(access_token_handler),
+        )
+        .route(
+            "/installation/repositories",
+            get(|| async { r#"{"repositories":[{"full_name":"octo/repo"}]}"# }),
+        )
+        .route("/repos/octo/repo/events", get(events_handler))
+        .with_state(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://127.0.0.1:{port}")
+}
+
+#[tokio::test]
+async fn app_mints_installation_token_then_caches_it() {
+    let mints = Arc::new(AtomicUsize::new(0));
+    let base = serve_github_app(mints.clone(), "2999-01-01T00:00:00Z").await;
+    let app = GithubApp::new(&base, 12345, TEST_APP_KEY).expect("valid app key");
+    let conn = GithubConnection::new(&base, app.installation_tokens(42));
+
+    let batch = conn.poll(Default::default()).await.expect("poll succeeds");
+    assert_eq!(batch.items.len(), 2);
+    assert_eq!(
+        mints.load(Ordering::SeqCst),
+        1,
+        "one mint for the first poll"
+    );
+
+    // The far-future token is reused on the next poll — no second exchange.
+    conn.poll(batch.cursor).await.expect("second poll");
+    assert_eq!(
+        mints.load(Ordering::SeqCst),
+        1,
+        "a live cached token is not re-minted"
+    );
+}
+
+#[tokio::test]
+async fn app_refreshes_an_expired_token() {
+    let mints = Arc::new(AtomicUsize::new(0));
+    // An already-expired token forces a re-mint on every access.
+    let base = serve_github_app(mints.clone(), "2000-01-01T00:00:00Z").await;
+    let app = GithubApp::new(&base, 12345, TEST_APP_KEY).expect("valid app key");
+    let conn = GithubConnection::new(&base, app.installation_tokens(42));
+
+    conn.poll(Default::default()).await.expect("first poll");
+    conn.poll(Default::default()).await.expect("second poll");
+    assert_eq!(
+        mints.load(Ordering::SeqCst),
+        2,
+        "an expired token is re-minted each poll"
+    );
+}
+
+#[test]
+fn app_rejects_a_non_pem_private_key() {
+    assert!(GithubApp::new("https://api.github.com", 1, b"not a pem").is_err());
 }
