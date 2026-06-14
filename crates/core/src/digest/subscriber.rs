@@ -1,6 +1,12 @@
+use crate::common::db::{begin_scope, ScopeCtx};
 use chrono::{DateTime, NaiveTime, Utc};
 use sqlx::{postgres::PgRow, PgExecutor, PgPool, Row};
 use uuid::Uuid;
+
+// `subscriber` is under RLS (fail-closed): a subscriber context sees only its own row (generate's
+// load + the post-delivery schedule advance run there); the tick's due-sweep, `status`, and operator
+// commands reach every row only in the **admin** control-plane context. Each function below opens its
+// own scoped transaction, so callers need no scope ceremony.
 
 /// A subscriber's delivery cadence. `Weekly` carries its (stable) weekday, so the "weekly ⇔ has a
 /// weekday" invariant is unrepresentable-when-wrong in Rust — the DB CHECK is just a backstop.
@@ -98,6 +104,9 @@ pub async fn insert_subscriber(
     digest_time: NaiveTime,
 ) -> Result<Uuid, sqlx::Error> {
     let (freq, on_weekday) = recurrence.columns();
+    // Signup is an operator/control-plane action (admin context); the new id isn't known yet, so a
+    // subscriber context couldn't authorize the insert anyway.
+    let mut tx = begin_scope(pool, ScopeCtx::Admin).await?;
     let row = sqlx::query(
         "INSERT INTO subscriber (email, name, freq, on_weekday, timezone, digest_time, next_run_at)
          VALUES ($1, $2, $3, $4, $5, $6, next_run(now(), $5, $6, $3, $4))
@@ -109,8 +118,9 @@ pub async fn insert_subscriber(
     .bind(on_weekday)
     .bind(timezone)
     .bind(digest_time)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row.get("id"))
 }
 
@@ -142,6 +152,8 @@ pub async fn update_preferences(
     digest_time: NaiveTime,
 ) -> Result<bool, sqlx::Error> {
     let (freq, on_weekday) = recurrence.columns();
+    // A self-service edit of one's own row → that subscriber's context.
+    let mut tx = begin_scope(pool, ScopeCtx::Subscriber(id)).await?;
     let result = sqlx::query(
         "UPDATE subscriber
          SET freq = $2,
@@ -157,41 +169,53 @@ pub async fn update_preferences(
     .bind(on_weekday)
     .bind(timezone)
     .bind(digest_time)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(result.rows_affected() > 0)
 }
 
 pub async fn list_subscribers(pool: &PgPool) -> Result<Vec<SubscriberRow>, sqlx::Error> {
-    sqlx::query(&format!(
+    let mut tx = begin_scope(pool, ScopeCtx::Admin).await?;
+    let rows = sqlx::query(&format!(
         "SELECT {SELECT_COLS} FROM subscriber ORDER BY next_run_at"
     ))
     .try_map(row_to_subscriber)
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(rows)
 }
 
 /// Deletes a subscriber by id, returning whether a row was removed. Their digests cascade
-/// (digest.subscriber_id is ON DELETE CASCADE), so this also clears their digest history.
+/// (digest.subscriber_id is ON DELETE CASCADE), so this also clears their digest history. An operator
+/// action → admin context (the cascade itself bypasses RLS, as Postgres does for all RI actions).
 pub async fn delete_subscriber(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+    let mut tx = begin_scope(pool, ScopeCtx::Admin).await?;
     let result = sqlx::query("DELETE FROM subscriber WHERE id = $1")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(result.rows_affected() > 0)
 }
 
+/// Loads one subscriber by id — generate's first step, so it runs in *that subscriber's* context
+/// (the only one in which the row is visible under RLS, fail-closed otherwise).
 pub async fn load_subscriber(
     pool: &PgPool,
     id: Uuid,
 ) -> Result<Option<SubscriberRow>, sqlx::Error> {
-    sqlx::query(&format!(
+    let mut tx = begin_scope(pool, ScopeCtx::Subscriber(id)).await?;
+    let row = sqlx::query(&format!(
         "SELECT {SELECT_COLS} FROM subscriber WHERE id = $1"
     ))
     .bind(id)
     .try_map(row_to_subscriber)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(row)
 }
 
 /// Subscribers whose digest is due: the boundary has passed (`next_run_at <= now()`). There is no
@@ -199,12 +223,16 @@ pub async fn load_subscriber(
 /// an event not yet clustered just isn't a candidate this fire and is re-considered on a later one
 /// (it's never lost from the durable log, though freshness ranking may leave it unsurfaced).
 pub async fn due_subscribers(pool: &PgPool) -> Result<Vec<SubscriberRow>, sqlx::Error> {
-    sqlx::query(&format!(
+    // The cron sweep enumerates every owner → admin control-plane context.
+    let mut tx = begin_scope(pool, ScopeCtx::Admin).await?;
+    let rows = sqlx::query(&format!(
         "SELECT {SELECT_COLS} FROM subscriber WHERE next_run_at <= now() ORDER BY next_run_at"
     ))
     .try_map(row_to_subscriber)
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(rows)
 }
 
 /// Advances the schedule after delivery: `delivered_through` becomes `last_run_at`, and

@@ -12,18 +12,21 @@ use bulletin_core::digest::subscriber::{
     advance_after_delivery, due_subscribers, insert_subscriber, load_subscriber,
     update_preferences, Recurrence,
 };
-use bulletin_core::ingest::store::insert_event;
+use bulletin_core::ingest::store::{insert_connection, insert_event};
 use bulletin_core::link::{
     link,
     store::{candidate_clusters, load_prior_members, persist_assignment},
 };
 use bulletin_core::{
+    begin_scope,
     cluster::{build_private, rollup},
     connect,
     event::EventBuilder,
+    grant_runtime_role,
     kind::SourceKind,
     migrate,
     scope::Scope,
+    ScopeCtx, RUNTIME_ROLE,
 };
 use chrono::{Duration, NaiveTime, TimeZone, Utc};
 use sqlx::{PgPool, Row};
@@ -309,7 +312,9 @@ async fn digest_delivery_and_idempotency() {
         .unwrap();
     assert!(digest.delivered_at.is_none());
 
-    let items = render_items(&pool, digest.id).await.unwrap();
+    let items = render_items(&mut pool.acquire().await.unwrap(), digest.id)
+        .await
+        .unwrap();
     assert_eq!(items.len(), 2);
     assert_eq!(items[0].source, SourceKind::Rss);
 
@@ -323,7 +328,13 @@ async fn digest_delivery_and_idempotency() {
         .unwrap();
     assert_eq!(again.id, digest.id);
     assert!(again.delivered_at.is_some());
-    assert_eq!(render_items(&pool, again.id).await.unwrap().len(), 2);
+    assert_eq!(
+        render_items(&mut pool.acquire().await.unwrap(), again.id)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
 
     // Watermark advanced one cadence; the just-delivered boundary is now last_run_at, and
     // next_run_at snapped to the next 09:00 UTC slot strictly after it (DST-safe wall-clock grid,
@@ -486,7 +497,9 @@ async fn cross_source_story_fuses_private_and_public_via_cve() {
     let digest = create_with_items(&pool, alice, sub.next_run_at, &[story.id])
         .await
         .unwrap();
-    let items = render_items(&pool, digest.id).await.unwrap();
+    let items = render_items(&mut pool.acquire().await.unwrap(), digest.id)
+        .await
+        .unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(
         items[0].connections.len(),
@@ -522,6 +535,246 @@ async fn private_build_is_watermark_incremental() {
     insert_private(&pool, alice, "s2", "g2", "Second", 200).await;
     assert_eq!(build_private(&pool, alice).await.unwrap(), 1);
     assert_eq!(cluster_count(&pool).await, 2);
+}
+
+// Phase 4 — the DB physically enforces scope isolation. Under the least-privilege runtime role
+// (non-superuser, so FORCE ROW LEVEL SECURITY applies), the two-context policies confine every
+// `event`/`cluster` query to its scope: the no-subscriber context sees only public rows, a
+// subscriber context sees public ∪ own-private and can never read another tenant's private rows or
+// write outside its own scope. This is the RLS backstop behind the query-level predicates and the
+// typed `Scope` — proven against a real connection as the runtime role, not the test superuser
+// (which bypasses RLS even with FORCE, which is exactly why the runtime role must be neither owner
+// nor superuser).
+#[tokio::test]
+async fn rls_isolates_private_content_under_runtime_role() {
+    let (pool, pg) = setup().await;
+
+    // The RLS migration created the runtime role; grant it table access and a password so this test
+    // can open a second pool *as that role* over TCP (the deployment does the grant in `migrate`).
+    grant_runtime_role(&pool).await.unwrap();
+    sqlx::query(&format!(
+        "ALTER ROLE {RUNTIME_ROLE} WITH LOGIN PASSWORD 'app'"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let alice = insert_subscriber(
+        &pool,
+        "alice@x.com",
+        None,
+        Recurrence::Daily,
+        "UTC",
+        nine_am(),
+    )
+    .await
+    .unwrap();
+    let bob = insert_subscriber(
+        &pool,
+        "bob@x.com",
+        None,
+        Recurrence::Daily,
+        "UTC",
+        nine_am(),
+    )
+    .await
+    .unwrap();
+
+    // Seed as the superuser (bypasses RLS): one public, one private per owner; build all scopes.
+    insert_public(&pool, "pub", "pub", "Public", 100).await;
+    insert_private(&pool, alice, "a-secret", "a-secret", "Alice secret", 200).await;
+    insert_private(&pool, bob, "b-secret", "b-secret", "Bob secret", 300).await;
+    build_all(&pool).await;
+    build_private(&pool, alice).await.unwrap();
+    build_private(&pool, bob).await.unwrap();
+
+    // A second pool, logged in as the non-superuser runtime role → RLS is in force.
+    let port = pg.get_host_port_ipv4(5432).await.unwrap();
+    let runtime_url = format!("postgresql://{RUNTIME_ROLE}:app@127.0.0.1:{port}/postgres");
+    let app = connect(&runtime_url).await.unwrap();
+
+    // 1. No-subscriber context: only public content is visible.
+    {
+        let mut tx = begin_scope(&app, ScopeCtx::NoSubscriber).await.unwrap();
+        let events: i64 = sqlx::query("SELECT count(*) AS n FROM event")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap()
+            .get("n");
+        let clusters: i64 = sqlx::query("SELECT count(*) AS n FROM cluster")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap()
+            .get("n");
+        tx.commit().await.unwrap();
+        assert_eq!(
+            events, 1,
+            "no-subscriber context sees only the public event"
+        );
+        assert_eq!(
+            clusters, 1,
+            "no-subscriber context sees only the public cluster"
+        );
+    }
+
+    // 2. Alice's context: public ∪ her own private, never Bob's.
+    {
+        let mut tx = begin_scope(&app, ScopeCtx::Subscriber(alice))
+            .await
+            .unwrap();
+        let titles: Vec<String> = sqlx::query("SELECT title FROM event ORDER BY title")
+            .try_map(|r: sqlx::postgres::PgRow| Ok(r.get::<String, _>("title")))
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert!(titles.contains(&"Public".to_string()));
+        assert!(titles.contains(&"Alice secret".to_string()));
+        assert!(
+            !titles.contains(&"Bob secret".to_string()),
+            "Alice's context cannot read Bob's private event"
+        );
+    }
+
+    // 3. Directional invariant: Alice's context cannot write a row scoped to Bob.
+    {
+        let mut tx = begin_scope(&app, ScopeCtx::Subscriber(alice))
+            .await
+            .unwrap();
+        let bob_ev = EventBuilder::new(
+            SourceKind::Github,
+            "inject",
+            Utc.timestamp_opt(400, 0).single().unwrap(),
+            "Injected",
+            "g",
+        )
+        .private(true)
+        .finalize(Some(bob));
+        let res = insert_event(&mut *tx, &bob_ev).await;
+        assert!(
+            res.is_err(),
+            "writing another tenant's private row must be refused by RLS"
+        );
+        let _ = tx.rollback().await;
+    }
+
+    // 4. The no-subscriber context cannot inject a private row at all (no public→private leak path).
+    {
+        let mut tx = begin_scope(&app, ScopeCtx::NoSubscriber).await.unwrap();
+        let priv_ev = EventBuilder::new(
+            SourceKind::Github,
+            "sneaky",
+            Utc.timestamp_opt(500, 0).single().unwrap(),
+            "Sneaky",
+            "g",
+        )
+        .private(true)
+        .finalize(Some(alice));
+        let res = insert_event(&mut *tx, &priv_ev).await;
+        assert!(
+            res.is_err(),
+            "the no-subscriber context cannot write private rows"
+        );
+        let _ = tx.rollback().await;
+    }
+}
+
+// Phase 4 (cont.) — the control-plane / delivery tables are RLS'd too, and fail-closed. Under the
+// runtime role: the default (no-subscriber) context can't read `subscriber`/`connection`/`digest`
+// at all; a subscriber context sees only its own rows; the admin context is the only cross-tenant
+// reach. This is what makes the isolation total rather than partial — there's no unpoliced table on
+// the path from a private event to a delivered digest.
+#[tokio::test]
+async fn rls_isolates_control_plane_under_runtime_role() {
+    let (pool, pg) = setup().await;
+    grant_runtime_role(&pool).await.unwrap();
+    sqlx::query(&format!(
+        "ALTER ROLE {RUNTIME_ROLE} WITH LOGIN PASSWORD 'app'"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Seed (as superuser): two subscribers, one connection owned by alice.
+    let alice = insert_subscriber(
+        &pool,
+        "alice@x.com",
+        None,
+        Recurrence::Daily,
+        "UTC",
+        nine_am(),
+    )
+    .await
+    .unwrap();
+    let bob = insert_subscriber(
+        &pool,
+        "bob@x.com",
+        None,
+        Recurrence::Daily,
+        "UTC",
+        nine_am(),
+    )
+    .await
+    .unwrap();
+    insert_connection(
+        &pool,
+        SourceKind::Github,
+        serde_json::json!({ "installation_id": 1, "repos": [] }),
+        900,
+        Some(alice),
+    )
+    .await
+    .unwrap();
+
+    let port = pg.get_host_port_ipv4(5432).await.unwrap();
+    let runtime_url = format!("postgresql://{RUNTIME_ROLE}:app@127.0.0.1:{port}/postgres");
+    let app = connect(&runtime_url).await.unwrap();
+
+    async fn count(app: &PgPool, ctx: ScopeCtx, table: &str) -> i64 {
+        let mut tx = begin_scope(app, ctx).await.unwrap();
+        let n: i64 = sqlx::query(&format!("SELECT count(*) AS n FROM {table}"))
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap()
+            .get("n");
+        tx.commit().await.unwrap();
+        n
+    }
+
+    // 1. Fail-closed: the default no-subscriber context sees none of these tables.
+    assert_eq!(count(&app, ScopeCtx::NoSubscriber, "subscriber").await, 0);
+    assert_eq!(count(&app, ScopeCtx::NoSubscriber, "connection").await, 0);
+
+    // 2. Admin: the cross-tenant control-plane reach the cron sweeps use.
+    assert_eq!(count(&app, ScopeCtx::Admin, "subscriber").await, 2);
+    assert_eq!(count(&app, ScopeCtx::Admin, "connection").await, 1);
+
+    // 3. A subscriber context sees only its own rows — Alice sees herself + her connection, not Bob.
+    {
+        let mut tx = begin_scope(&app, ScopeCtx::Subscriber(alice))
+            .await
+            .unwrap();
+        let ids: Vec<Uuid> = sqlx::query("SELECT id FROM subscriber")
+            .try_map(|r: sqlx::postgres::PgRow| Ok(r.get::<Uuid, _>("id")))
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            ids,
+            vec![alice],
+            "Alice's context sees only her own subscriber row"
+        );
+    }
+    assert_eq!(
+        count(&app, ScopeCtx::Subscriber(alice), "connection").await,
+        1
+    );
+    assert_eq!(
+        count(&app, ScopeCtx::Subscriber(bob), "connection").await,
+        0,
+        "Bob owns no connection and can't see Alice's"
+    );
 }
 
 // Signup schedules the first digest at the next occurrence of the local digest time in the

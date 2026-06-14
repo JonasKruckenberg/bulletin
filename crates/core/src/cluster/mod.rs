@@ -9,7 +9,12 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::common::{event::Event, kind::SourceKind, scope::Scope};
+use crate::common::{
+    db::{begin_scope, ScopeCtx},
+    event::Event,
+    kind::SourceKind,
+    scope::Scope,
+};
 
 /// The recomputed rollup the build upserts onto a cluster row: the latest event's title/link, the
 /// group's recency span, and the union of its events' `entities` — the blocking substrate M3 linking
@@ -98,7 +103,11 @@ pub struct BuildStats {
 /// half-open ingest range `(built_through, now()]`: finds the groups it dirtied, recomputes each
 /// cluster's rollup over *all* its events, upserts, then advances to `now()`.
 pub async fn build(pool: &PgPool) -> Result<Option<BuildStats>> {
-    let mut tx = pool.begin().await.context("begin build txn")?;
+    // PublicBuild runs in the no-subscriber RLS context: it can read and write only public rows, so
+    // it physically cannot pull a private event into a public cluster (design §12).
+    let mut tx = begin_scope(pool, ScopeCtx::NoSubscriber)
+        .await
+        .context("begin build txn")?;
 
     if !store::try_build_lock(&mut *tx)
         .await
@@ -164,7 +173,12 @@ async fn build_groups(
 /// makes that a DB-enforced (RLS) guarantee rather than a query convention. Returns the number of
 /// groups rebuilt this pass.
 pub async fn build_private(pool: &PgPool, subscriber_id: Uuid) -> Result<usize> {
-    let mut tx = pool.begin().await.context("begin private build txn")?;
+    // PrivateBuild runs in the owner's subscriber RLS context: it reads only their private events and
+    // writes only their private clusters — the DB enforces the per-tenant boundary the query
+    // predicates assert.
+    let mut tx = begin_scope(pool, ScopeCtx::Subscriber(subscriber_id))
+        .await
+        .context("begin private build txn")?;
 
     if !store::try_private_build_lock(&mut *tx, subscriber_id)
         .await

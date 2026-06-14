@@ -15,8 +15,17 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Runtime DB connection string — the **least-privilege role** (`bulletin_app`: non-owner,
+    /// no `BYPASSRLS`) that `serve` / `worker` / `debug` log in as. Under it the two-context RLS
+    /// policies (design §12) physically confine each query to its scope.
     #[arg(long, env = "DATABASE_URL")]
     database_url: String,
+    /// Migration DB connection string — the **owner/migration role** that owns the DDL and runs
+    /// `migrate`. Defaults to `--database-url` when unset (single-role dev). In production this is a
+    /// separate, more-privileged role from the runtime one, so a runtime credential can never alter
+    /// the schema or disable RLS.
+    #[arg(long, env = "BULLETIN_MIGRATION_DATABASE_URL")]
+    migration_database_url: Option<String>,
     /// Bind address for the health HTTP server (`serve` / `all`).
     #[arg(long, env = "BULLETIN_HTTP_ADDR", default_value = "127.0.0.1:3000")]
     http_addr: SocketAddr,
@@ -61,7 +70,13 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Migrate => {
-            let pool = connect_pool(&cli.database_url).await?;
+            // Migrate as the owner role: it owns the DDL, creates the runtime role + RLS policies,
+            // and (afterwards) grants the runtime role its table access.
+            let migration_url = cli
+                .migration_database_url
+                .as_deref()
+                .unwrap_or(&cli.database_url);
+            let pool = connect_pool(migration_url).await?;
             tracing::info!("running bulletin migrations");
             bulletin_core::migrate(&pool)
                 .await
@@ -70,6 +85,12 @@ async fn main() -> Result<()> {
             worker::setup_storage(&pool)
                 .await
                 .context("apalis storage setup failed")?;
+            // Re-grant the runtime role its access every migrate, so tables added by this run (and
+            // the apalis queue schema, just created above) are always reachable by `bulletin_app`.
+            tracing::info!("granting runtime role access");
+            bulletin_core::grant_runtime_role(&pool)
+                .await
+                .context("granting runtime role access failed")?;
             tracing::info!("migrations complete");
         }
         Command::Serve => {

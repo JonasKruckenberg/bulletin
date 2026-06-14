@@ -17,5 +17,7 @@ pub mod ingest;
 pub mod link;
 
 // Ergonomic re-exports of the shared vocabulary.
-pub use common::db::{connect, migrate};
+pub use common::db::{
+    begin_scope, connect, grant_runtime_role, migrate, with_scope, ScopeCtx, RUNTIME_ROLE,
+};
 pub use common::{event, fingerprint, kind, scope, status};

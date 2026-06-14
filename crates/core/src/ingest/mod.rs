@@ -6,13 +6,18 @@ pub mod realtime;
 pub mod rss;
 pub mod store;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::common::{event::EventBuilder, kind::SourceKind};
+use crate::common::db::{begin_scope, ScopeCtx};
+use crate::common::{
+    event::{EventBuilder, NewEvent},
+    kind::SourceKind,
+};
 use crate::ingest::github::token::TokenProvider;
 
 pub struct Batch<I, C> {
@@ -179,6 +184,36 @@ pub enum PollOutcome {
     },
 }
 
+/// Appends finalized events to the log under RLS, returning `(inserted, deduplicated)`. Each event
+/// is written in the context its scope demands — a public event in the no-subscriber context, a
+/// private event in its owner's — because the DB write policy refuses any other pairing. Events are
+/// grouped by context and committed one transaction per context (at most two for a single
+/// connection: public + the owner), so the per-event scope discipline costs no transaction-per-row.
+async fn append_scoped(pool: &PgPool, events: Vec<NewEvent>) -> Result<(usize, usize)> {
+    let total = events.len();
+    let mut groups: HashMap<ScopeCtx, Vec<NewEvent>> = HashMap::new();
+    for ev in events {
+        groups
+            .entry(ScopeCtx::for_scope(&ev.scope))
+            .or_default()
+            .push(ev);
+    }
+
+    let mut inserted = 0usize;
+    for (ctx, evs) in groups {
+        let mut tx = begin_scope(pool, ctx)
+            .await
+            .context("open scoped ingest txn")?;
+        for ev in &evs {
+            if store::insert_event(&mut *tx, ev).await?.is_some() {
+                inserted += 1;
+            }
+        }
+        tx.commit().await.context("commit scoped ingest txn")?;
+    }
+    Ok((inserted, total - inserted))
+}
+
 /// Ingest one connection: load it, fetch its source, append new events to the log, then advance
 /// the cursor (or back off on failure). Events commit before the cursor advances — the
 /// crash-safety invariant: a re-poll re-fetches, and fingerprint dedup collapses the overlap.
@@ -207,20 +242,15 @@ pub async fn poll(pool: &PgPool, connection_id: Uuid, ctx: &ConnectorCtx) -> Res
 
     match dispatch.poll_and_normalize(conn_row.cursor.clone()).await {
         Ok((builders, new_cursor)) => {
-            let total = builders.len();
-            let mut inserted = 0usize;
-            for builder in builders {
-                // Per-event scope: `finalize` maps the builder's `is_private` flag against THIS
-                // connection's owner — a private-repo item becomes `Private(owner)`, public stays
-                // shared. The owner comes from our row, never the polled payload (§12 risk #1).
-                if store::insert_event(pool, &builder.finalize(conn_row.subscriber_id))
-                    .await?
-                    .is_some()
-                {
-                    inserted += 1;
-                }
-            }
-            let deduplicated = total - inserted;
+            // Per-event scope: `finalize` maps the builder's `is_private` flag against THIS
+            // connection's owner — a private-repo item becomes `Private(owner)`, public stays
+            // shared. The owner comes from our row, never the polled payload (§12 risk #1).
+            // `append_scoped` then writes each event in the RLS context its scope requires.
+            let events: Vec<NewEvent> = builders
+                .into_iter()
+                .map(|b| b.finalize(conn_row.subscriber_id))
+                .collect();
+            let (inserted, deduplicated) = append_scoped(pool, events).await?;
             tracing::info!(
                 connection_id = %conn_row.id,
                 source = source.as_str(),
@@ -309,20 +339,15 @@ pub async fn process_webhook(
 
     match dispatch.accept_and_normalize(event_type, delivery_id, body)? {
         realtime::Inbound::Events(builders) => {
-            let total = builders.len();
-            let mut inserted = 0usize;
-            for builder in builders {
-                // Per-event scope, derived from the *resolved* connection's owner (never the webhook
-                // payload — IDOR defense): a private-repo delivery becomes `Private(owner)`. The
-                // webhook body's `repository.private` only sets the builder's `is_private` flag.
-                if store::insert_event(pool, &builder.finalize(conn.subscriber_id))
-                    .await?
-                    .is_some()
-                {
-                    inserted += 1;
-                }
-            }
-            let deduplicated = total - inserted;
+            // Per-event scope, derived from the *resolved* connection's owner (never the webhook
+            // payload — IDOR defense): a private-repo delivery becomes `Private(owner)`. The webhook
+            // body's `repository.private` only sets the builder's `is_private` flag. `append_scoped`
+            // writes each event in the RLS context its scope requires.
+            let events: Vec<NewEvent> = builders
+                .into_iter()
+                .map(|b| b.finalize(conn.subscriber_id))
+                .collect();
+            let (inserted, deduplicated) = append_scoped(pool, events).await?;
             tracing::info!(
                 connection_id = %conn.id,
                 source = source.as_str(),

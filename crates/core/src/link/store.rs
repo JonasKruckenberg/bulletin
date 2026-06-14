@@ -83,7 +83,12 @@ pub async fn persist_assignment(
     subscriber_id: Uuid,
     assignment: &Assignment,
 ) -> Result<(), sqlx::Error> {
-    let mut tx = pool.begin().await?;
+    // Writes only this subscriber's own stories → its RLS context (story is fail-closed otherwise).
+    let mut tx = crate::common::db::begin_scope(
+        pool,
+        crate::common::db::ScopeCtx::Subscriber(subscriber_id),
+    )
+    .await?;
 
     for story in &assignment.stories {
         let clusters =
