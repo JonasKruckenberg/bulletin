@@ -68,10 +68,7 @@ pub async fn upsert_cluster(
     group_key: &str,
     r: &ClusterRollup,
 ) -> Result<Uuid, sqlx::Error> {
-    let (scope_kind, scope_subscriber_id) = match scope {
-        Scope::Public => ("public", None::<Uuid>),
-        Scope::Private(sub) => ("private", Some(*sub)),
-    };
+    let (scope_kind, scope_subscriber_id) = scope.to_columns();
     let row = sqlx::query(
         "INSERT INTO cluster
             (scope_kind, scope_subscriber_id, source, group_key, title, link, last_event_time, updated_at)

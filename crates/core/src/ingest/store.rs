@@ -2,7 +2,7 @@
 //! normalized events to the **event log** (`event` table, fingerprint-deduped).
 
 use crate::common::event::{from_row, Event, NewEvent};
-use crate::common::{kind::SourceKind, scope::Scope};
+use crate::common::kind::SourceKind;
 use chrono::{DateTime, Utc};
 use sqlx::{postgres::PgRow, PgPool, Row};
 use uuid::Uuid;
@@ -195,10 +195,7 @@ pub async fn record_failure(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> 
 /// Appends `ev` to the event log, deduplicating on fingerprint.
 /// Returns `Some(event)` if inserted, `None` if the fingerprint already existed.
 pub async fn insert_event(pool: &PgPool, ev: &NewEvent) -> Result<Option<Event>, sqlx::Error> {
-    let (scope_kind, scope_subscriber_id) = match &ev.scope {
-        Scope::Public => ("public", None::<Uuid>),
-        Scope::Private(sub_id) => ("private", Some(*sub_id)),
-    };
+    let (scope_kind, scope_subscriber_id) = ev.scope.to_columns();
 
     sqlx::query(
         r#"
