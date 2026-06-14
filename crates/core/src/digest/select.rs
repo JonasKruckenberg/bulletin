@@ -53,6 +53,17 @@ impl Format {
     }
 }
 
+impl TryFrom<&str> for Format {
+    type Error = &'static str;
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        match s {
+            "story" => Ok(Format::Story),
+            "note" => Ok(Format::Note),
+            _ => Err("unknown format"),
+        }
+    }
+}
+
 /// The tunable scoring knobs — the `digest_config` row, lifted into a pure value so selection is
 /// testable against fixtures (design §8.4: "the relevance_floor, richness threshold, and caps live in
 /// a config table in v1"). [`Default`] mirrors the migration defaults so a fixture needn't hit the DB.
@@ -70,6 +81,10 @@ pub struct ScoringConfig {
     pub story_cap: usize,
     /// Max Notes rendered (~15–25).
     pub note_cap: usize,
+    /// Priority multiplier for a story re-surfaced with no new events since it was last shown
+    /// (design §9.4 re-surface suppression) — it fades to a "still developing" note and eventually
+    /// out. `1.0` disables the penalty.
+    pub resurface_penalty: f32,
 }
 
 impl Default for ScoringConfig {
@@ -81,8 +96,19 @@ impl Default for ScoringConfig {
             recency_half_life_days: 3.0,
             story_cap: 5,
             note_cap: 20,
+            resurface_penalty: 0.25,
         }
     }
+}
+
+/// A snapshot of a story as it was last shown to this subscriber (the most recent prior
+/// `digest_item`) — the re-surface suppression key (design §9.4). A story whose `last_event_time`
+/// hasn't advanced past `last_event_time` here, and which hasn't graduated `Note → Story`, is a stale
+/// re-surface to be damped.
+#[derive(Debug, Clone, Copy)]
+pub struct Shown {
+    pub last_event_time: DateTime<Utc>,
+    pub format: Format,
 }
 
 /// The persisted **decision record** for one story (design §10.2 reason record), extended for M4: the
@@ -127,6 +153,9 @@ pub struct Candidate {
     pub max_severity: Option<i16>,
     /// Whether the story includes the subscriber's own private content — the scope bonus.
     pub has_private: bool,
+    /// The story as last shown to this subscriber, if ever — the re-surface suppression input
+    /// (design §9.4). `None` = never shown (a fresh story); stable story ids make this well-defined.
+    pub last_shown: Option<Shown>,
 }
 
 impl Candidate {
@@ -144,6 +173,7 @@ impl Candidate {
             content_depth: ContentKind::Longform,
             max_severity: None,
             has_private: false,
+            last_shown: None,
         }
     }
 }
@@ -188,6 +218,10 @@ pub struct Decision {
     pub last_event_time: DateTime<Utc>,
     pub relevance: f32,
     pub priority: f32,
+    /// The natural richness classification — what to freeze on `digest_item` for the next fire's
+    /// re-surface/graduation check (unaffected by a re-surface demotion of `format`).
+    pub natural_format: Format,
+    /// The format to render — `natural_format`, or `Note` when re-surface-damped to "still developing".
     pub format: Format,
     pub richness: String,
     pub verdict: Verdict,
@@ -255,6 +289,10 @@ struct Gated {
     last_event_time: DateTime<Utc>,
     relevance: f32,
     priority: f32,
+    /// The richness classification (the "natural" format) — snapshotted for the next fire's
+    /// graduation check, independent of any re-surface demotion.
+    natural_format: Format,
+    /// The format actually rendered — `natural_format`, or `Note` when re-surface-demoted.
     format: Format,
     richness: &'static str,
 }
@@ -272,7 +310,10 @@ pub fn select(
     let mut gated: Vec<Gated> = Vec::new();
     let mut dropped: Vec<Decision> = Vec::new();
     for c in &candidates {
-        let (format, richness_phrase) = richness(c);
+        // The natural richness classification — what the story *is*. Re-surface may demote what's
+        // rendered, but the snapshot must record the natural format so graduation isn't fooled by its
+        // own demotion (otherwise a damped Story would "graduate" back next fire, oscillating).
+        let (natural_format, natural_phrase) = richness(c);
         let r = relevance(c, cfg);
         if r < cfg.relevance_floor {
             dropped.push(Decision {
@@ -280,22 +321,40 @@ pub fn select(
                 last_event_time: c.last_event_time,
                 relevance: r,
                 priority: 0.0,
-                format,
-                richness: richness_phrase.to_string(),
+                natural_format,
+                format: natural_format,
+                richness: natural_phrase.to_string(),
                 verdict: Verdict::Dropped {
                     cause: DropCause::BelowFloor,
                 },
             });
-        } else {
-            gated.push(Gated {
-                id: c.id,
-                last_event_time: c.last_event_time,
-                relevance: r,
-                priority: priority(c, r, cfg, now),
-                format,
-                richness: richness_phrase,
-            });
+            continue;
         }
+        let mut p = priority(c, r, cfg, now);
+        let mut format = natural_format;
+        let mut richness_phrase = natural_phrase;
+        // Re-surface suppression (design §9.4): a story already shown to this subscriber with no new
+        // events since — and not graduating Note → Story (natural richness grew) — fades to a compact
+        // "still developing" note and is priority-damped, so it sinks and eventually ages out. A
+        // genuinely new event (or a graduation) re-surfaces it at full weight.
+        if let Some(shown) = c.last_shown {
+            let new_events = c.last_event_time > shown.last_event_time;
+            let graduated = shown.format == Format::Note && natural_format == Format::Story;
+            if !new_events && !graduated {
+                format = Format::Note;
+                richness_phrase = "still developing";
+                p *= cfg.resurface_penalty;
+            }
+        }
+        gated.push(Gated {
+            id: c.id,
+            last_event_time: c.last_event_time,
+            relevance: r,
+            priority: p,
+            natural_format,
+            format,
+            richness: richness_phrase,
+        });
     }
 
     // 2. Rank by priority desc, then recency, then id — deterministic. With no thread term and equal
@@ -331,6 +390,7 @@ pub fn select(
             last_event_time: g.last_event_time,
             relevance: g.relevance,
             priority: g.priority,
+            natural_format: g.natural_format,
             format: g.format,
             richness: g.richness.to_string(),
             verdict,
@@ -391,6 +451,86 @@ mod tests {
         c.has_private = true;
         c.relevance = 2.0; // a thread term from apply_thread_weights
         assert_eq!(relevance(&c, &cfg), 3.5); // base 1.0 + scope 0.5 + thread 2.0
+    }
+
+    #[test]
+    fn stale_resurface_fades_to_a_still_developing_note() {
+        // A longform Story shown before with no new events since → demoted to a "still developing"
+        // Note and priority-damped (design §9.4).
+        let cfg = ScoringConfig::default();
+        let mut c = story(1, 100);
+        c.last_shown = Some(Shown {
+            last_event_time: at(100),
+            format: Format::Story,
+        });
+        let out = select(vec![c], &cfg, at(100));
+        assert_eq!(out[0].format, Format::Note);
+        assert_eq!(out[0].richness, "still developing");
+    }
+
+    #[test]
+    fn damped_resurface_snapshots_its_natural_format_not_the_demotion() {
+        // A longform Story re-surfaced with no news renders as a Note, but its *natural* format stays
+        // Story — so the snapshot frozen for next time won't spuriously "graduate" it (no oscillation).
+        let cfg = ScoringConfig::default();
+        let mut c = story(1, 100);
+        c.last_shown = Some(Shown {
+            last_event_time: at(100),
+            format: Format::Story,
+        });
+        let out = select(vec![c], &cfg, at(100));
+        assert_eq!(
+            out[0].format,
+            Format::Note,
+            "rendered as a still-developing note"
+        );
+        assert_eq!(
+            out[0].natural_format,
+            Format::Story,
+            "but the snapshotted natural format is unchanged"
+        );
+    }
+
+    #[test]
+    fn new_event_resurfaces_at_full_weight() {
+        let cfg = ScoringConfig::default();
+        let mut c = story(1, 200); // a newer event than when last shown
+        c.last_shown = Some(Shown {
+            last_event_time: at(100),
+            format: Format::Story,
+        });
+        let out = select(vec![c], &cfg, at(200));
+        assert_eq!(out[0].format, Format::Story);
+        assert_ne!(out[0].richness, "still developing");
+    }
+
+    #[test]
+    fn note_to_story_graduation_resurfaces_despite_no_new_events() {
+        let cfg = ScoringConfig::default();
+        let mut c = story(1, 100);
+        c.source_diversity = 2; // richness grew → now a Story
+        c.last_shown = Some(Shown {
+            last_event_time: at(100),
+            format: Format::Note, // last shown as a Note, no new events
+        });
+        let out = select(vec![c], &cfg, at(100));
+        assert_eq!(out[0].format, Format::Story);
+        assert_ne!(out[0].richness, "still developing");
+    }
+
+    #[test]
+    fn stale_resurface_sinks_below_a_fresh_peer() {
+        let cfg = ScoringConfig::default();
+        let mut stale = story(1, 100);
+        stale.last_shown = Some(Shown {
+            last_event_time: at(100),
+            format: Format::Story,
+        });
+        let fresh = story(2, 100); // same recency, never shown
+        let out = select(vec![stale, fresh], &cfg, at(100));
+        // The fresh Story out-ranks the damped "still developing" note.
+        assert_eq!(out[0].id, Uuid::from_u128(2));
+        assert_eq!(out[0].format, Format::Story);
     }
 
     #[test]

@@ -79,6 +79,8 @@ pub enum DebugCommand {
     },
     /// Explain a subscriber's selection: every candidate cluster + why it's in or out (dry-run)
     DigestExplain { subscriber: Uuid },
+    /// Show the data behind a story: its event timeline (source · link · time), oldest-first
+    DigestProvenance { story_id: Uuid },
     /// Print a single-glance snapshot of pipeline state (events, clusters, queue, …)
     Status,
 }
@@ -270,6 +272,9 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> R
         DebugCommand::DigestExplain { subscriber } => {
             print_explain(&digest::explain(pool, subscriber).await?);
         }
+        DebugCommand::DigestProvenance { story_id } => {
+            print_provenance(story_id, &digest::provenance(pool, story_id).await?);
+        }
         DebugCommand::Status => {
             print_status(&status::gather(pool).await?);
         }
@@ -332,6 +337,27 @@ fn print_explain(rows: &[digest::ExplainRow]) {
         }
     }
     println!("\n{selected} selected · {over_cap} over cap · {dropped} dropped");
+}
+
+/// Renders a story's provenance timeline (design §10.1) — one event per line, oldest-first, each with
+/// its time, source, title, and backing link. The "show the data behind this story" drill-down.
+fn print_provenance(story_id: Uuid, entries: &[digest::store::TimelineEntry]) {
+    if entries.is_empty() {
+        println!("no events behind story {story_id} (unknown, tombstoned, or empty)");
+        return;
+    }
+    println!("timeline for story {story_id} ({} events):", entries.len());
+    for e in entries {
+        println!(
+            "{}\t{}\t{}",
+            e.event_time.format("%Y-%m-%dT%H:%M:%SZ"),
+            e.source.as_str(),
+            e.title,
+        );
+        if let Some(link) = &e.link {
+            println!("  {link}");
+        }
+    }
 }
 
 /// Renders the `status` dashboard: each subsystem on its own line(s). The watchpoints to scan are

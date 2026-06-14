@@ -20,8 +20,9 @@ use uuid::Uuid;
 use crate::common::db::{with_scope, ScopeCtx};
 use crate::digest::select::{select, Candidate, Decision, DecisionRecord, ItemReason, Verdict};
 use crate::digest::store::{
-    build_render_item, cluster_cards, create_with_items, load_config, mark_delivered,
-    record_decisions, render_items, render_items_for_stories, RenderItem,
+    build_render_item, cluster_cards, create_with_items, last_shown, load_config, mark_delivered,
+    record_decisions, render_items, render_items_for_stories, story_owner, story_timeline,
+    FrozenItem, RenderItem, TimelineEntry,
 };
 use crate::digest::subscriber::{load_subscriber, SubscriberRow};
 use crate::link::{self, LinkedStory};
@@ -70,13 +71,15 @@ async fn link_and_select(
     sub: &SubscriberRow,
     last_run: Option<DateTime<Utc>>,
     horizon_days: i32,
+    shown_before: DateTime<Utc>,
     persist: bool,
 ) -> Result<(Vec<LinkedStory>, Vec<Decision>, HashMap<Uuid, Vec<String>>)> {
     let sub_id = sub.id;
-    // Read the candidate clusters + the prior story assignment in the subscriber's RLS context: the
-    // candidate set is `public ∪ own-private` (and the prior assignment is the subscriber's own
-    // stories), never another tenant's — the query says so, and now the DB enforces it (design §12).
-    let (clusters, prior) = with_scope(pool, ScopeCtx::Subscriber(sub_id), move |conn| {
+    // Read the candidate clusters, the prior story assignment, and the per-story "last shown"
+    // snapshots in the subscriber's RLS context: the candidate set is `public ∪ own-private` (and the
+    // prior assignment + snapshots are the subscriber's own), never another tenant's — the query says
+    // so, and now the DB enforces it (design §12).
+    let (clusters, prior, shown) = with_scope(pool, ScopeCtx::Subscriber(sub_id), move |conn| {
         Box::pin(async move {
             let clusters =
                 link::store::candidate_clusters(&mut *conn, sub_id, last_run, horizon_days)
@@ -85,7 +88,10 @@ async fn link_and_select(
             let prior = link::store::load_prior_members(&mut *conn, sub_id)
                 .await
                 .context("load prior story assignment")?;
-            Ok((clusters, prior))
+            let shown = last_shown(&mut *conn, sub_id, shown_before)
+                .await
+                .context("load last-shown snapshots")?;
+            Ok((clusters, prior, shown))
         })
     })
     .await?;
@@ -124,6 +130,7 @@ async fn link_and_select(
             content_depth: s.content_depth,
             max_severity: s.max_severity,
             has_private: s.has_private,
+            last_shown: shown.get(&s.id).copied(),
         })
         .collect();
     // Add the Thread relevance term before ranking (compiled out when the feature is off; a no-op
@@ -295,6 +302,22 @@ fn selected_ids(decisions: &[Decision]) -> Vec<Uuid> {
         .collect()
 }
 
+/// The selected stories as `FrozenItem`s — story id + the recency anchor + format to freeze on each
+/// `digest_item` (the re-surface snapshot, design §9.4), in render order.
+fn frozen_items(decisions: &[Decision]) -> Vec<FrozenItem> {
+    decisions
+        .iter()
+        .filter(|d| matches!(d.verdict, Verdict::Selected { .. }))
+        .map(|d| FrozenItem {
+            story_id: d.id,
+            last_event_time: d.last_event_time,
+            // Snapshot the *natural* richness format (not a re-surface demotion), so the next fire's
+            // graduation check compares like with like and a damped story doesn't oscillate.
+            format: d.natural_format,
+        })
+        .collect()
+}
+
 /// GenerateDigest for one subscriber: select the window's candidate clusters, freeze them into a
 /// digest, render, and deliver via `mailer` — advancing the subscriber's watermark on delivery.
 /// Idempotent and resumable: the `(subscriber, window_end)` row is created with its items in one
@@ -328,12 +351,21 @@ pub async fn generate(
 
     // Link the candidate clusters into stories (persisting the assignment so ids stay stable), then
     // rank the stories by recency. The story is the unit the digest freezes and renders (§8.2).
-    let (_, decisions, story_entities) =
-        link_and_select(pool, &sub, sub.last_run_at, CONTEXT_HORIZON_DAYS, true).await?;
+    // `window_end` is the re-surface cutoff: a story is "stale" only against digests *before* this
+    // one, so an idempotent re-run of the same window doesn't shadow-suppress its own selection.
+    let (_, decisions, story_entities) = link_and_select(
+        pool,
+        &sub,
+        sub.last_run_at,
+        CONTEXT_HORIZON_DAYS,
+        window_end,
+        true,
+    )
+    .await?;
     log_selection(sub.id, &decisions);
     let selected = selected_ids(&decisions);
 
-    let digest = create_with_items(pool, sub.id, window_end, &selected)
+    let digest = create_with_items(pool, sub.id, window_end, &frozen_items(&decisions))
         .await
         .context("create digest")?;
 
@@ -431,7 +463,7 @@ pub async fn dispatch_now(
     // A preview links in-memory but persists nothing (`false`): it must not disturb the real story
     // cache, schedule, or de-dup history.
     let (stories, decisions, story_entities) =
-        link_and_select(pool, &sub, None, lookback_days, false).await?;
+        link_and_select(pool, &sub, None, lookback_days, Utc::now(), false).await?;
     log_selection(sub.id, &decisions);
     let selected = selected_ids(&decisions);
 
@@ -526,8 +558,15 @@ pub async fn explain(pool: &PgPool, subscriber_id: Uuid) -> Result<Vec<ExplainRo
         .await
         .context("build private clusters")?;
 
-    let (stories, decisions, story_entities) =
-        link_and_select(pool, &sub, sub.last_run_at, CONTEXT_HORIZON_DAYS, false).await?;
+    let (stories, decisions, story_entities) = link_and_select(
+        pool,
+        &sub,
+        sub.last_run_at,
+        CONTEXT_HORIZON_DAYS,
+        sub.next_run_at,
+        false,
+    )
+    .await?;
 
     let by_id: HashMap<Uuid, &LinkedStory> = stories.iter().map(|s| (s.id, s)).collect();
     let ids: Vec<Uuid> = stories
@@ -564,4 +603,31 @@ pub async fn explain(pool: &PgPool, subscriber_id: Uuid) -> Result<Vec<ExplainRo
             }
         })
         .collect())
+}
+
+/// "Show the data behind this story" (design §10.1): the event timeline of one story, oldest-first
+/// (source + link + time per event). Resolves the story's owning subscriber via the admin
+/// control-plane context, then walks `story.clusters → events` in *that subscriber's* RLS scope, so
+/// the story's private events are visible to exactly their owner. Empty for an unknown story. The
+/// `digest-provenance` debug command renders it.
+pub async fn provenance(pool: &PgPool, story_id: Uuid) -> Result<Vec<TimelineEntry>> {
+    let owner = with_scope(pool, ScopeCtx::Admin, move |conn| {
+        Box::pin(async move {
+            story_owner(&mut *conn, story_id)
+                .await
+                .context("resolve story owner")
+        })
+    })
+    .await?;
+    let Some(owner) = owner else {
+        return Ok(Vec::new());
+    };
+    with_scope(pool, ScopeCtx::Subscriber(owner), move |conn| {
+        Box::pin(async move {
+            story_timeline(&mut *conn, story_id)
+                .await
+                .context("load story timeline")
+        })
+    })
+    .await
 }
