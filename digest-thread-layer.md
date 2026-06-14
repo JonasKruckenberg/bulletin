@@ -200,6 +200,13 @@ PROJECTION (read side · subscriber's wall clock · punctual · pure over snapsh
 Cost is bounded by the subscriber's entity count (hundreds to low thousands — *a life, not the
 firehose*). Milliseconds; relaxed cadence; best-effort; coalescing. Never blocks a fire.
 
+> **Where the ML lives.** The semantic comprehension this layer wants — embeddings (the
+> no-shared-token linking/identity bridge), reranking, entity/state extraction, and Story/Thread-delta
+> summarization — runs **here, inside `thread_maintenance`/build**, exactly because it is write-side and
+> off the punctual path. A locally-hosted, all-Apache, no-egress model stack is viable on modest
+> hardware; see **`digest-local-ml-options.md`** for the mid-2026 serving stack (`llama-server` + TEI)
+> and per-task model picks. This keeps the §12 trust property: no private content ever leaves the box.
+
 ### 5.2 Projection (fire-time) changes
 
 - **Thread-assign:** for each freshly-linked story, GIN-lookup threads sharing ≥ k canonical entities,
