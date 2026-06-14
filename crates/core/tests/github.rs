@@ -49,9 +49,16 @@ fn issue_event_maps_to_longform_thread() {
     assert_eq!(new.group_key, "gh:octo/repo#issue-42");
     assert!(new.title.contains("issue opened: A bug"));
     assert_eq!(new.links, vec!["https://github.com/octo/repo/issues/42"]);
+    // Structural entities are namespaced (`repo:`/`user:`); `finalize` also derives the `url:`/
+    // `domain:` keys from the html_url. Sorted + deduped.
     assert_eq!(
         new.entities,
-        vec!["octo/repo".to_string(), "alice".to_string()]
+        vec![
+            "domain:github.com".to_string(),
+            "repo:octo/repo".to_string(),
+            "url:https://github.com/octo/repo/issues/42".to_string(),
+            "user:alice".to_string(),
+        ]
     );
 }
 

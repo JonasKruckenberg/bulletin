@@ -146,12 +146,24 @@ fn render_plain(window_end: DateTime<Utc>, tz: Tz, greeting: &str, items: &[Rend
             body.push_str(&format!("   {link}\n"));
         }
         body.push_str(&format!(
-            "   {} · {}\n\n",
+            "   {} · {}\n",
             item.source.as_str(),
             item.last_event_time
                 .with_timezone(&tz)
                 .format("%Y-%m-%d %H:%M %Z")
         ));
+        // The cross-source connections fused into this story, each with why it belongs (§8.2).
+        for conn in &item.connections {
+            body.push_str(&format!("   ↳ {} [{}]", conn.title, conn.source.as_str()));
+            if let Some(reason) = &conn.link_reason {
+                body.push_str(&format!(" — {reason}"));
+            }
+            body.push('\n');
+            if let Some(link) = &conn.link {
+                body.push_str(&format!("     {link}\n"));
+            }
+        }
+        body.push('\n');
     }
     body
 }
@@ -387,6 +399,7 @@ fn render_item_row(item: &RenderItem, tz: Tz, category: &str, item_summary: &str
         .last_event_time
         .with_timezone(&tz)
         .format("%b %-d, %H:%M %Z");
+    let connections = render_connections(&item.connections);
 
     format!(
         r#"<tr>
@@ -398,7 +411,7 @@ fn render_item_row(item: &RenderItem, tz: Tz, category: &str, item_summary: &str
 <!-- PLACEHOLDER: per-item summary — remove or replace once items carry a summary -->
 <div style="margin-top:12px;font-family:{SERIF};font-size:16px;font-style:italic;line-height:1.65;color:{INK_MUTED};">{item_summary}</div>
 <!-- /PLACEHOLDER -->
-<!-- DEBUG: source + timestamp — debugging info, remove before launch -->
+{connections}<!-- DEBUG: source + timestamp — debugging info, remove before launch -->
 <div style="margin-top:14px;font-family:{SANS};font-size:12px;letter-spacing:0.02em;">
 <span style="font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:{ACCENT};">{source}</span>
 <span style="color:{INK_MUTED};">&nbsp;&middot;&nbsp;{time}</span>
@@ -406,6 +419,48 @@ fn render_item_row(item: &RenderItem, tz: Tz, category: &str, item_summary: &str
 <!-- /DEBUG -->
 </td>
 </tr>
+"#
+    )
+}
+
+/// The "Connected across sources" block: the cross-source clusters fused into a story (design §8.2),
+/// each a headline (linked when it has a URL), a source tag, and the `link_reason` for why it belongs
+/// — the M3 value made visible. Empty for a singleton story, so a lone item renders unchanged.
+fn render_connections(connections: &[crate::digest::store::Connection]) -> String {
+    if connections.is_empty() {
+        return String::new();
+    }
+    let mut rows = String::new();
+    for c in connections {
+        let title = escape(&c.title);
+        let head = match &c.link {
+            Some(link) => format!(
+                r#"<a href="{}" style="color:{INK_BODY};text-decoration:none;font-weight:700;">{title}</a>"#,
+                escape(link)
+            ),
+            None => format!(r#"<span style="color:{INK_BODY};font-weight:700;">{title}</span>"#),
+        };
+        let source = escape(c.source.as_str());
+        let reason = c
+            .link_reason
+            .as_deref()
+            .map(|r| {
+                format!(
+                    r#" <span style="color:{INK_MUTED};">— {}</span>"#,
+                    escape(r)
+                )
+            })
+            .unwrap_or_default();
+        rows.push_str(&format!(
+            r#"<div style="margin-top:8px;font-family:{SERIF};font-size:15px;line-height:1.5;color:{INK_BODY};">
+<span style="color:{ACCENT};">&#8627;</span> {head} <span style="font-family:{SANS};font-size:11px;text-transform:uppercase;letter-spacing:0.06em;color:{ACCENT};">{source}</span>{reason}</div>
+"#
+        ));
+    }
+    format!(
+        r#"<div style="margin-top:16px;padding-top:4px;">
+<div style="font-family:{SANS};font-size:11px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:{INK_MUTED};">Connected across sources</div>
+{rows}</div>
 "#
     )
 }
@@ -439,6 +494,7 @@ mod tests {
             link: link.map(str::to_string),
             source,
             last_event_time: Utc.with_ymd_and_hms(2026, 6, 13, 8, 30, 0).unwrap(),
+            connections: Vec::new(),
         }
     }
 

@@ -107,6 +107,20 @@ impl EventBuilder {
             _ => Scope::Public,
         };
         let fingerprint = Fingerprint::compute(self.source.as_str(), &self.stable_id);
+
+        // Enrich the connector's structural entities (`repo:`/`user:`) with the cross-source keys
+        // (`cve:`/`url:`/`domain:`) mined from this event's text + links, in one place so every
+        // source gets them uniformly — they are the blocking substrate M3 linking runs on (§8.2).
+        // Entities are *not* folded into the fingerprint, so enrichment never disturbs dedup.
+        let mut entities = self.entities;
+        entities.extend(super::entity::derive(
+            &self.title,
+            self.body.as_deref(),
+            &self.links,
+        ));
+        entities.sort();
+        entities.dedup();
+
         NewEvent {
             source: self.source,
             scope,
@@ -117,7 +131,7 @@ impl EventBuilder {
             links: self.links,
             group_key: self.group_key,
             content_kind: self.content_kind,
-            entities: self.entities,
+            entities,
             severity_hint: self.severity_hint,
             raw: self.raw,
         }

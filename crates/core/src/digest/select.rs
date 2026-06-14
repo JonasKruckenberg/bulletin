@@ -1,9 +1,11 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-/// A candidate cluster for a digest: its id and the recency key selection orders by.
+/// A candidate for a digest: an id (a **story** id since M3 — a fused cross-source unit) and the
+/// recency key selection orders by. Selection is generic over what the id names; pre-M3 it was a
+/// cluster, now it is a story (one or more clusters linked together).
 pub struct Candidate {
-    pub cluster_id: Uuid,
+    pub id: Uuid,
     pub last_event_time: DateTime<Utc>,
 }
 
@@ -20,16 +22,16 @@ pub enum Verdict {
 /// A candidate paired with its verdict — the selection's audit trail.
 #[derive(Debug, Clone)]
 pub struct Decision {
-    pub cluster_id: Uuid,
+    pub id: Uuid,
     pub last_event_time: DateTime<Utc>,
     pub verdict: Verdict,
 }
 
-/// Recency-ordered, tiebreak-stable: newest first, ties broken by `cluster_id`.
+/// Recency-ordered, tiebreak-stable: newest first, ties broken by `id`.
 fn by_recency(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
     b.last_event_time
         .cmp(&a.last_event_time)
-        .then_with(|| a.cluster_id.cmp(&b.cluster_id))
+        .then_with(|| a.id.cmp(&b.id))
 }
 
 /// Pure selection: order candidates newest-first and cap at `max_items`, returning a verdict for
@@ -49,7 +51,7 @@ pub fn select(candidates: Vec<Candidate>, max_items: usize) -> Vec<Decision> {
                 Verdict::OverCap { rank }
             };
             Decision {
-                cluster_id: c.cluster_id,
+                id: c.id,
                 last_event_time: c.last_event_time,
                 verdict,
             }
@@ -65,7 +67,7 @@ mod tests {
 
     fn cand(id: u128, secs: i64) -> Candidate {
         Candidate {
-            cluster_id: Uuid::from_u128(id),
+            id: Uuid::from_u128(id),
             last_event_time: Utc.timestamp_opt(secs, 0).single().unwrap(),
         }
     }
@@ -73,7 +75,7 @@ mod tests {
     fn selected_ids(decisions: &[Decision]) -> Vec<Uuid> {
         decisions
             .iter()
-            .filter_map(|d| matches!(d.verdict, Verdict::Selected { .. }).then_some(d.cluster_id))
+            .filter_map(|d| matches!(d.verdict, Verdict::Selected { .. }).then_some(d.id))
             .collect()
     }
 
@@ -91,11 +93,11 @@ mod tests {
         // newest→oldest: id2(300), id3(200), id1(100); cap 2 → id1 is over-cap.
         let out = select(vec![cand(1, 100), cand(2, 300), cand(3, 200)], 2);
         assert_eq!(out.len(), 3);
-        assert_eq!(out[0].cluster_id, Uuid::from_u128(2));
+        assert_eq!(out[0].id, Uuid::from_u128(2));
         assert_eq!(out[0].verdict, Verdict::Selected { position: 0 });
-        assert_eq!(out[1].cluster_id, Uuid::from_u128(3));
+        assert_eq!(out[1].id, Uuid::from_u128(3));
         assert_eq!(out[1].verdict, Verdict::Selected { position: 1 });
-        assert_eq!(out[2].cluster_id, Uuid::from_u128(1));
+        assert_eq!(out[2].id, Uuid::from_u128(1));
         assert_eq!(out[2].verdict, Verdict::OverCap { rank: 2 });
     }
 

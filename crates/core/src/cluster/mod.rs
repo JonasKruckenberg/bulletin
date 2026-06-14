@@ -11,17 +11,21 @@ use uuid::Uuid;
 
 use crate::common::{event::Event, kind::SourceKind, scope::Scope};
 
-/// The recomputed rollup the build upserts onto a cluster row. M1 keeps only what the digest
-/// reads — the latest event's title/link and the group's recency. Richer rollups (counts,
-/// severity, entities) re-add later, when something consumes them.
+/// The recomputed rollup the build upserts onto a cluster row: the latest event's title/link, the
+/// group's recency span, and the union of its events' `entities` — the blocking substrate M3 linking
+/// runs on (§8.2). Richer rollups (counts, severity, depth) re-add in M4, when scoring consumes them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterRollup {
     /// Representative title — the latest event's title.
     pub title: String,
     /// Representative link — the latest event's primary link, if any.
     pub link: Option<String>,
+    /// Earliest event_time in the group — the start of its recency span.
+    pub first_event_time: DateTime<Utc>,
     /// Most recent event_time in the group — the selection ordering key.
     pub last_event_time: DateTime<Utc>,
+    /// Sorted, de-duplicated union of the group's event entities — the linking blocking key.
+    pub entities: Vec<String>,
 }
 
 /// Pure rollup: fold a within-source group of events into a cluster rollup. The representative
@@ -29,15 +33,23 @@ pub struct ClusterRollup {
 /// store loads a group ordered by `(event_time, id)`). Returns `None` for an empty group.
 pub fn rollup(events: &[Event]) -> Option<ClusterRollup> {
     let mut representative = events.first()?;
+    let mut first = representative.event_time;
+    let mut entities: Vec<String> = Vec::new();
     for ev in events {
         if ev.event_time >= representative.event_time {
             representative = ev;
         }
+        first = first.min(ev.event_time);
+        entities.extend(ev.entities.iter().cloned());
     }
+    entities.sort();
+    entities.dedup();
     Some(ClusterRollup {
         title: representative.title.clone(),
         link: representative.links.first().cloned(),
+        first_event_time: first,
         last_event_time: representative.event_time,
+        entities,
     })
 }
 
@@ -63,7 +75,7 @@ pub fn cluster_key(event: &Event) -> ClusterKey {
 }
 
 /// Whether a cluster of the given `scope` may appear in `subscriber`'s digest candidate set: public
-/// is shared, private is owner-only. The in-code mirror of the `candidates_in_lookback` predicate
+/// is shared, private is owner-only. The in-code mirror of the candidate-cluster predicate
 /// (`scope_kind = 'public' OR scope_subscriber_id = $sub`) — the isolation invariant the proptests
 /// pin so a logic change can't silently leak another subscriber's private cluster.
 pub fn visible_to(scope: &Scope, subscriber: Uuid) -> bool {
@@ -301,7 +313,7 @@ mod tests {
 
         // A subscriber's digest candidate set (`public ∪ own-private`) never contains another
         // subscriber's private cluster, and never hides their own — `visible_to` is exactly the
-        // `candidates_in_lookback` predicate, pinned here so a query change can't silently leak.
+        // candidate-cluster predicate, pinned here so a query change can't silently leak.
         #[test]
         fn candidate_set_isolates_private_clusters(
             specs in prop::collection::vec((0u8..3, "[a-c]", 0i64..1000), 0..40),

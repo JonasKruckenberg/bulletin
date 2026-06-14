@@ -17,13 +17,13 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::common::kind::SourceKind;
-use crate::digest::select::{select, Decision, Verdict};
+use crate::digest::select::{select, Candidate, Decision, Verdict};
 use crate::digest::store::{
-    candidates_in_lookback, cluster_display, create_with_items, mark_delivered, render_items,
-    render_items_for_clusters,
+    build_render_item, cluster_cards, create_with_items, mark_delivered, render_items,
+    render_items_for_stories, RenderItem,
 };
 use crate::digest::subscriber::{load_subscriber, SubscriberRow};
+use crate::link::{self, LinkedStory};
 
 /// How far back a digest's candidate lookback reaches for *context*, beyond the guaranteed
 /// reach-back to the last delivery (design §9.4). Generous on purpose: it must exceed the longest
@@ -54,29 +54,55 @@ async fn load_required(pool: &PgPool, subscriber_id: Uuid) -> Result<SubscriberR
         .ok_or_else(|| anyhow!("subscriber {subscriber_id} not found"))
 }
 
-/// The pure selection over a lookback floor — the shared core of the scheduled digest, the ad-hoc
-/// dispatch, and `explain`, so all three rank candidates identically. The caller logs/uses the
-/// decisions and decides the floor: `last_run`/`CONTEXT_HORIZON_DAYS` on schedule, `None`/an explicit
-/// lookback off-schedule.
-async fn select_over_lookback(
+/// Link this subscriber's candidate clusters into stories, then rank them — the shared core of the
+/// scheduled digest, the ad-hoc dispatch, and `explain`, so all three link and rank identically
+/// (design §8.2). Returns the linked stories and a `Decision` per story.
+///
+/// The candidate set is scoped `public ∪ own-private` (never another subscriber's), and `link` runs
+/// per subscriber because a story can fuse public clusters with this subscriber's own private ones.
+/// `persist` writes the new assignment (the scheduled path, so stable ids carry forward and stories
+/// can be frozen); the dry-run paths (`dispatch`/`explain`) pass `false` and keep the result
+/// in-memory. The caller decides the lookback floor: `last_run`/`CONTEXT_HORIZON_DAYS` on schedule,
+/// `None`/an explicit lookback off-schedule.
+async fn link_and_select(
     pool: &PgPool,
     sub: &SubscriberRow,
     last_run: Option<DateTime<Utc>>,
     horizon_days: i32,
-) -> Result<Vec<Decision>> {
-    // Scoped to this subscriber: the candidate set is `public ∪ own-private`, never another's.
-    let candidates = candidates_in_lookback(pool, sub.id, last_run, horizon_days)
+    persist: bool,
+) -> Result<(Vec<LinkedStory>, Vec<Decision>)> {
+    let clusters = link::store::candidate_clusters(pool, sub.id, last_run, horizon_days)
         .await
-        .context("collect candidates")?;
-    Ok(select(candidates, sub.max_items as usize))
+        .context("collect candidate clusters")?;
+    let prior = link::store::load_prior_members(pool, sub.id)
+        .await
+        .context("load prior story assignment")?;
+
+    let assignment = link::link(&clusters, &prior, Uuid::now_v7);
+    if persist {
+        link::store::persist_assignment(pool, sub.id, &assignment)
+            .await
+            .context("persist story assignment")?;
+    }
+
+    let candidates = assignment
+        .stories
+        .iter()
+        .map(|s| Candidate {
+            id: s.id,
+            last_event_time: s.last_event_time,
+        })
+        .collect();
+    let decisions = select(candidates, sub.max_items as usize);
+    Ok((assignment.stories, decisions))
 }
 
-/// The cluster ids that made the cut, in render order.
+/// The story ids that made the cut, in render order.
 fn selected_ids(decisions: &[Decision]) -> Vec<Uuid> {
     decisions
         .iter()
         .filter(|d| matches!(d.verdict, Verdict::Selected { .. }))
-        .map(|d| d.cluster_id)
+        .map(|d| d.id)
         .collect()
 }
 
@@ -111,7 +137,10 @@ pub async fn generate(
         .await
         .context("build private clusters")?;
 
-    let decisions = select_over_lookback(pool, &sub, sub.last_run_at, CONTEXT_HORIZON_DAYS).await?;
+    // Link the candidate clusters into stories (persisting the assignment so ids stay stable), then
+    // rank the stories by recency. The story is the unit the digest freezes and renders (§8.2).
+    let (_, decisions) =
+        link_and_select(pool, &sub, sub.last_run_at, CONTEXT_HORIZON_DAYS, true).await?;
     log_selection(sub.id, sub.max_items as usize, &decisions);
     let selected = selected_ids(&decisions);
 
@@ -192,11 +221,19 @@ pub async fn dispatch_now(
         .context("build private clusters")?;
 
     // Explicit lookback floor = now − lookback_days (last_run_at is ignored — this is off-schedule).
-    let decisions = select_over_lookback(pool, &sub, None, lookback_days).await?;
+    // A preview links in-memory but persists nothing (`false`): it must not disturb the real story
+    // cache, schedule, or de-dup history.
+    let (stories, decisions) = link_and_select(pool, &sub, None, lookback_days, false).await?;
     log_selection(sub.id, sub.max_items as usize, &decisions);
     let selected = selected_ids(&decisions);
 
-    let items = render_items_for_clusters(pool, &selected)
+    // Reassemble the selected stories (in render order) from the in-memory assignment.
+    let by_id: HashMap<Uuid, &LinkedStory> = stories.iter().map(|s| (s.id, s)).collect();
+    let selected_stories: Vec<LinkedStory> = selected
+        .iter()
+        .filter_map(|id| by_id.get(id).map(|s| (*s).clone()))
+        .collect();
+    let items = render_items_for_stories(pool, &selected_stories)
         .await
         .context("load render items")?;
     if items.is_empty() {
@@ -240,7 +277,7 @@ fn log_selection(subscriber_id: Uuid, cap: usize, decisions: &[Decision]) {
     );
     for d in decisions {
         tracing::debug!(
-            cluster_id = %d.cluster_id,
+            story_id = %d.id,
             last_event_time = %d.last_event_time,
             verdict = ?d.verdict,
             "selection decision"
@@ -248,41 +285,47 @@ fn log_selection(subscriber_id: Uuid, cap: usize, decisions: &[Decision]) {
     }
 }
 
-/// One candidate's selection verdict joined to its display fields — a row of `digest-explain`.
+/// One candidate **story**'s selection verdict joined to its assembled render item — a row of
+/// `digest-explain`. `item` is the same representative + connections the email would show (`None` if
+/// the story resolves to no cluster), so the dry-run reflects exactly what would be rendered.
 pub struct ExplainRow {
     pub verdict: Verdict,
-    pub cluster_id: Uuid,
-    pub source: Option<SourceKind>,
-    pub title: Option<String>,
+    pub story_id: Uuid,
     pub last_event_time: DateTime<Utc>,
+    pub item: Option<RenderItem>,
 }
 
-/// Dry-run of selection for a subscriber: every candidate cluster paired with its verdict and a
-/// human-readable title, with **no writes and no send**. Runs the exact same pure `select` the
-/// real digest does, over the subscriber's scheduled lookback.
+/// Dry-run of linking + selection for a subscriber: every candidate story paired with its verdict
+/// and its assembled render item, with **no writes and no send** (it links in-memory but persists
+/// nothing). Runs the exact same pure `link` + `select` the real digest does, over the subscriber's
+/// scheduled lookback — so it explains both *why a story is in/out* and *why its clusters fused*.
 pub async fn explain(pool: &PgPool, subscriber_id: Uuid) -> Result<Vec<ExplainRow>> {
     let sub = load_required(pool, subscriber_id).await?;
-    let decisions = select_over_lookback(pool, &sub, sub.last_run_at, CONTEXT_HORIZON_DAYS).await?;
-
-    let ids: Vec<Uuid> = decisions.iter().map(|d| d.cluster_id).collect();
-    let display: HashMap<Uuid, _> = cluster_display(pool, &ids)
+    crate::cluster::build_private(pool, sub.id)
         .await
-        .context("load cluster display")?
-        .into_iter()
-        .map(|c| (c.id, c))
+        .context("build private clusters")?;
+
+    let (stories, decisions) =
+        link_and_select(pool, &sub, sub.last_run_at, CONTEXT_HORIZON_DAYS, false).await?;
+
+    let by_id: HashMap<Uuid, &LinkedStory> = stories.iter().map(|s| (s.id, s)).collect();
+    let ids: Vec<Uuid> = stories
+        .iter()
+        .flat_map(|s| s.clusters.iter().map(|c| c.cluster_id))
         .collect();
+    let cards = cluster_cards(pool, &ids)
+        .await
+        .context("load cluster cards")?;
 
     Ok(decisions
         .into_iter()
-        .map(|d| {
-            let disp = display.get(&d.cluster_id);
-            ExplainRow {
-                verdict: d.verdict,
-                cluster_id: d.cluster_id,
-                source: disp.map(|c| c.source),
-                title: disp.map(|c| c.title.clone()),
-                last_event_time: d.last_event_time,
-            }
+        .map(|d| ExplainRow {
+            verdict: d.verdict,
+            story_id: d.id,
+            last_event_time: d.last_event_time,
+            item: by_id
+                .get(&d.id)
+                .and_then(|s| build_render_item(&s.clusters, &cards)),
         })
         .collect())
 }

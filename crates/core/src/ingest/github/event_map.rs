@@ -311,9 +311,12 @@ pub fn lifecycle_status(body: &serde_json::Value) -> Option<LifecycleStatus> {
 /// Map one GitHub activity to a connector-side event builder. Infra `finalize`s it (scope +
 /// fingerprint); the `stable_id` here is what the fingerprint is computed over.
 pub fn to_builder(ev: GithubEvent) -> EventBuilder {
-    let mut entities = vec![ev.repo.name.clone()];
+    // Structural entities, namespaced so they classify as *weak* linking keys and don't collide
+    // across kinds (`repo:acme/x` ≠ `user:acme`). `finalize` adds the cross-source `cve:`/`url:`
+    // keys mined from the title/links on top (§8.2).
+    let mut entities = vec![format!("repo:{}", ev.repo.name)];
     if !ev.actor.login.is_empty() {
-        entities.push(ev.actor.login.clone());
+        entities.push(format!("user:{}", ev.actor.login));
     }
     let links: Vec<String> = html_url(&ev).into_iter().collect();
 

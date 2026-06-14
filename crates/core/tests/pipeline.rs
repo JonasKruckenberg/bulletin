@@ -6,15 +6,17 @@
 use bulletin_core::cluster::store::{
     advance_build_watermark, build_bounds, dirty_groups, list_group_events, upsert_cluster,
 };
-use bulletin_core::digest::select::{select, Verdict};
-use bulletin_core::digest::store::{
-    candidates_in_lookback, create_with_items, mark_delivered, render_items,
-};
+use bulletin_core::digest::select::{select, Candidate, Verdict};
+use bulletin_core::digest::store::{create_with_items, mark_delivered, render_items};
 use bulletin_core::digest::subscriber::{
     advance_after_delivery, due_subscribers, insert_subscriber, load_subscriber,
     update_preferences, Recurrence,
 };
 use bulletin_core::ingest::store::insert_event;
+use bulletin_core::link::{
+    link,
+    store::{candidate_clusters, load_prior_members, persist_assignment},
+};
 use bulletin_core::{
     cluster::{build_private, rollup},
     connect,
@@ -130,6 +132,34 @@ async fn cluster_count(pool: &PgPool) -> i64 {
         .get("n")
 }
 
+/// Link a subscriber's candidate clusters into stories, persist the assignment, and return the
+/// selected story ids in render order — the store-level mirror of `digest::generate`'s middle.
+async fn select_stories(
+    pool: &PgPool,
+    sub_id: Uuid,
+    last_run: Option<chrono::DateTime<Utc>>,
+    max_items: usize,
+) -> Vec<Uuid> {
+    let clusters = candidate_clusters(pool, sub_id, last_run, 30)
+        .await
+        .unwrap();
+    let assignment = link(&clusters, &[], Uuid::now_v7);
+    persist_assignment(pool, sub_id, &assignment).await.unwrap();
+    let candidates: Vec<Candidate> = assignment
+        .stories
+        .iter()
+        .map(|s| Candidate {
+            id: s.id,
+            last_event_time: s.last_event_time,
+        })
+        .collect();
+    select(candidates, max_items)
+        .into_iter()
+        .filter(|d| matches!(d.verdict, Verdict::Selected { .. }))
+        .map(|d| d.id)
+        .collect()
+}
+
 // Each distinct group_key becomes its own cluster; events sharing a group_key collapse into one,
 // represented by the latest.
 #[tokio::test]
@@ -152,13 +182,24 @@ async fn build_groups_events_into_clusters() {
         .unwrap();
     assert_eq!(rollup(&shared).unwrap().title, "Shared latest");
 
-    let candidates = candidates_in_lookback(&pool, Uuid::nil(), None, 30)
+    let candidates = candidate_clusters(&pool, Uuid::nil(), None, 30)
         .await
         .unwrap();
     assert_eq!(candidates.len(), 3);
 
-    // Pure selection caps and orders newest-first.
-    let selected = select(candidates, 2)
+    // No shared linkable entity (distinct urls; a shared domain doesn't link) → 3 singleton stories;
+    // selection caps at 2.
+    let assignment = link(&candidates, &[], Uuid::now_v7);
+    assert_eq!(assignment.stories.len(), 3);
+    let cands: Vec<Candidate> = assignment
+        .stories
+        .iter()
+        .map(|s| Candidate {
+            id: s.id,
+            last_event_time: s.last_event_time,
+        })
+        .collect();
+    let selected = select(cands, 2)
         .into_iter()
         .filter(|d| matches!(d.verdict, Verdict::Selected { .. }))
         .count();
@@ -216,7 +257,7 @@ async fn no_build_gate_unbuilt_events_ride_next_fire() {
     );
     // ...but the unbuilt event is not yet a candidate.
     assert!(
-        candidates_in_lookback(&pool, Uuid::nil(), None, 30)
+        candidate_clusters(&pool, Uuid::nil(), None, 30)
             .await
             .unwrap()
             .is_empty(),
@@ -227,7 +268,7 @@ async fn no_build_gate_unbuilt_events_ride_next_fire() {
 
     // Once clustered it becomes a candidate.
     assert_eq!(
-        candidates_in_lookback(&pool, Uuid::nil(), None, 30)
+        candidate_clusters(&pool, Uuid::nil(), None, 30)
             .await
             .unwrap()
             .len(),
@@ -260,14 +301,7 @@ async fn digest_delivery_and_idempotency() {
     let sub = load_subscriber(&pool, sub_id).await.unwrap().unwrap();
     let window_end = sub.next_run_at;
 
-    let candidates = candidates_in_lookback(&pool, sub.id, sub.last_run_at, 30)
-        .await
-        .unwrap();
-    let selected: Vec<_> = select(candidates, sub.max_items as usize)
-        .into_iter()
-        .filter(|d| matches!(d.verdict, Verdict::Selected { .. }))
-        .map(|d| d.cluster_id)
-        .collect();
+    let selected = select_stories(&pool, sub.id, sub.last_run_at, sub.max_items as usize).await;
     assert_eq!(selected.len(), 2);
 
     let digest = create_with_items(&pool, sub_id, window_end, &selected)
@@ -351,14 +385,14 @@ async fn private_clusters_are_isolated_to_their_owner() {
 
     // Alice and Bob each see the public cluster + their own private one (2), never the other's.
     assert_eq!(
-        candidates_in_lookback(&pool, alice, None, 30)
+        candidate_clusters(&pool, alice, None, 30)
             .await
             .unwrap()
             .len(),
         2
     );
     assert_eq!(
-        candidates_in_lookback(&pool, bob, None, 30)
+        candidate_clusters(&pool, bob, None, 30)
             .await
             .unwrap()
             .len(),
@@ -366,7 +400,7 @@ async fn private_clusters_are_isolated_to_their_owner() {
     );
     // Carol sees only the shared public cluster.
     assert_eq!(
-        candidates_in_lookback(&pool, carol, None, 30)
+        candidate_clusters(&pool, carol, None, 30)
             .await
             .unwrap()
             .len(),
@@ -376,6 +410,89 @@ async fn private_clusters_are_isolated_to_their_owner() {
     // The total cluster count is 1 public + 2 private — a private event never lands in a public
     // cluster (scope is part of the cluster identity).
     assert_eq!(cluster_count(&pool).await, 3);
+}
+
+// M3 headline: a private GitHub PR and a public advisory naming the same CVE fuse into ONE story in
+// the owner's digest, with a link_reason; the story's id is stable across recompute; and the rendered
+// digest carries the fused item with its cross-source connection. The exit criteria, end to end.
+#[tokio::test]
+async fn cross_source_story_fuses_private_and_public_via_cve() {
+    let (pool, _pg) = setup().await;
+    let alice = insert_subscriber(
+        &pool,
+        "alice@x.com",
+        None,
+        Recurrence::Daily,
+        "UTC",
+        nine_am(),
+    )
+    .await
+    .unwrap();
+
+    // A public advisory and Alice's own private PR, both naming CVE-2026-1234 in their titles
+    // (so `finalize` mines the same strong `cve:` entity onto each).
+    insert_public(
+        &pool,
+        "adv",
+        "adv",
+        "Advisory: CVE-2026-1234 disclosed",
+        100,
+    )
+    .await;
+    insert_private(
+        &pool,
+        alice,
+        "pr",
+        "pr",
+        "Fix for CVE-2026-1234 in api",
+        200,
+    )
+    .await;
+    build_all(&pool).await;
+    assert_eq!(build_private(&pool, alice).await.unwrap(), 1);
+
+    // Alice's candidate set is her private PR + the public advisory; linking fuses them on the CVE.
+    let clusters = candidate_clusters(&pool, alice, None, 30).await.unwrap();
+    assert_eq!(clusters.len(), 2);
+    let assignment = link(&clusters, &[], Uuid::now_v7);
+    assert_eq!(
+        assignment.stories.len(),
+        1,
+        "the shared CVE fuses the public advisory and the private PR into one story"
+    );
+    let story = &assignment.stories[0];
+    assert_eq!(story.clusters.len(), 2);
+    assert!(
+        story
+            .clusters
+            .iter()
+            .all(|c| c.link_reason.as_deref() == Some("shared cve:CVE-2026-1234")),
+        "each member records why it linked"
+    );
+
+    // Persist, then recompute with the prior assignment: the story id is forwarded (stable).
+    persist_assignment(&pool, alice, &assignment).await.unwrap();
+    let prior = load_prior_members(&pool, alice).await.unwrap();
+    let again = link(&clusters, &prior, Uuid::now_v7);
+    assert_eq!(again.stories.len(), 1);
+    assert_eq!(
+        again.stories[0].id, story.id,
+        "the story id stays stable across recompute"
+    );
+    assert!(again.merges.is_empty());
+
+    // Freeze + render: one digest item (the fused story) carrying one cross-source connection.
+    let sub = load_subscriber(&pool, alice).await.unwrap().unwrap();
+    let digest = create_with_items(&pool, alice, sub.next_run_at, &[story.id])
+        .await
+        .unwrap();
+    let items = render_items(&pool, digest.id).await.unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].connections.len(),
+        1,
+        "the rendered story shows its fused cross-source member"
+    );
 }
 
 // PrivateBuild is watermark-bounded like the public build: it processes only events ingested since
