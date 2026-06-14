@@ -195,6 +195,29 @@ const BORDER: &str = "#ddd4c2"; // hairline rules between items
 const SERIF: &str = "Georgia, 'Times New Roman', serif";
 const SANS: &str = "'Helvetica Neue', Helvetica, Arial, sans-serif";
 
+// A deliberately off-palette "this is scaffolding" look for the debug block, so no reader mistakes
+// the selection trace for finished editorial content. Monospace type and a dashed amber callout read
+// as developer output, not design — and make the block obvious to strip later.
+const MONO: &str = "'SF Mono', 'SFMono-Regular', Menlo, Consolas, 'Liberation Mono', monospace";
+const DEBUG_BG: &str = "#fff8e1"; // pale amber notebook tint, foreign to the cream palette
+const DEBUG_BORDER: &str = "#e0a800"; // amber, for the dashed "draft" border
+const DEBUG_INK: &str = "#7a5c00"; // dark amber, the debug text colour
+
+/// A small progressive-enhancement stylesheet. The layout is all inline-CSS and works without this
+/// (most clients ignore `<style>`/media queries) — but the clients that *do* honour it, chiefly
+/// modern mobile mail, get tighter side padding and a touch larger type on narrow screens, where the
+/// 600px desktop card would otherwise feel cramped and small. Classes are layered over the inline
+/// defaults; `!important` lets the media query win where it applies, inline holds everywhere else.
+const MOBILE_CSS: &str = r#"<style>
+@media only screen and (max-width:480px) {
+  .bx { padding-left:24px !important; padding-right:24px !important; }
+  .lead { font-size:18px !important; line-height:1.75 !important; }
+  .headline { font-size:22px !important; }
+  .meta { font-size:14px !important; }
+  .related { font-size:16px !important; }
+}
+</style>"#;
+
 /// HTML view: a centered editorial card on warm paper — a small-caps brand label, a serif
 /// masthead, a `── date ──` rule, a short time-of-day greeting lead, then the selected items as a
 /// ruled list (a terracotta number, the headline link, a category, a summary, and a source · time
@@ -203,7 +226,8 @@ const SANS: &str = "'Helvetica Neue', Helvetica, Arial, sans-serif";
 /// The greeting stands in for the reference design's "big picture" summary until the digest
 /// produces a real one. Per-item sections the data model doesn't feed yet (category/summary) render
 /// parametric lorem-ipsum placeholders wrapped in `<!-- PLACEHOLDER … -->`; the source · time
-/// caption is debug-only and wrapped in `<!-- DEBUG … -->` — both are easy to grep out later.
+/// caption is debug-only, wrapped in `<!-- DEBUG … -->` and styled as a distinct monospace amber
+/// callout so it never reads as real content — both are easy to grep out later.
 ///
 /// Table-based, all-inline-CSS, single column — the "bulletproof" shape that survives the
 /// patchwork of email clients. The chrome comes from `content`; every piece of caller- or
@@ -236,7 +260,7 @@ fn render_html(
         if i > 0 {
             rows.push_str(&divider);
         }
-        rows.push_str(&render_item_row(item, tz, &category, &item_summary));
+        rows.push_str(&render_item_row(i, item, tz, &category, &item_summary));
     }
 
     format!(
@@ -248,6 +272,7 @@ fn render_html(
 <meta name="color-scheme" content="light">
 <meta name="supported-color-schemes" content="light">
 <title>Bulletin digest</title>
+{MOBILE_CSS}
 </head>
 <body style="margin:0;padding:0;background-color:{BG};-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%;">
 <div style="display:none;max-height:0;overflow:hidden;opacity:0;mso-hide:all;">{preheader}</div>
@@ -256,19 +281,19 @@ fn render_html(
 <td align="center" style="padding:36px 12px;">
 <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="width:600px;max-width:100%;background-color:{SURFACE};border:1px solid {BORDER};border-radius:4px;">
 <tr>
-<td style="padding:52px 52px 0 52px;">
+<td class="bx" style="padding:52px 40px 0 40px;">
 <div style="font-family:{SANS};font-size:12px;font-weight:600;letter-spacing:0.12em;text-transform:uppercase;color:{INK_MUTED};text-align:center;">{brand}</div>
 <h1 style="margin:18px 0 30px 0;font-family:{SERIF};font-size:34px;font-weight:700;line-height:1.25;color:{INK};text-align:center;">{title}</h1>
 {date_rule}
 <div style="font-family:{SERIF};font-size:15px;font-style:italic;font-weight:700;color:{ACCENT};margin:34px 0 12px 0;">The big picture</div>
 <!-- Lead: a time-of-day greeting (real) opens the paragraph, then the "big picture" summary. -->
-<div style="font-family:{SERIF};font-size:17px;line-height:1.75;color:{INK_BODY};margin:0;"><strong style="color:{INK};font-weight:700;">{greeting}</strong> <!-- PLACEHOLDER: "big picture" summary — remove or replace once the digest produces a real one -->{summary}<!-- /PLACEHOLDER --></div>
+<div class="lead" style="font-family:{SERIF};font-size:17px;line-height:1.75;color:{INK_BODY};margin:0;"><strong style="color:{INK};font-weight:700;">{greeting}</strong> <!-- PLACEHOLDER: "big picture" summary — remove or replace once the digest produces a real one -->{summary}<!-- /PLACEHOLDER --></div>
 <div style="font-family:{SERIF};font-size:15px;font-style:italic;font-weight:700;color:{ACCENT};margin:40px 0 0 0;">In this digest &middot; {count} item{plural}</div>
 </td>
 </tr>
 {rows}{soft_divider}<tr>
-<td style="padding:30px 52px 52px 52px;">
-<div style="font-family:{SANS};font-size:12px;line-height:1.7;color:{INK_MUTED};text-align:center;">{footer}</div>
+<td class="bx" style="padding:30px 40px 52px 40px;">
+<div class="meta" style="font-family:{SANS};font-size:13px;line-height:1.7;color:{INK_MUTED};text-align:center;">{footer}</div>
 </td>
 </tr>
 </table>
@@ -310,6 +335,7 @@ fn render_empty_html(
 <meta name="color-scheme" content="light">
 <meta name="supported-color-schemes" content="light">
 <title>Bulletin digest</title>
+{MOBILE_CSS}
 </head>
 <body style="margin:0;padding:0;background-color:{BG};-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%;">
 <div style="display:none;max-height:0;overflow:hidden;opacity:0;mso-hide:all;">{preheader}</div>
@@ -318,7 +344,7 @@ fn render_empty_html(
 <td align="center" style="padding:36px 12px;">
 <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="width:600px;max-width:100%;background-color:{SURFACE};border:1px solid {BORDER};border-radius:4px;">
 <tr>
-<td style="padding:52px 52px 0 52px;">
+<td class="bx" style="padding:52px 40px 0 40px;">
 <div style="font-family:{SANS};font-size:12px;font-weight:600;letter-spacing:0.12em;text-transform:uppercase;color:{INK_MUTED};text-align:center;">{brand}</div>
 <h1 style="margin:18px 0 30px 0;font-family:{SERIF};font-size:34px;font-weight:700;line-height:1.25;color:{INK};text-align:center;">{title}</h1>
 {date_rule}
@@ -330,8 +356,8 @@ fn render_empty_html(
 </td>
 </tr>
 {soft_divider}<tr>
-<td style="padding:30px 52px 52px 52px;">
-<div style="font-family:{SANS};font-size:12px;line-height:1.7;color:{INK_MUTED};text-align:center;">{footer}</div>
+<td class="bx" style="padding:30px 40px 52px 40px;">
+<div class="meta" style="font-family:{SANS};font-size:13px;line-height:1.7;color:{INK_MUTED};text-align:center;">{footer}</div>
 </td>
 </tr>
 </table>
@@ -351,7 +377,7 @@ fn render_empty_html(
 fn soft_divider() -> String {
     format!(
         r#"<tr>
-<td align="center" style="padding:6px 52px;">
+<td align="center" style="padding:6px 40px;">
 <table role="presentation" cellpadding="0" cellspacing="0" border="0" align="center">
 <tr>
 <td width="44" height="1" style="width:44px;height:1px;line-height:1px;font-size:0;background-color:{BORDER};">&nbsp;</td>
@@ -379,42 +405,63 @@ fn date_rule(date: &str) -> String {
 }
 
 /// One item: the headline (a link when the cluster has one), then a placeholder category and
-/// summary, and the source · time caption. `category` and `item_summary` are pre-escaped
-/// placeholders; the source · time caption is debug-only and marked for later removal. Items are
-/// separated by [`soft_divider`], not a per-item rule.
-fn render_item_row(item: &RenderItem, tz: Tz, category: &str, item_summary: &str) -> String {
+/// summary, and the debug block. `category` and `item_summary` are pre-escaped placeholders; the
+/// debug block is debug-only — a monospace, dashed-amber callout (with a `debug` tag so it reads as
+/// scaffolding, not finished content) carrying the why-and-how of this row: its selection rank and
+/// the recency key it was chosen on, the source, the raw link, and how many related sub-items it
+/// fused. `position` is the 0-based render slot (== recency rank, since selection is recency-only).
+/// All of it is marked `<!-- DEBUG … -->` for later removal. Items are separated by
+/// [`soft_divider`], not a per-item rule.
+fn render_item_row(
+    position: usize,
+    item: &RenderItem,
+    tz: Tz,
+    category: &str,
+    item_summary: &str,
+) -> String {
     let title = escape(&item.title);
     let headline = match &item.link {
         Some(link) => format!(
-            r#"<a href="{}" style="font-family:{SERIF};font-size:21px;font-weight:700;line-height:1.3;color:{INK};text-decoration:none;">{title}</a>"#,
+            r#"<a class="headline" href="{}" style="font-family:{SERIF};font-size:21px;font-weight:700;line-height:1.3;color:{INK};text-decoration:none;">{title}</a>"#,
             escape(link)
         ),
         None => format!(
-            r#"<span style="font-family:{SERIF};font-size:21px;font-weight:700;line-height:1.3;color:{INK};">{title}</span>"#
+            r#"<span class="headline" style="font-family:{SERIF};font-size:21px;font-weight:700;line-height:1.3;color:{INK};">{title}</span>"#
         ),
     };
 
     let source = escape(item.source.as_str());
-    let time = item
+    // Debug fields: the recency key selection ranked on (full date), the 1-based rank, the raw link,
+    // and the count of fused sub-items — the answer to "why is this here, and what's inside it?".
+    let rank = position + 1;
+    let recency_key = item
         .last_event_time
         .with_timezone(&tz)
-        .format("%b %-d, %H:%M %Z");
+        .format("%Y-%m-%d %H:%M %Z");
+    let link = item
+        .link
+        .as_deref()
+        .map(escape)
+        .unwrap_or_else(|| "—".into());
+    let related = item.connections.len();
     let connections = render_connections(&item.connections);
 
     format!(
         r#"<tr>
-<td style="padding:30px 52px;">
+<td class="bx" style="padding:30px 40px;">
 {headline}
 <!-- PLACEHOLDER: per-item category — remove or replace once items carry a category -->
-<div style="margin-top:9px;font-family:{SANS};font-size:12px;font-weight:500;letter-spacing:0.04em;color:{ACCENT};">{category}</div>
+<div class="meta" style="margin-top:9px;font-family:{SANS};font-size:13px;font-weight:500;letter-spacing:0.04em;color:{ACCENT};">{category}</div>
 <!-- /PLACEHOLDER -->
 <!-- PLACEHOLDER: per-item summary — remove or replace once items carry a summary -->
-<div style="margin-top:12px;font-family:{SERIF};font-size:16px;font-style:italic;line-height:1.65;color:{INK_MUTED};">{item_summary}</div>
+<div class="meta" style="margin-top:12px;font-family:{SERIF};font-size:16px;font-style:italic;line-height:1.65;color:{INK_MUTED};">{item_summary}</div>
 <!-- /PLACEHOLDER -->
-{connections}<!-- DEBUG: source + timestamp — debugging info, remove before launch -->
-<div style="margin-top:14px;font-family:{SANS};font-size:12px;letter-spacing:0.02em;">
-<span style="font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:{ACCENT};">{source}</span>
-<span style="color:{INK_MUTED};">&nbsp;&middot;&nbsp;{time}</span>
+{connections}<!-- DEBUG: selection trace — debugging info, remove before launch -->
+<div style="margin-top:18px;padding:9px 12px;background-color:{DEBUG_BG};border:1px dashed {DEBUG_BORDER};border-radius:3px;font-family:{MONO};font-size:12px;line-height:1.6;color:{DEBUG_INK};">
+<span style="display:inline-block;padding:1px 6px;margin-right:8px;background-color:{DEBUG_BORDER};color:{DEBUG_BG};font-weight:700;text-transform:uppercase;letter-spacing:0.1em;border-radius:2px;">debug</span>
+<span style="font-weight:700;">selected #{rank}</span> <span>by recency</span>
+<div style="margin-top:4px;">key {recency_key} &middot; source <span style="font-weight:700;">{source}</span> &middot; related {related}</div>
+<div style="margin-top:4px;word-break:break-all;">link {link}</div>
 </div>
 <!-- /DEBUG -->
 </td>
@@ -423,9 +470,10 @@ fn render_item_row(item: &RenderItem, tz: Tz, category: &str, item_summary: &str
     )
 }
 
-/// The "Connected across sources" block: the cross-source clusters fused into a story (design §8.2),
-/// each a headline (linked when it has a URL), a source tag, and the `link_reason` for why it belongs
-/// — the M3 value made visible. Empty for a singleton story, so a lone item renders unchanged.
+/// The "Related" block: the cross-source clusters fused into a story (design §8.2), each a headline
+/// (linked when it has a URL), a source tag, and the `link_reason` for why it belongs — the M3 value
+/// made visible. Renders every fused sub-item (uncapped). Empty for a singleton story, so a lone item
+/// renders unchanged.
 fn render_connections(connections: &[crate::digest::store::Connection]) -> String {
     if connections.is_empty() {
         return String::new();
@@ -452,14 +500,14 @@ fn render_connections(connections: &[crate::digest::store::Connection]) -> Strin
             })
             .unwrap_or_default();
         rows.push_str(&format!(
-            r#"<div style="margin-top:8px;font-family:{SERIF};font-size:15px;line-height:1.5;color:{INK_BODY};">
-<span style="color:{ACCENT};">&#8627;</span> {head} <span style="font-family:{SANS};font-size:11px;text-transform:uppercase;letter-spacing:0.06em;color:{ACCENT};">{source}</span>{reason}</div>
+            r#"<div class="related" style="margin-top:8px;font-family:{SERIF};font-size:16px;line-height:1.5;color:{INK_BODY};">
+<span style="color:{ACCENT};">&#8627;</span> {head} <span style="font-family:{SANS};font-size:12px;text-transform:uppercase;letter-spacing:0.06em;color:{ACCENT};">{source}</span>{reason}</div>
 "#
         ));
     }
     format!(
         r#"<div style="margin-top:16px;padding-top:4px;">
-<div style="font-family:{SANS};font-size:11px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:{INK_MUTED};">Connected across sources</div>
+<div class="meta" style="font-family:{SANS};font-size:12px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:{INK_MUTED};">Related</div>
 {rows}</div>
 "#
     )
@@ -584,8 +632,19 @@ mod tests {
         assert!(html.contains("ITEM_SUMMARY_TEXT"));
         // ...inside grep-able markers for later removal/replacement (summary + category + item).
         assert_eq!(html.matches("<!-- PLACEHOLDER:").count(), 3);
-        assert!(html.contains("<!-- DEBUG: source + timestamp"));
+        assert!(html.contains("<!-- DEBUG: selection trace"));
         assert!(html.contains("<!-- /DEBUG -->"));
+        // The debug block is styled to look unmistakably like scaffolding — a monospace,
+        // dashed-amber callout carrying a visible `debug` tag — so it can't pass for real content.
+        assert!(html.contains(MONO));
+        assert!(html.contains(DEBUG_BG));
+        assert!(html.contains(&format!("border:1px dashed {DEBUG_BORDER}")));
+        assert!(html.contains(">debug</span>"));
+        // ...and it carries the selection trace: rank, recency key, source, related count, link.
+        assert!(html.contains("selected #1"));
+        assert!(html.contains("by recency"));
+        assert!(html.contains("related 0"));
+        assert!(html.contains("link https://example.com"));
     }
 
     #[test]
