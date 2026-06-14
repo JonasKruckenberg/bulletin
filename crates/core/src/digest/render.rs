@@ -195,6 +195,14 @@ const BORDER: &str = "#ddd4c2"; // hairline rules between items
 const SERIF: &str = "Georgia, 'Times New Roman', serif";
 const SANS: &str = "'Helvetica Neue', Helvetica, Arial, sans-serif";
 
+// A deliberately off-palette "this is scaffolding" look for the debug caption, so no reader
+// mistakes the source + timestamp for finished editorial content. Monospace type and a dashed
+// amber callout read as developer output, not design — and make the block obvious to strip later.
+const MONO: &str = "'SF Mono', 'SFMono-Regular', Menlo, Consolas, 'Liberation Mono', monospace";
+const DEBUG_BG: &str = "#fff8e1"; // pale amber notebook tint, foreign to the cream palette
+const DEBUG_BORDER: &str = "#e0a800"; // amber, for the dashed "draft" border
+const DEBUG_INK: &str = "#7a5c00"; // dark amber, the debug text colour
+
 /// HTML view: a centered editorial card on warm paper — a small-caps brand label, a serif
 /// masthead, a `── date ──` rule, a short time-of-day greeting lead, then the selected items as a
 /// ruled list (a terracotta number, the headline link, a category, a summary, and a source · time
@@ -203,7 +211,8 @@ const SANS: &str = "'Helvetica Neue', Helvetica, Arial, sans-serif";
 /// The greeting stands in for the reference design's "big picture" summary until the digest
 /// produces a real one. Per-item sections the data model doesn't feed yet (category/summary) render
 /// parametric lorem-ipsum placeholders wrapped in `<!-- PLACEHOLDER … -->`; the source · time
-/// caption is debug-only and wrapped in `<!-- DEBUG … -->` — both are easy to grep out later.
+/// caption is debug-only, wrapped in `<!-- DEBUG … -->` and styled as a distinct monospace amber
+/// callout so it never reads as real content — both are easy to grep out later.
 ///
 /// Table-based, all-inline-CSS, single column — the "bulletproof" shape that survives the
 /// patchwork of email clients. The chrome comes from `content`; every piece of caller- or
@@ -380,8 +389,9 @@ fn date_rule(date: &str) -> String {
 
 /// One item: the headline (a link when the cluster has one), then a placeholder category and
 /// summary, and the source · time caption. `category` and `item_summary` are pre-escaped
-/// placeholders; the source · time caption is debug-only and marked for later removal. Items are
-/// separated by [`soft_divider`], not a per-item rule.
+/// placeholders; the source · time caption is debug-only — rendered as a monospace, dashed-amber
+/// callout with a `debug` tag so it reads as scaffolding, not finished content — and marked for
+/// later removal. Items are separated by [`soft_divider`], not a per-item rule.
 fn render_item_row(item: &RenderItem, tz: Tz, category: &str, item_summary: &str) -> String {
     let title = escape(&item.title);
     let headline = match &item.link {
@@ -412,9 +422,10 @@ fn render_item_row(item: &RenderItem, tz: Tz, category: &str, item_summary: &str
 <div style="margin-top:12px;font-family:{SERIF};font-size:16px;font-style:italic;line-height:1.65;color:{INK_MUTED};">{item_summary}</div>
 <!-- /PLACEHOLDER -->
 {connections}<!-- DEBUG: source + timestamp — debugging info, remove before launch -->
-<div style="margin-top:14px;font-family:{SANS};font-size:12px;letter-spacing:0.02em;">
-<span style="font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:{ACCENT};">{source}</span>
-<span style="color:{INK_MUTED};">&nbsp;&middot;&nbsp;{time}</span>
+<div style="margin-top:18px;padding:8px 12px;background-color:{DEBUG_BG};border:1px dashed {DEBUG_BORDER};border-radius:3px;font-family:{MONO};font-size:12px;line-height:1.5;color:{DEBUG_INK};">
+<span style="display:inline-block;padding:1px 6px;margin-right:8px;background-color:{DEBUG_BORDER};color:{DEBUG_BG};font-weight:700;text-transform:uppercase;letter-spacing:0.1em;border-radius:2px;">debug</span>
+<span style="font-weight:700;">{source}</span>
+<span>&nbsp;&middot;&nbsp;{time}</span>
 </div>
 <!-- /DEBUG -->
 </td>
@@ -586,6 +597,12 @@ mod tests {
         assert_eq!(html.matches("<!-- PLACEHOLDER:").count(), 3);
         assert!(html.contains("<!-- DEBUG: source + timestamp"));
         assert!(html.contains("<!-- /DEBUG -->"));
+        // The debug caption is styled to look unmistakably like scaffolding — a monospace,
+        // dashed-amber callout carrying a visible `debug` tag — so it can't pass for real content.
+        assert!(html.contains(MONO));
+        assert!(html.contains(DEBUG_BG));
+        assert!(html.contains(&format!("border:1px dashed {DEBUG_BORDER}")));
+        assert!(html.contains(">debug</span>"));
     }
 
     #[test]
