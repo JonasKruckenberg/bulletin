@@ -438,7 +438,11 @@ fn render_item_row(
         .last_event_time
         .with_timezone(&tz)
         .format("%Y-%m-%d %H:%M %Z");
-    let link = item.link.as_deref().map(escape).unwrap_or_else(|| "—".into());
+    let link = item
+        .link
+        .as_deref()
+        .map(escape)
+        .unwrap_or_else(|| "—".into());
     let related = item.connections.len();
     let connections = render_connections(&item.connections);
 
