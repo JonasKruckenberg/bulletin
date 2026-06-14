@@ -722,6 +722,7 @@ async fn rls_isolates_control_plane_under_runtime_role() {
         serde_json::json!({ "installation_id": 1, "repos": [] }),
         900,
         Some(alice),
+        Some("1"),
     )
     .await
     .unwrap();
