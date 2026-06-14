@@ -61,29 +61,20 @@ pub struct LifecycleChange {
 }
 
 /// What `accept_webhook` produced from one delivery: source items to ingest, or a lifecycle signal.
+/// After normalization (`I = EventBuilder`) it's the realtime counterpart to the pull path's
+/// `(Vec<EventBuilder>, cursor)`.
 pub enum Inbound<I> {
     Events(Vec<I>),
     Lifecycle(LifecycleChange),
 }
 
-/// `Inbound` after normalization — connector-side builders ready for `finalize`, or a lifecycle
-/// change. The realtime counterpart to the pull path's `(Vec<EventBuilder>, cursor)`.
-pub enum NormalizedInbound {
-    Events(Vec<EventBuilder>),
-    Lifecycle(LifecycleChange),
-}
-
-/// App-level realtime head for a source (design §5.4). `verify`/`route` run at the HTTP edge with
-/// only the app secret + raw bytes — no connection resolved yet.
+/// App-level realtime head for a source (design §5.4). `verify` runs at the HTTP edge with only the
+/// app secret + raw bytes — no connection resolved yet. (The credential-free routing peek is the
+/// free [`route`] fn below: the worker job that needs it has no secret to build a verifier.)
 pub trait RealtimeConnector: Send + Sync {
     /// Authenticate the raw body against the app secret in **constant time**, over the bytes exactly
     /// as received (no parse first — a parse-then-verify is a signature-bypass foothold).
     fn verify(&self, headers: &WebhookHeaders, body: &[u8]) -> Verified;
-
-    /// Extract the *routing key* (GitHub: `installation.id`) used to look up OUR connection row.
-    /// Credential-free and **never** trusted for authorization beyond routing — the subscriber and
-    /// scope come from the resolved row, not the payload (IDOR defense, design §12).
-    fn route(&self, body: &[u8]) -> Result<String, SourceError>;
 }
 
 /// Per-connection realtime worker — a [`Connection`] that also accepts webhooks (design §5.4).
@@ -133,7 +124,7 @@ impl RealtimeDispatch {
         event_type: &str,
         delivery_id: &str,
         body: &[u8],
-    ) -> Result<NormalizedInbound, SourceError> {
+    ) -> Result<Inbound<EventBuilder>, SourceError> {
         match self {
             RealtimeDispatch::Github(c) => match c.accept_webhook(event_type, delivery_id, body)? {
                 Inbound::Events(items) => {
@@ -142,17 +133,18 @@ impl RealtimeDispatch {
                         .map(|i| c.hydrate(i))
                         .flat_map(|i| c.to_events(i))
                         .collect();
-                    Ok(NormalizedInbound::Events(builders))
+                    Ok(Inbound::Events(builders))
                 }
-                Inbound::Lifecycle(change) => Ok(NormalizedInbound::Lifecycle(change)),
+                Inbound::Lifecycle(change) => Ok(Inbound::Lifecycle(change)),
             },
         }
     }
 }
 
-/// The app-level routing peek for a source — the `route` half of [`RealtimeConnector`] reached
-/// without constructing the (secret-bearing) verifier, since the worker job has no secret and
-/// doesn't need one to resolve a connection. Closed match over the realtime source set.
+/// The app-level routing peek for a source: extract the routing key (GitHub: `installation.id`) used
+/// to resolve OUR connection row. Credential-free — the worker job that calls it has no secret and
+/// needs none to route — and never trusted for authorization beyond routing (IDOR defense, design
+/// §12). Closed match over the realtime source set.
 pub fn route(source: SourceKind, body: &[u8]) -> Result<String, SourceError> {
     match source {
         SourceKind::Github => github::webhook::route(body),

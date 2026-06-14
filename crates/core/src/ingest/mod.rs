@@ -307,7 +307,7 @@ pub async fn process_webhook(
     };
 
     match dispatch.accept_and_normalize(event_type, delivery_id, body)? {
-        realtime::NormalizedInbound::Events(builders) => {
+        realtime::Inbound::Events(builders) => {
             let total = builders.len();
             let mut inserted = 0usize;
             for builder in builders {
@@ -335,7 +335,7 @@ pub async fn process_webhook(
                 deduplicated,
             })
         }
-        realtime::NormalizedInbound::Lifecycle(change) => {
+        realtime::Inbound::Lifecycle(change) => {
             let status = change.status.as_str();
             store::update_connection_status(pool, conn.id, status).await?;
             tracing::info!(

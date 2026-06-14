@@ -9,7 +9,7 @@ use apalis::prelude::*;
 use apalis_postgres::PostgresStorage;
 use axum::{
     body::Bytes,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
@@ -22,6 +22,11 @@ use bulletin_core::ingest::realtime::{RealtimeConnector, Verified, WebhookHeader
 use bulletin_core::kind::SourceKind;
 
 use crate::worker::{is_duplicate_enqueue, ProcessWebhookJob};
+
+/// GitHub's documented maximum webhook payload size. axum's default extractor limit is 2 MB, which
+/// would 413 the larger deliveries (big pushes/PRs) *after* they pass signature verification — and
+/// GitHub then retries them forever — so we lift the cap to GitHub's own ceiling on this route.
+const MAX_WEBHOOK_BODY: usize = 25 * 1024 * 1024;
 
 #[derive(Clone)]
 struct WebhookState {
@@ -44,7 +49,10 @@ pub fn router(pool: PgPool, github_webhook_secret: Option<Vec<u8>>) -> Router {
     };
     Router::new()
         .route("/health", get(|| async { "ok" }))
-        .route("/webhooks/github", post(github_webhook))
+        .route(
+            "/webhooks/github",
+            post(github_webhook).layer(DefaultBodyLimit::max(MAX_WEBHOOK_BODY)),
+        )
         .with_state(state)
 }
 
@@ -84,15 +92,20 @@ async fn github_webhook(
     let delivery_id = wh.delivery_id.unwrap_or_default();
 
     let mut storage = PostgresStorage::<ProcessWebhookJob>::new(&state.pool);
-    let task = TaskBuilder::new(ProcessWebhookJob {
+    let mut builder = TaskBuilder::new(ProcessWebhookJob {
         source: SourceKind::Github,
         event_type,
         delivery_id: delivery_id.clone(),
-        raw_body: body.to_vec(),
-    })
-    // Collapse re-deliveries of the same X-GitHub-Delivery (GitHub retries on a non-2xx).
-    .with_idempotency_key(format!("gh-webhook:{delivery_id}"))
-    .build();
+        // A verified GitHub delivery is UTF-8 JSON; `_lossy` only guards a non-conforming sender and
+        // never drops the delivery (the job re-parses the JSON anyway).
+        body: String::from_utf8_lossy(&body).into_owned(),
+    });
+    // Collapse re-deliveries of the same X-GitHub-Delivery (GitHub retries on a non-2xx). Skip the
+    // key if the header was absent — an empty id would alias every keyless delivery onto one job.
+    if !delivery_id.is_empty() {
+        builder = builder.with_idempotency_key(format!("gh-webhook:{delivery_id}"));
+    }
+    let task = builder.build();
 
     match storage.push_task(task).await {
         Ok(()) => (StatusCode::ACCEPTED, "queued").into_response(),

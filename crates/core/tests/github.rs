@@ -14,8 +14,7 @@ use bulletin_core::ingest::github::token::StaticTokenProvider;
 use bulletin_core::ingest::github::webhook::{self, GithubWebhook};
 use bulletin_core::ingest::github::GithubConnection;
 use bulletin_core::ingest::realtime::{
-    LifecycleStatus, NormalizedInbound, RealtimeConnector, RealtimeDispatch, Verified,
-    WebhookHeaders,
+    Inbound, LifecycleStatus, RealtimeConnector, RealtimeDispatch, Verified, WebhookHeaders,
 };
 use bulletin_core::ingest::Connection;
 use bulletin_core::kind::{ContentKind, SourceKind};
@@ -296,8 +295,8 @@ fn installation_deleted_is_a_revoke_lifecycle() {
         .accept_and_normalize("installation", "d", body.as_bytes())
         .unwrap()
     {
-        NormalizedInbound::Lifecycle(c) => assert_eq!(c.status, LifecycleStatus::Revoked),
-        NormalizedInbound::Events(_) => panic!("expected a lifecycle change"),
+        Inbound::Lifecycle(c) => assert_eq!(c.status, LifecycleStatus::Revoked),
+        Inbound::Events(_) => panic!("expected a lifecycle change"),
     }
 }
 
@@ -316,12 +315,12 @@ fn content_webhook_normalizes_through_the_dispatch() {
         .accept_and_normalize("issues", "d", body.as_bytes())
         .unwrap()
     {
-        NormalizedInbound::Events(builders) => {
+        Inbound::Events(builders) => {
             assert_eq!(builders.len(), 1);
             let ev = builders.into_iter().next().unwrap().finalize(Scope::Public);
             assert_eq!(ev.group_key, "gh:o/r#issue-3");
         }
-        NormalizedInbound::Lifecycle(_) => panic!("expected events"),
+        Inbound::Lifecycle(_) => panic!("expected events"),
     }
 }
 

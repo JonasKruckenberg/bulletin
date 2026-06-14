@@ -53,15 +53,11 @@ impl RealtimeConnector for GithubWebhook {
             Err(_) => Verified::Invalid,
         }
     }
-
-    fn route(&self, body: &[u8]) -> Result<String, SourceError> {
-        route(body)
-    }
 }
 
 /// Peek the installation id (`installation.id`) — the webhook routing key — without the secret.
 /// Used by the worker job (which has no secret) to resolve our connection row by
-/// `(source, provider_account_id)`.
+/// `(source, provider_account_id)`. The closed-set entry point is [`super::super::realtime::route`].
 pub fn route(body: &[u8]) -> Result<String, SourceError> {
     let value: serde_json::Value = serde_json::from_slice(body)
         .map_err(|e| SourceError::Parse(format!("webhook body is not JSON: {e}")))?;
