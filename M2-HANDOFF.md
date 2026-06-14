@@ -111,7 +111,7 @@ or `cargo nextest run`.
 | **1** | Connector trait family seam, `ContentKind`, GitHub poll, `ConnDispatch` | ✅ merged (commit `6236abd`) |
 | **2** | Webhook catcher + `ProcessWebhook` job + HMAC verify + realtime traits | ✅ implemented (branch `claude/m1-phase-2-c1tvgu`) |
 | **3** | Private scope load-bearing + per-subscriber private clusters + scope-invariant proptest | ✅ implemented (branch `claude/m2-phase-3-s5ewh9`) |
-| **4** | Two-context RLS (two roles, two URLs) | ⬜ next |
+| **4** | Two-context RLS (two roles, two URLs) | ✅ implemented (branch `claude/m2-phase-4-reso5w`) |
 | **5** | Credential-at-rest (interim XChaCha20-Poly1305 envelope) + real GitHub token minting | ⬜ |
 
 ---
@@ -302,6 +302,75 @@ shared; the proptest passes.
 ---
 
 ## 8. Phase 4 — Two-context RLS (two roles, two URLs)
+
+> **Status: implemented** (branch `claude/m2-phase-4-reso5w`). What landed, vs. the plan below:
+> - **Migrations** `…019_rls.sql` + `…020_rls_control_plane.sql` (numbered after M3's
+>   `017_cluster_entities`/`018_story`; run by the owner role): idempotently creates the non-owner,
+>   non-superuser, **no-BYPASSRLS** runtime role `bulletin_app` (a `DO` block that no-ops if a
+>   deployment pre-provisioned it — so the owner needn't hold CREATEROLE); `ENABLE`+`FORCE ROW LEVEL
+>   SECURITY` on `event` and `cluster` with two-context policies keyed on
+>   `nullif(current_setting('app.subscriber_id', true), '')`: SELECT = `public ∪ own-private`; INSERT/
+>   UPDATE = a public row only in the no-subscriber context, a private row only as its owner (the
+>   directional public→private invariant, DB-enforced). **Table GRANTs are not in the (checksummed)
+>   migration** — they're applied by `grant_runtime_role` (re-run every `migrate`) so later schema +
+>   the apalis queue schema (created after the domain migrations) are always covered.
+> - **`common/db.rs`** gains `ScopeCtx { NoSubscriber, Subscriber(uuid), Admin }` (the `Admin`
+>   control-plane variant is the `*` GUC sentinel; added with the control-plane migration), `set_scope` (the
+>   `set_config('app.subscriber_id', $1, true)` chokepoint — transaction-local, pool/PgBouncer-safe),
+>   `begin_scope` (a tx pre-pinned to a ctx, for the builds + the self-scoping control-plane store
+>   fns), and the canonical **`with_scope(pool, ctx, |conn| …)`** wrapper (commit on Ok / rollback on
+>   Err). `ScopeCtx::for_scope(&Scope)` maps an event's finalized scope to its write context.
+> - **Flows pinned to a context:** PublicBuild → `NoSubscriber`; `build_private`/`generate`/
+>   `dispatch_now`/`explain` → `Subscriber(id)` (candidate read, render, cluster-display all run
+>   scoped so own-private is visible and no other tenant's is). **Ingest** (`poll` + `process_webhook`)
+>   now finalizes all events then `append_scoped` groups them by `ScopeCtx` and commits one txn per
+>   context (≤2 per connection: public + the owner) — a public event writes in the no-subscriber
+>   context, a private one as its owner, exactly as the write policy demands. `insert_event` and the
+>   two `render_items*` fns took an `impl PgExecutor` so they run inside a scoped txn.
+> - **Two URLs:** `--database-url` is the runtime role (serve/worker/debug); new
+>   `--migration-database-url` / `BULLETIN_MIGRATION_DATABASE_URL` is the owner role (defaults to
+>   `--database-url` for single-role dev). `migrate` connects with the owner URL, then runs migrations
+>   → `setup_storage` → `grant_runtime_role`.
+> - **NixOS:** provisions both roles (owner via `ensureDBOwnership`, `bulletin_app` via `ensureUsers`
+>   so the owner needn't hold CREATEROLE), an ident map + a `local` pg_hba line so the one `bulletin`
+>   OS user reaches both roles over peer auth; migrate unit uses the owner URL, the service the runtime
+>   URL; `database.migrationUrl` option for the external-DB case. README's `Scope` section + deployment
+>   notes rewritten.
+> - **Verification tests** (`pipeline.rs`, Docker): open a **second pool as `bulletin_app`** (a
+>   password set in the test; non-superuser → FORCE RLS bites). `rls_isolates_private_content_…` proves
+>   the content tables: no-subscriber sees only public; a subscriber sees `public ∪ own-private`, never
+>   another's private; a subscriber can't write another tenant's private row; the no-subscriber context
+>   can't write a private row at all. `rls_isolates_control_plane_…` proves the control-plane tables:
+>   the no-subscriber context is denied `subscriber`/`connection` (fail-closed, count 0), a subscriber
+>   sees only its own rows, and `Admin` is the only cross-tenant reach. Existing DB suites connect as
+>   the `postgres` superuser, which **bypasses** RLS even under FORCE — so they keep passing unchanged
+>   (and that's *why* the verification tests must use the non-superuser runtime role).
+> - **Scope of enforcement — the whole path (the control-plane migration).** An earlier cut policied
+>   only `event` + `cluster` and left the control-plane/delivery tables merely granted; that was a
+>   partial boundary, and a partial isolation boundary invites reliance on a guarantee that doesn't
+>   hold (a `digest`/`digest_item`/`story` *is* "subscriber A's content"). The control-plane migration
+>   closes it: FORCE RLS now covers `connection`, `subscriber`, `digest`, `digest_item`,
+>   `private_build_watermark`, **and the M3 `story` table** too — the full
+>   `event → cluster → story → digest_item → digest → delivery` path plus the build cursor. A **third context,
+>   `Admin`** (the `*` sentinel), was added: these control-plane tables are **fail-closed** in the
+>   default no-subscriber context (deny), own-only in a subscriber context, and all-rows only in the
+>   explicit `Admin` context the cron sweeps / `status` / poll+webhook connection lookups / operator
+>   commands opt into. `Admin` deliberately gets **no** extra reach on the *content* tables (still
+>   public-only there), so there is no admin backdoor to another tenant's private content — it's
+>   readable only in its owner's context. Mechanism: the control-plane store fns self-scope (open
+>   their own `begin_scope(Admin|Subscriber(id))` txn), so call sites are unchanged.
+> - **Consequences to know:** `status` (run as `Admin`) reports global connection/subscriber/digest
+>   counts but **public-only** `event`/`cluster` counts (no admin backdoor to private content);
+>   `debug event-list` likewise shows only public events under the runtime role — to inspect a
+>   subscriber's private items use `digest-explain`/`digest-run`, which run in that subscriber's
+>   context. `build_watermark` (singleton public cursor) and the apalis queue stay un-policied (no
+>   per-subscriber data). FK cascade deletes (`subscriber`→`digest`→`digest_item`,
+>   `private_build_watermark`) and FK existence checks bypass RLS as Postgres always does for RI.
+> - **Seam left for Phase 5:** the webhook signing secret + GitHub App key are still plain config
+>   (sealed at rest in Phase 5); `creds_ref` indirection already in place.
+> - **Tests:** `clippy --all-targets` clean; `cargo fmt` clean; pure suites pass; **Docker was
+>   unavailable in this sandbox**, so the DB suites (incl. the new RLS verification test) compiled but
+>   did not run.
 
 **Goal:** the DB physically enforces scope isolation even against a logic bug.
 

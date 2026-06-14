@@ -2,7 +2,26 @@
 
 ### `Scope`
 
-TDB
+Every event and cluster carries a `Scope` — `Public` (shared by all subscribers) or
+`Private(subscriber)` (visible only to its owner). Information flows **public → private only**: a
+private item can never enter the public pool or another subscriber's digest. This is enforced at
+three layers, defense in depth:
+
+1. **Typed `Scope`** — scope is part of a cluster's identity, so a public and a private event can't
+   fold into the same cluster (a pure, property-tested invariant).
+2. **Query predicates** — every candidate read is `scope_kind = 'public' OR scope_subscriber_id = $me`.
+3. **Two-context row-level security** — the app logs in as a least-privilege role (`bulletin_app`:
+   non-owner, no `BYPASSRLS`) and runs each unit of work through a `with_scope(ctx, …)` wrapper that
+   sets a transaction-local `app.subscriber_id`. `FORCE ROW LEVEL SECURITY` covers the **whole path
+   from a private event to a delivered digest** — `event`, `cluster`, `story`, `digest`,
+   `digest_item`, plus the `connection`/`subscriber`/`private_build_watermark` control-plane rows. A
+   subscriber context
+   sees `public ∪ own-private` content and only its own control-plane/delivery rows; the
+   no-subscriber context (PublicBuild) is confined to public content and **denied** the control-plane
+   tables outright (fail-closed); a narrow `admin` context is the only cross-tenant reach, used by the
+   cron sweeps / status / operator commands — and it still has **no** backdoor to another tenant's
+   private *content*, which is readable only in its owner's context. So a logic bug that drops a
+   predicate still can't leak across tenants: the database refuses the row.
 
 ### `Inbox`
 
@@ -62,15 +81,22 @@ nixos-config flake consumes it as an input.
 }
 ```
 
-The defaults are dogfood-ready: it provisions a local PostgreSQL `bulletin` db + role over
-**unix-socket peer auth** (no passwords), writes digests as `.eml` into
+The defaults are dogfood-ready: it provisions a local PostgreSQL `bulletin` db with **two roles**
+over **unix-socket peer auth** (no passwords) — an owner role (`bulletin`, owns the DDL, runs
+`migrate`) and a least-privilege runtime role (`bulletin_app`, what serve/worker/debug log in as, so
+the two-context RLS above actually binds) — reached by the single `bulletin` OS user via a Postgres
+ident map. It writes digests as `.eml` into
 `/var/lib/bulletin/outbox` (file transport), logs JSON to journald, exposes Prometheus on
 `127.0.0.1:9464`, and runs `bulletin all` as a hardened static `bulletin` user. A oneshot
 `bulletin-migrate` runs first; on a local DB it `pg_dump`s a pre-migrate snapshot into
 `/var/lib/bulletin/backups` and is gated with `Requires=`, so a failed migration leaves the
 old instance running rather than starting a half-migrated binary.
 
-Options: `database.createLocally` / `database.url`, `http.addr`, `metrics.addr`,
+For an external database (`database.createLocally = false`), set `database.url` to the runtime role
+and `database.migrationUrl` to the owner/migration role (the latter must be able to create the
+runtime role and the RLS policies); both fall back per the option docs if omitted.
+
+Options: `database.createLocally` / `database.url` / `database.migrationUrl`, `http.addr`, `metrics.addr`,
 `log.format` / `log.level`, `email.transport` / `email.from` / `email.smtpSecretFile`,
 `openFirewall`.
 

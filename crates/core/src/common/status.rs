@@ -1,9 +1,16 @@
 //! A single-glance snapshot of pipeline state, for `debug status`. Every field is a cheap
 //! aggregate over a domain table (plus the apalis queue), so the whole report answers "what's
 //! in the system right now, and is anything stuck?" without trawling individual rows.
+//!
+//! The whole report runs in one **admin** control-plane transaction (the only context in which the
+//! fail-closed control-plane tables are readable). Note RLS still applies to the *content* tables
+//! (`event`, `cluster`) even under admin — they have no admin backdoor — so `event`/`cluster`
+//! aggregates here count the **public** scope only; private rows are counted only in their owner's
+//! context, which `status` never assumes. Connection/subscriber/digest counts are global.
 
+use crate::common::db::{begin_scope, ScopeCtx};
 use chrono::{DateTime, Utc};
-use sqlx::{PgPool, Row};
+use sqlx::{PgConnection, Row};
 
 #[derive(Debug)]
 pub struct StatusReport {
@@ -81,21 +88,24 @@ pub struct QueueStats {
     pub oldest_pending_secs: Option<i64>,
 }
 
-/// Gathers the full report. Each section is one round-trip; the queue section is skipped (→
-/// `None`) when the apalis schema doesn't exist yet.
-pub async fn gather(pool: &PgPool) -> Result<StatusReport, sqlx::Error> {
-    Ok(StatusReport {
-        connections: connection_stats(pool).await?,
-        events: event_stats(pool).await?,
-        build: build_status(pool).await?,
-        clusters: cluster_stats(pool).await?,
-        subscribers: subscriber_stats(pool).await?,
-        digests: digest_stats(pool).await?,
-        queue: queue_stats(pool).await?,
-    })
+/// Gathers the full report in one admin-scoped transaction. Each section is one round-trip; the
+/// queue section is skipped (→ `None`) when the apalis schema doesn't exist yet.
+pub async fn gather(pool: &sqlx::PgPool) -> Result<StatusReport, sqlx::Error> {
+    let mut tx = begin_scope(pool, ScopeCtx::Admin).await?;
+    let report = StatusReport {
+        connections: connection_stats(&mut tx).await?,
+        events: event_stats(&mut tx).await?,
+        build: build_status(&mut tx).await?,
+        clusters: cluster_stats(&mut tx).await?,
+        subscribers: subscriber_stats(&mut tx).await?,
+        digests: digest_stats(&mut tx).await?,
+        queue: queue_stats(&mut tx).await?,
+    };
+    tx.commit().await?;
+    Ok(report)
 }
 
-async fn connection_stats(pool: &PgPool) -> Result<ConnectionStats, sqlx::Error> {
+async fn connection_stats(conn: &mut PgConnection) -> Result<ConnectionStats, sqlx::Error> {
     let row = sqlx::query(
         "SELECT count(*) AS total,
                 count(*) FILTER (WHERE status = 'active')  AS active,
@@ -104,7 +114,7 @@ async fn connection_stats(pool: &PgPool) -> Result<ConnectionStats, sqlx::Error>
                 count(*) FILTER (WHERE status = 'active' AND next_poll_at <= now()) AS due_now
          FROM connection",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
     Ok(ConnectionStats {
         total: row.get("total"),
@@ -115,7 +125,7 @@ async fn connection_stats(pool: &PgPool) -> Result<ConnectionStats, sqlx::Error>
     })
 }
 
-async fn event_stats(pool: &PgPool) -> Result<EventStats, sqlx::Error> {
+async fn event_stats(conn: &mut PgConnection) -> Result<EventStats, sqlx::Error> {
     let agg = sqlx::query(
         "SELECT count(*) AS total,
                 count(*) FILTER (
@@ -125,7 +135,7 @@ async fn event_stats(pool: &PgPool) -> Result<EventStats, sqlx::Error> {
                 max(ingest_time) AS latest_ingest
          FROM event",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
 
     let by_source =
@@ -133,7 +143,7 @@ async fn event_stats(pool: &PgPool) -> Result<EventStats, sqlx::Error> {
             .try_map(|row: sqlx::postgres::PgRow| {
                 Ok((row.get::<String, _>("source"), row.get::<i64, _>("n")))
             })
-            .fetch_all(pool)
+            .fetch_all(&mut *conn)
             .await?;
 
     Ok(EventStats {
@@ -144,13 +154,13 @@ async fn event_stats(pool: &PgPool) -> Result<EventStats, sqlx::Error> {
     })
 }
 
-async fn build_status(pool: &PgPool) -> Result<BuildStatus, sqlx::Error> {
+async fn build_status(conn: &mut PgConnection) -> Result<BuildStatus, sqlx::Error> {
     let row = sqlx::query(
         "SELECT built_through,
                 extract(epoch FROM (now() - built_through))::bigint AS lag_secs
          FROM build_watermark",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
     Ok(BuildStatus {
         built_through: row.get("built_through"),
@@ -158,10 +168,10 @@ async fn build_status(pool: &PgPool) -> Result<BuildStatus, sqlx::Error> {
     })
 }
 
-async fn cluster_stats(pool: &PgPool) -> Result<ClusterStats, sqlx::Error> {
+async fn cluster_stats(conn: &mut PgConnection) -> Result<ClusterStats, sqlx::Error> {
     let row =
         sqlx::query("SELECT count(*) AS total, max(updated_at) AS latest_updated FROM cluster")
-            .fetch_one(pool)
+            .fetch_one(&mut *conn)
             .await?;
     Ok(ClusterStats {
         total: row.get("total"),
@@ -169,7 +179,7 @@ async fn cluster_stats(pool: &PgPool) -> Result<ClusterStats, sqlx::Error> {
     })
 }
 
-async fn subscriber_stats(pool: &PgPool) -> Result<SubscriberStats, sqlx::Error> {
+async fn subscriber_stats(conn: &mut PgConnection) -> Result<SubscriberStats, sqlx::Error> {
     let row = sqlx::query(
         "SELECT count(*) AS total,
                 count(*) FILTER (WHERE freq = 'daily')  AS daily,
@@ -178,7 +188,7 @@ async fn subscriber_stats(pool: &PgPool) -> Result<SubscriberStats, sqlx::Error>
                 min(next_run_at) AS next_run
          FROM subscriber",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
     Ok(SubscriberStats {
         total: row.get("total"),
@@ -189,7 +199,7 @@ async fn subscriber_stats(pool: &PgPool) -> Result<SubscriberStats, sqlx::Error>
     })
 }
 
-async fn digest_stats(pool: &PgPool) -> Result<DigestStats, sqlx::Error> {
+async fn digest_stats(conn: &mut PgConnection) -> Result<DigestStats, sqlx::Error> {
     let row = sqlx::query(
         "SELECT count(*) AS total,
                 count(*) FILTER (WHERE delivered_at IS NULL)     AS pending,
@@ -197,7 +207,7 @@ async fn digest_stats(pool: &PgPool) -> Result<DigestStats, sqlx::Error> {
                 max(delivered_at) AS last_delivered
          FROM digest",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
     Ok(DigestStats {
         total: row.get("total"),
@@ -207,9 +217,9 @@ async fn digest_stats(pool: &PgPool) -> Result<DigestStats, sqlx::Error> {
     })
 }
 
-async fn queue_stats(pool: &PgPool) -> Result<Option<Vec<QueueStats>>, sqlx::Error> {
+async fn queue_stats(conn: &mut PgConnection) -> Result<Option<Vec<QueueStats>>, sqlx::Error> {
     let exists: bool = sqlx::query("SELECT to_regclass('apalis.jobs') IS NOT NULL AS present")
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await?
         .get("present");
     if !exists {
@@ -241,7 +251,7 @@ async fn queue_stats(pool: &PgPool) -> Result<Option<Vec<QueueStats>>, sqlx::Err
             oldest_pending_secs: row.get("oldest_pending_secs"),
         })
     })
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
     Ok(Some(rows))
 }

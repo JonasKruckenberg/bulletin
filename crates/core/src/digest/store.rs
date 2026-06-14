@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 
+use crate::common::db::{begin_scope, ScopeCtx};
 use crate::common::kind::SourceKind;
 use crate::link::ClusterRef;
 use chrono::{DateTime, Utc};
-use sqlx::{postgres::PgRow, PgPool, Row};
+use sqlx::{postgres::PgRow, PgConnection, PgPool, Row};
 use uuid::Uuid;
 
 pub struct DigestRow {
@@ -52,9 +53,10 @@ pub(crate) struct ClusterCard {
     last_event_time: DateTime<Utc>,
 }
 
-/// Fetch the display card for each cluster id (order unspecified; callers index by id).
+/// Fetch the display card for each cluster id (order unspecified; callers index by id). Reads
+/// `cluster` (RLS-protected) → the caller runs it in the subscriber's scope (own ∪ public visible).
 pub(crate) async fn cluster_cards(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     ids: &[Uuid],
 ) -> Result<HashMap<Uuid, ClusterCard>, sqlx::Error> {
     sqlx::query("SELECT id, title, link, source, last_event_time FROM cluster WHERE id = ANY($1)")
@@ -70,7 +72,7 @@ pub(crate) async fn cluster_cards(
                 },
             ))
         })
-        .fetch_all(pool)
+        .fetch_all(conn)
         .await
         .map(|rows| rows.into_iter().collect())
 }
@@ -118,13 +120,16 @@ pub(crate) fn build_render_item(
 /// **stories** frozen as `digest_item` rows — digest and items commit together, so the digest is
 /// never observed without its selection. On a retry the row already exists; the unique window
 /// constraint makes the insert a no-op and the existing (frozen) items are returned untouched.
+///
+/// Runs in the subscriber's RLS context (the digest + its items + the referenced stories are all
+/// theirs), in one transaction so the digest is never observed without its selection.
 pub async fn create_with_items(
     pool: &PgPool,
     subscriber_id: Uuid,
     window_end: DateTime<Utc>,
     story_ids: &[Uuid],
 ) -> Result<DigestRow, sqlx::Error> {
-    let mut tx = pool.begin().await?;
+    let mut tx = begin_scope(pool, ScopeCtx::Subscriber(subscriber_id)).await?;
 
     let created = sqlx::query(
         "INSERT INTO digest (subscriber_id, window_end)
@@ -171,8 +176,12 @@ pub async fn create_with_items(
 }
 
 /// The digest's frozen stories, each assembled into a [`RenderItem`] (representative + connections),
-/// in render order. Walks `digest_item → story.clusters → cluster cards`.
-pub async fn render_items(pool: &PgPool, digest_id: Uuid) -> Result<Vec<RenderItem>, sqlx::Error> {
+/// in render order. Walks `digest_item → story.clusters → cluster cards`. Touches `digest_item` /
+/// `story` / `cluster` (all RLS-protected) → the caller runs it in the subscriber's scope.
+pub async fn render_items(
+    conn: &mut PgConnection,
+    digest_id: Uuid,
+) -> Result<Vec<RenderItem>, sqlx::Error> {
     let stories: Vec<(i32, Vec<ClusterRef>)> = sqlx::query(
         "SELECT di.position, s.clusters
          FROM digest_item di JOIN story s ON s.id = di.story_id
@@ -186,32 +195,33 @@ pub async fn render_items(pool: &PgPool, digest_id: Uuid) -> Result<Vec<RenderIt
             serde_json::from_value(clusters).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
         Ok((row.get::<i32, _>("position"), members))
     })
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
 
-    assemble_items(pool, stories.into_iter().map(|(_, m)| m).collect()).await
+    assemble_items(conn, stories.into_iter().map(|(_, m)| m).collect()).await
 }
 
 /// Render items for an explicit, ordered set of linked stories — the ad-hoc dispatch / preview path,
-/// whose selection isn't frozen into `digest_item` rows. Preserves the given order.
+/// whose selection isn't frozen into `digest_item` rows. Preserves the given order. Reads `cluster`
+/// (RLS-protected) → runs in the subscriber's scope.
 pub async fn render_items_for_stories(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     stories: &[crate::link::LinkedStory],
 ) -> Result<Vec<RenderItem>, sqlx::Error> {
-    assemble_items(pool, stories.iter().map(|s| s.clusters.clone()).collect()).await
+    assemble_items(conn, stories.iter().map(|s| s.clusters.clone()).collect()).await
 }
 
 /// Shared assembler: fetch every referenced cluster's card once, then build a `RenderItem` per story
 /// (in input order). Stories that resolve to no card (tombstoned/empty) are skipped.
 async fn assemble_items(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     stories: Vec<Vec<ClusterRef>>,
 ) -> Result<Vec<RenderItem>, sqlx::Error> {
     let ids: Vec<Uuid> = stories
         .iter()
         .flat_map(|members| members.iter().map(|m| m.cluster_id))
         .collect();
-    let cards = cluster_cards(pool, &ids).await?;
+    let cards = cluster_cards(conn, &ids).await?;
     Ok(stories
         .iter()
         .filter_map(|members| build_render_item(members, &cards))
@@ -222,13 +232,16 @@ async fn assemble_items(
 /// "delivered ⇒ schedule moved" invariant can't tear across a crash. `delivered_through` becomes
 /// the new `last_run_at` (the lookback's consideration floor); `next_run_at` jumps to the next
 /// future boundary (coalescing). The `delivered_at IS NULL` guard makes a re-run a no-op.
+///
+/// All three writes (digest, its stories, the subscriber schedule) are this subscriber's own rows →
+/// the subscriber RLS context, atomically.
 pub async fn mark_delivered(
     pool: &PgPool,
     digest_id: Uuid,
     subscriber_id: Uuid,
     delivered_through: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
-    let mut tx = pool.begin().await?;
+    let mut tx = begin_scope(pool, ScopeCtx::Subscriber(subscriber_id)).await?;
     sqlx::query("UPDATE digest SET delivered_at = now() WHERE id = $1 AND delivered_at IS NULL")
         .bind(digest_id)
         .execute(&mut *tx)
@@ -242,12 +255,15 @@ pub async fn mark_delivered(
     Ok(())
 }
 
-/// Recent digests with subscriber email and item count, for the debug CLI.
+/// Recent digests with subscriber email and item count, for the debug CLI. A cross-subscriber
+/// operator view → the admin control-plane context (digest/subscriber/digest_item are fail-closed
+/// outside it).
 pub async fn list_digests(
     pool: &PgPool,
     limit: i64,
 ) -> Result<Vec<(DigestRow, String, i64)>, sqlx::Error> {
-    sqlx::query(
+    let mut tx = begin_scope(pool, ScopeCtx::Admin).await?;
+    let rows = sqlx::query(
         "SELECT d.id, d.subscriber_id, d.window_end, d.delivered_at,
                 s.email,
                 (SELECT count(*) FROM digest_item di WHERE di.digest_id = d.id) AS item_count
@@ -261,6 +277,8 @@ pub async fn list_digests(
         let count: i64 = row.get("item_count");
         Ok((row_to_digest(row)?, email, count))
     })
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(rows)
 }

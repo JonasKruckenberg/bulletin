@@ -1,13 +1,19 @@
 //! The ingest flow's persistence: the `connection` rows it polls + schedules, and appending
 //! normalized events to the **event log** (`event` table, fingerprint-deduped).
 
+use crate::common::db::{begin_scope, ScopeCtx};
 use crate::common::event::{from_row, Event, NewEvent};
 use crate::common::kind::SourceKind;
 use chrono::{DateTime, Utc};
-use sqlx::{postgres::PgRow, PgPool, Row};
+use sqlx::{postgres::PgRow, PgExecutor, PgPool, Row};
 use uuid::Uuid;
 
 // ── Connections ────────────────────────────────────────────────────────
+//
+// `connection` is under RLS (fail-closed): the runtime role reaches every owner's connections only
+// in the **admin** control-plane context, which the poll/webhook/tick/debug paths run in (a
+// subscriber context would see only its own). Each function below opens its own admin-scoped
+// transaction via `begin_scope` so callers need no scope ceremony.
 
 pub struct ConnectionRow {
     pub id: Uuid,
@@ -41,15 +47,18 @@ fn row_to_connection(row: PgRow) -> Result<ConnectionRow, sqlx::Error> {
 
 /// Returns all active connections whose `next_poll_at` is in the past.
 pub async fn due_connections(pool: &PgPool) -> Result<Vec<ConnectionRow>, sqlx::Error> {
-    sqlx::query(
+    let mut tx = begin_scope(pool, ScopeCtx::Admin).await?;
+    let rows = sqlx::query(
         "SELECT id, source, status, config, cursor, poll_interval_secs,
                 next_poll_at, last_polled_at, consecutive_failures, subscriber_id
          FROM connection
          WHERE status = 'active' AND next_poll_at <= now()",
     )
     .try_map(row_to_connection)
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(rows)
 }
 
 /// Inserts a new active connection and returns its generated id. `owner` is the subscriber that owns
@@ -63,6 +72,7 @@ pub async fn insert_connection(
     poll_interval_secs: i64,
     owner: Option<Uuid>,
 ) -> Result<Uuid, sqlx::Error> {
+    let mut tx = begin_scope(pool, ScopeCtx::Admin).await?;
     let row = sqlx::query(
         "INSERT INTO connection (source, config, poll_interval_secs, subscriber_id)
          VALUES ($1, $2, $3, $4)
@@ -72,29 +82,35 @@ pub async fn insert_connection(
     .bind(config)
     .bind(poll_interval_secs)
     .bind(owner)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row.get("id"))
 }
 
 /// Returns all connections regardless of status.
 pub async fn list_connections(pool: &PgPool) -> Result<Vec<ConnectionRow>, sqlx::Error> {
-    sqlx::query(
+    let mut tx = begin_scope(pool, ScopeCtx::Admin).await?;
+    let rows = sqlx::query(
         "SELECT id, source, status, config, cursor, poll_interval_secs,
                 next_poll_at, last_polled_at, consecutive_failures, subscriber_id
          FROM connection ORDER BY next_poll_at",
     )
     .try_map(row_to_connection)
-    .fetch_all(pool)
-    .await
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(rows)
 }
 
 /// Deletes a connection by id. Returns true if a row was deleted.
 pub async fn delete_connection(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+    let mut tx = begin_scope(pool, ScopeCtx::Admin).await?;
     let result = sqlx::query("DELETE FROM connection WHERE id = $1")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(result.rows_affected() > 0)
 }
 
@@ -103,15 +119,18 @@ pub async fn load_connection(
     pool: &PgPool,
     id: Uuid,
 ) -> Result<Option<ConnectionRow>, sqlx::Error> {
-    sqlx::query(
+    let mut tx = begin_scope(pool, ScopeCtx::Admin).await?;
+    let row = sqlx::query(
         "SELECT id, source, status, config, cursor, poll_interval_secs,
                 next_poll_at, last_polled_at, consecutive_failures, subscriber_id
          FROM connection WHERE id = $1",
     )
     .bind(id)
     .try_map(row_to_connection)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(row)
 }
 
 /// Resolves the connection a webhook delivery routes to, by `(source, provider_account_id)` — the
@@ -122,7 +141,8 @@ pub async fn resolve_connection_by_provider(
     source: SourceKind,
     provider_account_id: &str,
 ) -> Result<Option<ConnectionRow>, sqlx::Error> {
-    sqlx::query(
+    let mut tx = begin_scope(pool, ScopeCtx::Admin).await?;
+    let row = sqlx::query(
         "SELECT id, source, status, config, cursor, poll_interval_secs,
                 next_poll_at, last_polled_at, consecutive_failures, subscriber_id
          FROM connection
@@ -131,8 +151,10 @@ pub async fn resolve_connection_by_provider(
     .bind(source)
     .bind(provider_account_id)
     .try_map(row_to_connection)
-    .fetch_optional(pool)
-    .await
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(row)
 }
 
 /// Sets a connection's status (e.g. a GitHub App suspend/uninstall lifecycle webhook → 'suspended'
@@ -142,11 +164,13 @@ pub async fn update_connection_status(
     id: Uuid,
     status: &str,
 ) -> Result<(), sqlx::Error> {
+    let mut tx = begin_scope(pool, ScopeCtx::Admin).await?;
     sqlx::query("UPDATE connection SET status = $2 WHERE id = $1")
         .bind(id)
         .bind(status)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -156,6 +180,7 @@ pub async fn advance_cursor(
     id: Uuid,
     cursor: serde_json::Value,
 ) -> Result<(), sqlx::Error> {
+    let mut tx = begin_scope(pool, ScopeCtx::Admin).await?;
     sqlx::query(
         "UPDATE connection
          SET cursor = $2,
@@ -166,14 +191,16 @@ pub async fn advance_cursor(
     )
     .bind(id)
     .bind(cursor)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
 /// Records a failed poll: increments failure count and applies exponential backoff.
 /// Flips status to 'errored' after 5 consecutive failures.
 pub async fn record_failure(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> {
+    let mut tx = begin_scope(pool, ScopeCtx::Admin).await?;
     sqlx::query(
         "UPDATE connection
          SET consecutive_failures = consecutive_failures + 1,
@@ -185,8 +212,9 @@ pub async fn record_failure(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> 
          WHERE id = $1",
     )
     .bind(id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -197,7 +225,14 @@ pub async fn record_failure(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> 
 /// that identity already existed. The fingerprint is pure content identity, so a poll and a webhook
 /// for the same activity *within one scope* still collapse; two owners seeing the same private
 /// activity stay distinct (the fingerprint alone would cross-tenant-collide).
-pub async fn insert_event(pool: &PgPool, ev: &NewEvent) -> Result<Option<Event>, sqlx::Error> {
+///
+/// Takes any executor (not just a pool) because under RLS the caller runs it inside a scoped
+/// transaction ([`with_scope`](crate::with_scope)): a public event in the no-subscriber context, a
+/// private event in its owner's — the DB write policy refuses any other pairing.
+pub async fn insert_event(
+    executor: impl PgExecutor<'_>,
+    ev: &NewEvent,
+) -> Result<Option<Event>, sqlx::Error> {
     let (scope_kind, scope_subscriber_id) = ev.scope.to_columns();
 
     sqlx::query(
@@ -228,7 +263,7 @@ pub async fn insert_event(pool: &PgPool, ev: &NewEvent) -> Result<Option<Event>,
     .bind(ev.severity_hint)
     .bind(ev.raw.as_deref())
     .try_map(from_row)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 

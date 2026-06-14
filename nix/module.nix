@@ -24,9 +24,26 @@ let
   user = "bulletin";
   dbName = "bulletin";
 
+  # Two DB roles for two-context RLS (design §12): the owner role (`bulletin`) owns the DDL and runs
+  # migrations; the least-privilege runtime role (`bulletin_app`: non-owner, no BYPASSRLS) is what
+  # serve/worker/debug log in as, so the FORCE ROW LEVEL SECURITY policies actually bind. Both are
+  # reached by the single OS user `bulletin` over unix-socket peer auth via an ident map (below).
+  ownerRole = "bulletin";
+  runtimeRole = "bulletin_app";
+
+  # Runtime connection string (serve/worker/debug → runtime role). The owner string (migrate → owner
+  # role) is separate, so a runtime credential can never alter the schema or disable RLS.
   databaseUrl =
     if cfg.database.createLocally then
-      "postgres:///${dbName}?host=/run/postgresql"
+      "postgres://${runtimeRole}@/${dbName}?host=/run/postgresql"
+    else
+      cfg.database.url;
+
+  migrationUrl =
+    if cfg.database.createLocally then
+      "postgres://${ownerRole}@/${dbName}?host=/run/postgresql"
+    else if cfg.database.migrationUrl != null then
+      cfg.database.migrationUrl
     else
       cfg.database.url;
 
@@ -108,8 +125,22 @@ in
       url = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
         default = null;
+        example = "postgres://bulletin_app@db.internal/bulletin";
+        description = ''
+          Runtime DATABASE_URL (the least-privilege `bulletin_app` role) to use when
+          `database.createLocally = false`.
+        '';
+      };
+      migrationUrl = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
         example = "postgres://bulletin@db.internal/bulletin";
-        description = "DATABASE_URL to use when `database.createLocally = false`.";
+        description = ''
+          Owner/migration connection string (a more-privileged role that owns the DDL) for `migrate`,
+          when `database.createLocally = false`. Falls back to `database.url` if unset — but then the
+          runtime role must itself be able to create the runtime role + RLS policies, so a dedicated
+          owner URL is strongly recommended.
+        '';
       };
     };
 
@@ -214,10 +245,28 @@ in
       ensureDatabases = [ dbName ];
       ensureUsers = [
         {
-          name = user;
+          name = ownerRole;
           ensureDBOwnership = true;
         }
+        # The least-privilege runtime role: created here (so the non-superuser owner needn't hold
+        # CREATEROLE — the RLS migration's role-create then no-ops), owns nothing. Its table grants
+        # come from `grant_runtime_role`, run during `migrate`. NixOS ensureUsers makes a plain
+        # LOGIN role: non-superuser, no BYPASSRLS — exactly what FORCE RLS requires.
+        {
+          name = runtimeRole;
+        }
       ];
+
+      # The single OS user `bulletin` reaches both DB roles over unix-socket peer auth: migrate as
+      # the owner, serve/worker as the runtime role. The ident map authorizes that, and the explicit
+      # pg_hba line (matched before the default catch-all) applies the map to the bulletin database.
+      identMap = ''
+        bulletin-map ${user} ${ownerRole}
+        bulletin-map ${user} ${runtimeRole}
+      '';
+      authentication = lib.mkBefore ''
+        local ${dbName} ${ownerRole},${runtimeRole} peer map=bulletin-map
+      '';
     };
 
     # CLI wrapper (DATABASE_URL preset) on PATH for seeding/ops + the digest-explain loop.
@@ -235,7 +284,8 @@ in
       after = pgDeps;
       requires = pgDeps;
       before = [ "bulletin.service" ];
-      environment.DATABASE_URL = databaseUrl;
+      # Migrate as the owner role (owns the DDL, creates the runtime role + RLS, grants it access).
+      environment.DATABASE_URL = migrationUrl;
       serviceConfig =
         hardening
         // {

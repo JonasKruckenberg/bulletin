@@ -17,6 +17,7 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::common::db::{with_scope, ScopeCtx};
 use crate::digest::select::{select, Candidate, Decision, Verdict};
 use crate::digest::store::{
     build_render_item, cluster_cards, create_with_items, mark_delivered, render_items,
@@ -71,16 +72,28 @@ async fn link_and_select(
     horizon_days: i32,
     persist: bool,
 ) -> Result<(Vec<LinkedStory>, Vec<Decision>)> {
-    let clusters = link::store::candidate_clusters(pool, sub.id, last_run, horizon_days)
-        .await
-        .context("collect candidate clusters")?;
-    let prior = link::store::load_prior_members(pool, sub.id)
-        .await
-        .context("load prior story assignment")?;
+    let sub_id = sub.id;
+    // Read the candidate clusters + the prior story assignment in the subscriber's RLS context: the
+    // candidate set is `public ∪ own-private` (and the prior assignment is the subscriber's own
+    // stories), never another tenant's — the query says so, and now the DB enforces it (design §12).
+    let (clusters, prior) = with_scope(pool, ScopeCtx::Subscriber(sub_id), move |conn| {
+        Box::pin(async move {
+            let clusters =
+                link::store::candidate_clusters(&mut *conn, sub_id, last_run, horizon_days)
+                    .await
+                    .context("collect candidate clusters")?;
+            let prior = link::store::load_prior_members(&mut *conn, sub_id)
+                .await
+                .context("load prior story assignment")?;
+            Ok((clusters, prior))
+        })
+    })
+    .await?;
 
     let assignment = link::link(&clusters, &prior, Uuid::now_v7);
     if persist {
-        link::store::persist_assignment(pool, sub.id, &assignment)
+        // Writes the subscriber's own stories → its RLS context (self-scoped inside the store fn).
+        link::store::persist_assignment(pool, sub_id, &assignment)
             .await
             .context("persist story assignment")?;
     }
@@ -152,9 +165,15 @@ pub async fn generate(
         return Ok(DigestOutcome::AlreadyDelivered);
     }
 
-    let items = render_items(pool, digest.id)
-        .await
-        .context("load render items")?;
+    let digest_id = digest.id;
+    let items = with_scope(pool, ScopeCtx::Subscriber(sub.id), move |conn| {
+        Box::pin(async move {
+            render_items(&mut *conn, digest_id)
+                .await
+                .context("load render items")
+        })
+    })
+    .await?;
     if items.is_empty() {
         // Empty windows are rare — going silent reads as a broken pipeline. Send a cheerful
         // "you're all caught up" note instead, opened with the same time-of-day salutation as a
@@ -227,15 +246,21 @@ pub async fn dispatch_now(
     log_selection(sub.id, sub.max_items as usize, &decisions);
     let selected = selected_ids(&decisions);
 
-    // Reassemble the selected stories (in render order) from the in-memory assignment.
+    // Reassemble the selected stories (in render order) from the in-memory assignment, rendering
+    // their cluster cards in the subscriber's RLS context.
     let by_id: HashMap<Uuid, &LinkedStory> = stories.iter().map(|s| (s.id, s)).collect();
     let selected_stories: Vec<LinkedStory> = selected
         .iter()
         .filter_map(|id| by_id.get(id).map(|s| (*s).clone()))
         .collect();
-    let items = render_items_for_stories(pool, &selected_stories)
-        .await
-        .context("load render items")?;
+    let items = with_scope(pool, ScopeCtx::Subscriber(sub.id), move |conn| {
+        Box::pin(async move {
+            render_items_for_stories(&mut *conn, &selected_stories)
+                .await
+                .context("load render items")
+        })
+    })
+    .await?;
     if items.is_empty() {
         return Ok(DigestOutcome::Empty);
     }
@@ -313,9 +338,14 @@ pub async fn explain(pool: &PgPool, subscriber_id: Uuid) -> Result<Vec<ExplainRo
         .iter()
         .flat_map(|s| s.clusters.iter().map(|c| c.cluster_id))
         .collect();
-    let cards = cluster_cards(pool, &ids)
-        .await
-        .context("load cluster cards")?;
+    let cards = with_scope(pool, ScopeCtx::Subscriber(sub.id), move |conn| {
+        Box::pin(async move {
+            cluster_cards(&mut *conn, &ids)
+                .await
+                .context("load cluster cards")
+        })
+    })
+    .await?;
 
     Ok(decisions
         .into_iter()
