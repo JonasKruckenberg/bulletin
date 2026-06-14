@@ -110,8 +110,8 @@ or `cargo nextest run`.
 |---|---|---|
 | **1** | Connector trait family seam, `ContentKind`, GitHub poll, `ConnDispatch` | ✅ merged (commit `6236abd`) |
 | **2** | Webhook catcher + `ProcessWebhook` job + HMAC verify + realtime traits | ✅ implemented (branch `claude/m1-phase-2-c1tvgu`) |
-| **3** | Private scope load-bearing + per-subscriber private clusters + scope-invariant proptest | ⬜ next |
-| **4** | Two-context RLS (two roles, two URLs) | ⬜ |
+| **3** | Private scope load-bearing + per-subscriber private clusters + scope-invariant proptest | ✅ implemented (branch `claude/m2-phase-3-s5ewh9`) |
+| **4** | Two-context RLS (two roles, two URLs) | ⬜ next |
 | **5** | Credential-at-rest (interim XChaCha20-Poly1305 envelope) + real GitHub token minting | ⬜ |
 
 ---
@@ -217,6 +217,59 @@ poll↔webhook dedup, lifecycle → status.
 ---
 
 ## 7. Phase 3 — Private scope load-bearing + per-subscriber private clusters
+
+> **Status: implemented** (branch `claude/m2-phase-3-s5ewh9`). What landed, vs. the plan below:
+> - **Migration** `…012_private_scope.sql`: `cluster` gains `scope_kind` + `scope_subscriber_id`
+>   (+ CHECK); `cluster_identity` replaced with `UNIQUE NULLS NOT DISTINCT (scope_kind,
+>   scope_subscriber_id, source, group_key)` (the `NULLS NOT DISTINCT` is load-bearing — without it
+>   the public upsert's `ON CONFLICT` never fires); `cluster_scope_recency` index; `connection`
+>   gains owning `subscriber_id uuid NULL REFERENCES subscriber(id) ON DELETE CASCADE`.
+>   Follow-up `…013_scoped_fingerprint.sql`: `event` dedup key widened to
+>   `UNIQUE NULLS NOT DISTINCT (fingerprint, scope_kind, scope_subscriber_id)` — the fingerprint
+>   stays pure content identity (poll↔webhook still collapse within a scope), but two owners over the
+>   *same* private repo no longer cross-tenant-collide (the global `UNIQUE(fingerprint)` would have
+>   dropped the second owner's event). `insert_event` conflicts on the constraint by name.
+> - **Visibility-aware finalize**: `EventBuilder` gained `is_private` + `.private(bool)`;
+>   `finalize(scope)` became `finalize(owner: Option<Uuid>)` mapping `(is_private, owner)` →
+>   `Scope` (`private + owner → Private(owner)`, else `Public`). `ingest::poll` and
+>   `process_webhook` finalize per-event with the connection's `subscriber_id` (from OUR row, never
+>   the payload). The `(private, None)` case is made **unreachable** rather than fail-open:
+>   `…014_connection_owner.sql` adds `CHECK (source = 'rss' OR subscriber_id IS NOT NULL)` and
+>   `SourceKind::can_emit_private` gates `connection-add`, so a private-capable source is always
+>   owned (FK CASCADE keeps it owned for life).
+> - **GitHub visibility**: `repos_to_poll` returns `RepoTarget { name, private }` (discovery reads
+>   `/installation/repositories`'s `private`; an allowlist can't, so it reports `private=false`);
+>   `GithubEvent` deserializes the feed's per-event `public` flag (default `true`) and `poll` folds
+>   the repo-list privacy onto each event (never a downgrade); `from_webhook` sets `public` from
+>   `repository.private`; `to_builder` passes `.private(!public)`.
+> - **PrivateBuild**: `cluster::build_private(pool, subscriber_id)` — a per-subscriber mirror of the
+>   public `build`: a txn holding a per-subscriber advisory lock, the half-open `(built_through,
+>   now()]` range from `…015_private_build_watermark.sql` (keyed per subscriber), recompute dirtied
+>   groups, upsert, advance the cursor. So it scales with *new* private activity (not lifetime
+>   history) and a quiet private cluster ages out of the candidate floor like a public one.
+>   `GenerateDigest` (and `dispatch_now`) call it before selecting. The public and private builds
+>   share their code: the group-discovery query (`dirty_groups(scope, lo, hi)`), the per-group
+>   loader (`list_group_events(scope, …)`), and the rollup→upsert loop (`build_groups`) are all
+>   scope-parameterized (via `scope.to_columns()` + `scope_subscriber_id IS NOT DISTINCT FROM`); only
+>   the lock/bounds/watermark differ. `upsert_cluster` is scope-aware too. `candidates_in_lookback`
+>   takes a `subscriber_id` and filters `scope_kind = 'public' OR scope_subscriber_id = $1` (the
+>   isolation boundary) — `explain` is scope-aware too but stays no-writes (doesn't build private).
+>   `…016_candidate_lookback_index.sql` replaces the Phase-3 `cluster_scope_recency` index (keyed on
+>   last_event_time, which served neither the `updated_at` floor nor the scope OR) with two
+>   predicate-aligned indexes the planner bitmap-ORs: a partial `(updated_at) WHERE public` and a
+>   `(scope_subscriber_id, updated_at)`.
+> - **Scope-invariant proptests** (pure, `cluster::tests`): public build never clusters a private
+>   event (scope is part of `ClusterKey`); a subscriber's candidate set (`visible_to`) never holds
+>   another subscriber's private cluster. Plus DB-backed tests (Docker): `pipeline.rs`
+>   per-owner isolation, `webhook.rs` private-repo → owner scope, `github.rs` visibility→scope.
+> - **Debug**: `debug connection-add --owner <subscriber>` binds a connection to its owner.
+> - **Seams left for later phases:** isolation is enforced at the *query* layer (the
+>   `scope_subscriber_id` predicates) — Phase 4 makes it DB-enforced via RLS so it holds against a
+>   logic bug. `cluster_entities` GIN (blocking) is still M3. (The earlier "no private watermark" and
+>   "ownerless-private fail-open" seams are now closed — see migrations 014/015.)
+> - **Tests:** `clippy --all-targets` clean; pure suites pass; Docker was unavailable in the build
+>   sandbox so the DB suites (`pipeline`/`webhook`/`event`/`connection`/`poll_rss`) compiled but did
+>   not run.
 
 **Goal:** private-repo events reach only their owner's digest; public stays shared.
 

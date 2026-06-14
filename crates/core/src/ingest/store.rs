@@ -2,7 +2,7 @@
 //! normalized events to the **event log** (`event` table, fingerprint-deduped).
 
 use crate::common::event::{from_row, Event, NewEvent};
-use crate::common::{kind::SourceKind, scope::Scope};
+use crate::common::kind::SourceKind;
 use chrono::{DateTime, Utc};
 use sqlx::{postgres::PgRow, PgPool, Row};
 use uuid::Uuid;
@@ -19,6 +19,9 @@ pub struct ConnectionRow {
     pub next_poll_at: DateTime<Utc>,
     pub last_polled_at: Option<DateTime<Utc>>,
     pub consecutive_failures: i16,
+    /// The owning subscriber (`None` = a global/public source like RSS). `finalize` binds a private
+    /// event to this owner — the IDOR/§12 boundary, since it comes from OUR row, not the payload.
+    pub subscriber_id: Option<Uuid>,
 }
 
 fn row_to_connection(row: PgRow) -> Result<ConnectionRow, sqlx::Error> {
@@ -32,6 +35,7 @@ fn row_to_connection(row: PgRow) -> Result<ConnectionRow, sqlx::Error> {
         next_poll_at: row.get("next_poll_at"),
         last_polled_at: row.get("last_polled_at"),
         consecutive_failures: row.get("consecutive_failures"),
+        subscriber_id: row.get("subscriber_id"),
     })
 }
 
@@ -39,7 +43,7 @@ fn row_to_connection(row: PgRow) -> Result<ConnectionRow, sqlx::Error> {
 pub async fn due_connections(pool: &PgPool) -> Result<Vec<ConnectionRow>, sqlx::Error> {
     sqlx::query(
         "SELECT id, source, status, config, cursor, poll_interval_secs,
-                next_poll_at, last_polled_at, consecutive_failures
+                next_poll_at, last_polled_at, consecutive_failures, subscriber_id
          FROM connection
          WHERE status = 'active' AND next_poll_at <= now()",
     )
@@ -48,21 +52,26 @@ pub async fn due_connections(pool: &PgPool) -> Result<Vec<ConnectionRow>, sqlx::
     .await
 }
 
-/// Inserts a new active connection and returns its generated id.
+/// Inserts a new active connection and returns its generated id. `owner` is the subscriber that owns
+/// this connection's private events (`None` for a global/public source like RSS); a GitHub
+/// connection that can see private repos must be owned, or its private events would have no scope to
+/// bind to and `finalize` would treat them as public.
 pub async fn insert_connection(
     pool: &PgPool,
     source: SourceKind,
     config: serde_json::Value,
     poll_interval_secs: i64,
+    owner: Option<Uuid>,
 ) -> Result<Uuid, sqlx::Error> {
     let row = sqlx::query(
-        "INSERT INTO connection (source, config, poll_interval_secs)
-         VALUES ($1, $2, $3)
+        "INSERT INTO connection (source, config, poll_interval_secs, subscriber_id)
+         VALUES ($1, $2, $3, $4)
          RETURNING id",
     )
     .bind(source)
     .bind(config)
     .bind(poll_interval_secs)
+    .bind(owner)
     .fetch_one(pool)
     .await?;
     Ok(row.get("id"))
@@ -72,7 +81,7 @@ pub async fn insert_connection(
 pub async fn list_connections(pool: &PgPool) -> Result<Vec<ConnectionRow>, sqlx::Error> {
     sqlx::query(
         "SELECT id, source, status, config, cursor, poll_interval_secs,
-                next_poll_at, last_polled_at, consecutive_failures
+                next_poll_at, last_polled_at, consecutive_failures, subscriber_id
          FROM connection ORDER BY next_poll_at",
     )
     .try_map(row_to_connection)
@@ -96,7 +105,7 @@ pub async fn load_connection(
 ) -> Result<Option<ConnectionRow>, sqlx::Error> {
     sqlx::query(
         "SELECT id, source, status, config, cursor, poll_interval_secs,
-                next_poll_at, last_polled_at, consecutive_failures
+                next_poll_at, last_polled_at, consecutive_failures, subscriber_id
          FROM connection WHERE id = $1",
     )
     .bind(id)
@@ -115,7 +124,7 @@ pub async fn resolve_connection_by_provider(
 ) -> Result<Option<ConnectionRow>, sqlx::Error> {
     sqlx::query(
         "SELECT id, source, status, config, cursor, poll_interval_secs,
-                next_poll_at, last_polled_at, consecutive_failures
+                next_poll_at, last_polled_at, consecutive_failures, subscriber_id
          FROM connection
          WHERE source = $1 AND provider_account_id = $2",
     )
@@ -183,13 +192,13 @@ pub async fn record_failure(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> 
 
 // ── Event log (append) ───────────────────────────────────────────────────
 
-/// Appends `ev` to the event log, deduplicating on fingerprint.
-/// Returns `Some(event)` if inserted, `None` if the fingerprint already existed.
+/// Appends `ev` to the event log, deduplicating on its scope-aware identity
+/// `(fingerprint, scope_kind, scope_subscriber_id)`. Returns `Some(event)` if inserted, `None` if
+/// that identity already existed. The fingerprint is pure content identity, so a poll and a webhook
+/// for the same activity *within one scope* still collapse; two owners seeing the same private
+/// activity stay distinct (the fingerprint alone would cross-tenant-collide).
 pub async fn insert_event(pool: &PgPool, ev: &NewEvent) -> Result<Option<Event>, sqlx::Error> {
-    let (scope_kind, scope_subscriber_id) = match &ev.scope {
-        Scope::Public => ("public", None::<Uuid>),
-        Scope::Private(sub_id) => ("private", Some(*sub_id)),
-    };
+    let (scope_kind, scope_subscriber_id) = ev.scope.to_columns();
 
     sqlx::query(
         r#"
@@ -198,7 +207,7 @@ pub async fn insert_event(pool: &PgPool, ev: &NewEvent) -> Result<Option<Event>,
             event_time, title, body, links, group_key, entities,
             content_kind, severity_hint, raw
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-        ON CONFLICT (fingerprint) DO NOTHING
+        ON CONFLICT ON CONSTRAINT event_fingerprint_unique DO NOTHING
         RETURNING
             id, fingerprint, source, scope_kind, scope_subscriber_id,
             event_time, title, body, links, group_key, entities,

@@ -12,7 +12,7 @@ use anyhow::Result;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::common::{event::EventBuilder, kind::SourceKind, scope::Scope};
+use crate::common::{event::EventBuilder, kind::SourceKind};
 use crate::ingest::github::token::TokenProvider;
 
 pub struct Batch<I, C> {
@@ -50,7 +50,7 @@ pub trait Connection: Send + Sync {
     ) -> impl std::future::Future<Output = Result<Batch<Self::Item, Self::Cursor>, SourceError>> + Send;
 
     /// Pure normalization: source-specific item → connector-side event builders. Infra calls
-    /// `finalize(scope)` on each builder to stamp the scope boundary and fingerprint.
+    /// `finalize(owner)` on each builder to stamp the scope boundary and fingerprint.
     fn to_events(&self, item: Self::Item) -> Vec<EventBuilder>;
 }
 
@@ -210,9 +210,10 @@ pub async fn poll(pool: &PgPool, connection_id: Uuid, ctx: &ConnectorCtx) -> Res
             let total = builders.len();
             let mut inserted = 0usize;
             for builder in builders {
-                // Scope is uniformly public until private scope becomes load-bearing (Phase 3);
-                // there it becomes per-event, derived by `finalize` from connection ownership.
-                if store::insert_event(pool, &builder.finalize(Scope::Public))
+                // Per-event scope: `finalize` maps the builder's `is_private` flag against THIS
+                // connection's owner — a private-repo item becomes `Private(owner)`, public stays
+                // shared. The owner comes from our row, never the polled payload (§12 risk #1).
+                if store::insert_event(pool, &builder.finalize(conn_row.subscriber_id))
                     .await?
                     .is_some()
                 {
@@ -311,9 +312,10 @@ pub async fn process_webhook(
             let total = builders.len();
             let mut inserted = 0usize;
             for builder in builders {
-                // Scope is uniformly public until private scope becomes load-bearing (Phase 3),
-                // where `finalize` derives it per-event from the resolved connection's owner.
-                if store::insert_event(pool, &builder.finalize(Scope::Public))
+                // Per-event scope, derived from the *resolved* connection's owner (never the webhook
+                // payload — IDOR defense): a private-repo delivery becomes `Private(owner)`. The
+                // webhook body's `repository.private` only sets the builder's `is_private` flag.
+                if store::insert_event(pool, &builder.finalize(conn.subscriber_id))
                     .await?
                     .is_some()
                 {

@@ -3,6 +3,7 @@ use bulletin_core::{connect, event::EventBuilder, kind::SourceKind, migrate, sco
 use chrono::Utc;
 use testcontainers::{runners::AsyncRunner, ImageExt};
 use testcontainers_modules::postgres::Postgres;
+use uuid::Uuid;
 
 async fn setup() -> (sqlx::PgPool, testcontainers::ContainerAsync<Postgres>) {
     let pg = Postgres::default()
@@ -33,7 +34,7 @@ fn rss(stable_id: &str, title: &str) -> EventBuilder {
 async fn insert_returns_event() {
     let (pool, _pg) = setup().await;
 
-    let new_ev = rss("item-1", "Hello world").finalize(Scope::Public);
+    let new_ev = rss("item-1", "Hello world").finalize(None);
     let event = insert_event(&pool, &new_ev)
         .await
         .unwrap()
@@ -52,7 +53,7 @@ async fn insert_returns_event() {
 async fn repoll_same_item_is_deduped() {
     let (pool, _pg) = setup().await;
 
-    let first = rss("item-1", "Original title").finalize(Scope::Public);
+    let first = rss("item-1", "Original title").finalize(None);
     assert!(insert_event(&pool, &first).await.unwrap().is_some());
 
     let second = EventBuilder::new(
@@ -64,7 +65,7 @@ async fn repoll_same_item_is_deduped() {
     )
     .body("body added on edit")
     .entities(vec!["Rust".into()])
-    .finalize(Scope::Public);
+    .finalize(None);
 
     assert_eq!(
         first.fingerprint, second.fingerprint,
@@ -81,15 +82,50 @@ async fn repoll_same_item_is_deduped() {
 async fn distinct_stable_ids_both_insert() {
     let (pool, _pg) = setup().await;
 
-    let ea = insert_event(&pool, &rss("item-a", "Item A").finalize(Scope::Public))
+    let ea = insert_event(&pool, &rss("item-a", "Item A").finalize(None))
         .await
         .unwrap()
         .expect("item-a should insert");
-    let eb = insert_event(&pool, &rss("item-b", "Item B").finalize(Scope::Public))
+    let eb = insert_event(&pool, &rss("item-b", "Item B").finalize(None))
         .await
         .unwrap()
         .expect("item-b should insert");
 
     assert_ne!(ea.id, eb.id);
     assert_ne!(ea.fingerprint, eb.fingerprint);
+}
+
+// Dedup is scoped per owner: the same content-identity (same fingerprint) seen by two different
+// private owners are two distinct events — a shared private repo can't collapse one tenant's
+// activity into another's. Within a single owner's scope a re-observation still dedups.
+#[tokio::test]
+async fn fingerprint_dedup_is_scoped_per_owner() {
+    let (pool, _pg) = setup().await;
+    let alice = Uuid::new_v4();
+    let bob = Uuid::new_v4();
+
+    let a = rss("issue:999", "Alice's view")
+        .private(true)
+        .finalize(Some(alice));
+    let b = rss("issue:999", "Bob's view")
+        .private(true)
+        .finalize(Some(bob));
+
+    // Same content → same fingerprint (the fingerprint is scope-free, by design)...
+    assert_eq!(a.fingerprint, b.fingerprint);
+
+    // ...but the (fingerprint, scope) identity differs, so both insert — no cross-tenant collapse.
+    assert!(insert_event(&pool, &a).await.unwrap().is_some());
+    assert!(
+        insert_event(&pool, &b).await.unwrap().is_some(),
+        "a second owner seeing the same private activity must not be dropped as a duplicate"
+    );
+
+    // A re-observation within the same owner's scope (e.g. poll after webhook) still dedups.
+    assert!(insert_event(&pool, &a).await.unwrap().is_none());
+
+    // And a public event with that same fingerprint is its own identity too.
+    let shared = rss("issue:999", "public view").finalize(None);
+    assert_eq!(shared.fingerprint, a.fingerprint);
+    assert!(insert_event(&pool, &shared).await.unwrap().is_some());
 }

@@ -4,8 +4,7 @@
 //! Postgres.
 
 use bulletin_core::cluster::store::{
-    advance_build_watermark, build_bounds, dirty_public_groups, list_public_group_events,
-    upsert_cluster,
+    advance_build_watermark, build_bounds, dirty_groups, list_group_events, upsert_cluster,
 };
 use bulletin_core::digest::select::{select, Verdict};
 use bulletin_core::digest::store::{
@@ -17,7 +16,12 @@ use bulletin_core::digest::subscriber::{
 };
 use bulletin_core::ingest::store::insert_event;
 use bulletin_core::{
-    cluster::rollup, connect, event::EventBuilder, kind::SourceKind, migrate, scope::Scope,
+    cluster::{build_private, rollup},
+    connect,
+    event::EventBuilder,
+    kind::SourceKind,
+    migrate,
+    scope::Scope,
 };
 use chrono::{Duration, NaiveTime, TimeZone, Utc};
 use sqlx::{PgPool, Row};
@@ -75,20 +79,44 @@ async fn insert_public(pool: &PgPool, stable_id: &str, group_key: &str, title: &
         group_key,
     )
     .links(vec![format!("https://example.com/{stable_id}")])
-    .finalize(Scope::Public);
+    .finalize(None);
+    insert_event(pool, &ev).await.unwrap();
+}
+
+/// Inserts a private event owned by `subscriber` (a private-repo-shaped item).
+async fn insert_private(
+    pool: &PgPool,
+    subscriber: Uuid,
+    stable_id: &str,
+    group_key: &str,
+    title: &str,
+    secs: i64,
+) {
+    let ev = EventBuilder::new(
+        SourceKind::Github,
+        stable_id,
+        Utc.timestamp_opt(secs, 0).single().unwrap(),
+        title,
+        group_key,
+    )
+    .links(vec![format!("https://example.com/{stable_id}")])
+    .private(true)
+    .finalize(Some(subscriber));
     insert_event(pool, &ev).await.unwrap();
 }
 
 /// Runs PublicBuild's core loop inline (the binary's `build::run`, minus the advisory lock).
 async fn build_all(pool: &PgPool) {
     let (lo, hi) = build_bounds(pool).await.unwrap();
-    let groups = dirty_public_groups(pool, lo, hi).await.unwrap();
+    let groups = dirty_groups(pool, &Scope::Public, lo, hi).await.unwrap();
     for (source, group_key) in &groups {
-        let events = list_public_group_events(pool, *source, group_key)
+        let events = list_group_events(pool, &Scope::Public, *source, group_key)
             .await
             .unwrap();
         if let Some(r) = rollup(&events) {
-            upsert_cluster(pool, *source, group_key, &r).await.unwrap();
+            upsert_cluster(pool, &Scope::Public, *source, group_key, &r)
+                .await
+                .unwrap();
         }
     }
     advance_build_watermark(pool, hi).await.unwrap();
@@ -119,12 +147,14 @@ async fn build_groups_events_into_clusters() {
     assert_eq!(cluster_count(&pool).await, 3);
 
     // The shared cluster is represented by its latest event.
-    let shared = list_public_group_events(&pool, SourceKind::Rss, "shared")
+    let shared = list_group_events(&pool, &Scope::Public, SourceKind::Rss, "shared")
         .await
         .unwrap();
     assert_eq!(rollup(&shared).unwrap().title, "Shared latest");
 
-    let candidates = candidates_in_lookback(&pool, None, 30).await.unwrap();
+    let candidates = candidates_in_lookback(&pool, Uuid::nil(), None, 30)
+        .await
+        .unwrap();
     assert_eq!(candidates.len(), 3);
 
     // Pure selection caps and orders newest-first.
@@ -186,7 +216,7 @@ async fn no_build_gate_unbuilt_events_ride_next_fire() {
     );
     // ...but the unbuilt event is not yet a candidate.
     assert!(
-        candidates_in_lookback(&pool, None, 30)
+        candidates_in_lookback(&pool, Uuid::nil(), None, 30)
             .await
             .unwrap()
             .is_empty(),
@@ -197,7 +227,10 @@ async fn no_build_gate_unbuilt_events_ride_next_fire() {
 
     // Once clustered it becomes a candidate.
     assert_eq!(
-        candidates_in_lookback(&pool, None, 30).await.unwrap().len(),
+        candidates_in_lookback(&pool, Uuid::nil(), None, 30)
+            .await
+            .unwrap()
+            .len(),
         1,
         "built cluster is now a candidate"
     );
@@ -227,7 +260,7 @@ async fn digest_delivery_and_idempotency() {
     let sub = load_subscriber(&pool, sub_id).await.unwrap().unwrap();
     let window_end = sub.next_run_at;
 
-    let candidates = candidates_in_lookback(&pool, sub.last_run_at, 30)
+    let candidates = candidates_in_lookback(&pool, sub.id, sub.last_run_at, 30)
         .await
         .unwrap();
     let selected: Vec<_> = select(candidates, sub.max_items as usize)
@@ -266,6 +299,112 @@ async fn digest_delivery_and_idempotency() {
     assert!(sub.next_run_at > window_end);
     assert!(sub.next_run_at <= window_end + Duration::days(1));
     assert_eq!(local_run_time(&pool, sub_id, "UTC").await, nine_am());
+}
+
+// Phase 3 isolation: after the public build and each owner's just-in-time private build, a
+// subscriber's candidate set is exactly `public ∪ own-private` — a private event reaches only its
+// owner, public stays shared, and a subscriber with no private events sees only public clusters.
+#[tokio::test]
+async fn private_clusters_are_isolated_to_their_owner() {
+    let (pool, _pg) = setup().await;
+
+    let alice = insert_subscriber(
+        &pool,
+        "alice@x.com",
+        None,
+        Recurrence::Daily,
+        "UTC",
+        nine_am(),
+    )
+    .await
+    .unwrap();
+    let bob = insert_subscriber(
+        &pool,
+        "bob@x.com",
+        None,
+        Recurrence::Daily,
+        "UTC",
+        nine_am(),
+    )
+    .await
+    .unwrap();
+    let carol = insert_subscriber(
+        &pool,
+        "carol@x.com",
+        None,
+        Recurrence::Daily,
+        "UTC",
+        nine_am(),
+    )
+    .await
+    .unwrap();
+
+    insert_public(&pool, "pub", "pub", "Public news", 100).await;
+    insert_private(&pool, alice, "a-secret", "a-secret", "Alice secret", 200).await;
+    insert_private(&pool, bob, "b-secret", "b-secret", "Bob secret", 300).await;
+
+    build_all(&pool).await; // public clusters only
+    assert_eq!(build_private(&pool, alice).await.unwrap(), 1);
+    assert_eq!(build_private(&pool, bob).await.unwrap(), 1);
+    // carol has no private events → nothing to build.
+    assert_eq!(build_private(&pool, carol).await.unwrap(), 0);
+
+    // Alice and Bob each see the public cluster + their own private one (2), never the other's.
+    assert_eq!(
+        candidates_in_lookback(&pool, alice, None, 30)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        candidates_in_lookback(&pool, bob, None, 30)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    // Carol sees only the shared public cluster.
+    assert_eq!(
+        candidates_in_lookback(&pool, carol, None, 30)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // The total cluster count is 1 public + 2 private — a private event never lands in a public
+    // cluster (scope is part of the cluster identity).
+    assert_eq!(cluster_count(&pool).await, 3);
+}
+
+// PrivateBuild is watermark-bounded like the public build: it processes only events ingested since
+// the subscriber's last build, so a re-run with nothing new is a no-op and a quiet private cluster's
+// updated_at is not bumped (so it ages out of the candidate floor the way a public cluster does).
+#[tokio::test]
+async fn private_build_is_watermark_incremental() {
+    let (pool, _pg) = setup().await;
+    let alice = insert_subscriber(
+        &pool,
+        "alice@x.com",
+        None,
+        Recurrence::Daily,
+        "UTC",
+        nine_am(),
+    )
+    .await
+    .unwrap();
+
+    insert_private(&pool, alice, "s1", "g1", "First", 100).await;
+    // First build (watermark = epoch) clusters the one group...
+    assert_eq!(build_private(&pool, alice).await.unwrap(), 1);
+    // ...and a re-run with nothing newly ingested is a no-op (watermark advanced past it).
+    assert_eq!(build_private(&pool, alice).await.unwrap(), 0);
+
+    // A new private event re-dirties only its own group; the settled one isn't rebuilt.
+    insert_private(&pool, alice, "s2", "g2", "Second", 200).await;
+    assert_eq!(build_private(&pool, alice).await.unwrap(), 1);
+    assert_eq!(cluster_count(&pool).await, 2);
 }
 
 // Signup schedules the first digest at the next occurrence of the local digest time in the

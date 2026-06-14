@@ -96,10 +96,20 @@ impl GithubConnection {
             .header(reqwest::header::USER_AGENT, "bulletin")
     }
 
-    /// The repos to reconcile: the configured allowlist, or every repo the installation can see.
-    async fn repos_to_poll(&self, token: &str) -> Result<Vec<String>, SourceError> {
+    /// The repos to reconcile, each tagged with its visibility. Discovery via
+    /// `/installation/repositories` carries an authoritative per-repo `private`; an explicit
+    /// allowlist can't, so those are reported `private = false` and rely on the per-event `public`
+    /// flag the feed itself carries (folded in [`poll`](Self::poll)) — never a downgrade, so a
+    /// private repo's activity is still tagged private.
+    async fn repos_to_poll(&self, token: &str) -> Result<Vec<RepoTarget>, SourceError> {
         if let Some(repos) = &self.repos {
-            return Ok(repos.clone());
+            return Ok(repos
+                .iter()
+                .map(|name| RepoTarget {
+                    name: name.clone(),
+                    private: false,
+                })
+                .collect());
         }
         let url = format!("{}/installation/repositories", self.base_url);
         let resp = self
@@ -122,7 +132,10 @@ impl GithubConnection {
         Ok(parsed
             .repositories
             .into_iter()
-            .map(|r| r.full_name)
+            .map(|r| RepoTarget {
+                name: r.full_name,
+                private: r.private,
+            })
             .collect())
     }
 
@@ -185,6 +198,12 @@ impl GithubConnection {
     }
 }
 
+/// One repo to reconcile, with its visibility (private repos tag their events `Private(owner)`).
+struct RepoTarget {
+    name: String,
+    private: bool,
+}
+
 #[derive(Deserialize)]
 struct InstallationRepos {
     #[serde(default)]
@@ -194,6 +213,8 @@ struct InstallationRepos {
 #[derive(Deserialize)]
 struct RepoEntry {
     full_name: String,
+    #[serde(default)]
+    private: bool,
 }
 
 impl Connection for GithubConnection {
@@ -210,10 +231,19 @@ impl Connection for GithubConnection {
         let mut items = Vec::new();
         let mut next = GithubCursor::default();
         for repo in repos {
-            let repo_cursor = cursor.repos.get(&repo).cloned().unwrap_or_default();
-            let (events, new_cursor) = self.poll_repo(&token.secret, &repo, repo_cursor).await?;
+            let repo_cursor = cursor.repos.get(&repo.name).cloned().unwrap_or_default();
+            let (mut events, new_cursor) = self
+                .poll_repo(&token.secret, &repo.name, repo_cursor)
+                .await?;
+            // A private repo forces every one of its events private (never a downgrade), so an
+            // allowlist that can't report visibility still tags private-repo activity correctly.
+            if repo.private {
+                for ev in &mut events {
+                    ev.public = false;
+                }
+            }
             items.extend(events);
-            next.repos.insert(repo, new_cursor);
+            next.repos.insert(repo.name, new_cursor);
         }
 
         Ok(Batch {

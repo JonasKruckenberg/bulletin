@@ -2,7 +2,7 @@ use axum::{routing::get, Router};
 use bulletin_core::ingest::rss::{RssConnection, RssCursor};
 use bulletin_core::ingest::store::{advance_cursor, insert_event, load_connection};
 use bulletin_core::ingest::Connection;
-use bulletin_core::{connect, migrate, scope::Scope};
+use bulletin_core::{connect, migrate};
 use serde_json::json;
 use testcontainers::{runners::AsyncRunner, ImageExt};
 use testcontainers_modules::postgres::Postgres;
@@ -87,7 +87,7 @@ async fn run_poll_cycle(pool: &sqlx::PgPool, connection_id: uuid::Uuid) -> usize
             .into_iter()
             .next()
             .unwrap()
-            .finalize(Scope::Public);
+            .finalize(None);
         insert_event(pool, &ev).await.unwrap();
     }
 

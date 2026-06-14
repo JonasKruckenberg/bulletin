@@ -7,8 +7,9 @@ pub mod store;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
+use uuid::Uuid;
 
-use crate::common::event::Event;
+use crate::common::{event::Event, kind::SourceKind, scope::Scope};
 
 /// The recomputed rollup the build upserts onto a cluster row. M1 keeps only what the digest
 /// reads — the latest event's title/link and the group's recency. Richer rollups (counts,
@@ -40,6 +41,38 @@ pub fn rollup(events: &[Event]) -> Option<ClusterRollup> {
     })
 }
 
+/// A cluster's scope-aware identity — the in-code mirror of the DB constraint
+/// `UNIQUE(scope_kind, scope_subscriber_id, source, group_key)`. **Scope is part of the key**, so a
+/// public and a private event can never fold into the same cluster: this is the typed primary
+/// isolation defense, alongside the RLS that lands in Phase 4. Used by the pure scope-invariant
+/// proptests below.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ClusterKey {
+    pub scope: Scope,
+    pub source: SourceKind,
+    pub group_key: String,
+}
+
+/// The cluster a finalized event belongs to. Pure; mirrors the build's grouping.
+pub fn cluster_key(event: &Event) -> ClusterKey {
+    ClusterKey {
+        scope: event.scope.clone(),
+        source: event.source,
+        group_key: event.group_key.clone(),
+    }
+}
+
+/// Whether a cluster of the given `scope` may appear in `subscriber`'s digest candidate set: public
+/// is shared, private is owner-only. The in-code mirror of the `candidates_in_lookback` predicate
+/// (`scope_kind = 'public' OR scope_subscriber_id = $sub`) — the isolation invariant the proptests
+/// pin so a logic change can't silently leak another subscriber's private cluster.
+pub fn visible_to(scope: &Scope, subscriber: Uuid) -> bool {
+    match scope {
+        Scope::Public => true,
+        Scope::Private(owner) => *owner == subscriber,
+    }
+}
+
 pub struct BuildStats {
     pub dirty_groups: usize,
     pub built_through: DateTime<Utc>,
@@ -66,20 +99,11 @@ pub async fn build(pool: &PgPool) -> Result<Option<BuildStats>> {
     let (built_through, hwm) = store::build_bounds(&mut *tx)
         .await
         .context("read build bounds")?;
-    let groups = store::dirty_public_groups(&mut *tx, built_through, hwm)
+    let groups = store::dirty_groups(&mut *tx, &Scope::Public, built_through, hwm)
         .await
         .context("find dirty groups")?;
 
-    for (source, group_key) in &groups {
-        let events = store::list_public_group_events(&mut *tx, *source, group_key)
-            .await
-            .context("load group events")?;
-        if let Some(r) = rollup(&events) {
-            store::upsert_cluster(&mut *tx, *source, group_key, &r)
-                .await
-                .context("upsert cluster")?;
-        }
-    }
+    build_groups(&mut tx, &Scope::Public, &groups).await?;
 
     store::advance_build_watermark(&mut *tx, hwm)
         .await
@@ -92,6 +116,70 @@ pub async fn build(pool: &PgPool) -> Result<Option<BuildStats>> {
     }))
 }
 
+/// The per-group build step both [`build`] and [`build_private`] run: recompute each dirtied group's
+/// rollup over *all* its (scoped) events and upsert the cluster. Only the scope, lock, bounds, and
+/// watermark differ between the two builds; this is the shared body, so a change to how a group is
+/// folded lands in one place. Reads and writes are both fenced by `scope`, so a private build can
+/// only touch its owner's clusters.
+async fn build_groups(
+    conn: &mut sqlx::PgConnection,
+    scope: &Scope,
+    groups: &[(SourceKind, String)],
+) -> Result<()> {
+    for (source, group_key) in groups {
+        let events = store::list_group_events(&mut *conn, scope, *source, group_key)
+            .await
+            .context("load group events")?;
+        if let Some(r) = rollup(&events) {
+            store::upsert_cluster(&mut *conn, scope, *source, group_key, &r)
+                .await
+                .context("upsert cluster")?;
+        }
+    }
+    Ok(())
+}
+
+/// PrivateBuild: drain one subscriber's new private events into their private clusters, ahead of
+/// their digest. The per-subscriber counterpart to [`build`], with the same shape — a transaction
+/// holding a per-subscriber advisory lock (concurrent builds for the same subscriber serialize; the
+/// loser returns `Ok(0)`), the half-open ingest range `(built_through, now()]` from the subscriber's
+/// own `private_build_watermark`, recompute each dirtied group's rollup, upsert, advance the cursor.
+///
+/// Watermark-bounded so it scales with *new* private activity, not lifetime history, and a quiet
+/// private cluster ages out of the candidate floor exactly like a public one (its `updated_at` is
+/// only bumped when a new event re-dirties its group). Every read/write is fenced by
+/// `scope_subscriber_id = subscriber_id`, so this can only touch the caller's own clusters — Phase 4
+/// makes that a DB-enforced (RLS) guarantee rather than a query convention. Returns the number of
+/// groups rebuilt this pass.
+pub async fn build_private(pool: &PgPool, subscriber_id: Uuid) -> Result<usize> {
+    let mut tx = pool.begin().await.context("begin private build txn")?;
+
+    if !store::try_private_build_lock(&mut *tx, subscriber_id)
+        .await
+        .context("acquire private build lock")?
+    {
+        tracing::debug!(%subscriber_id, "private build already in progress; skipping");
+        return Ok(0);
+    }
+
+    let (built_through, hwm) = store::private_build_bounds(&mut *tx, subscriber_id)
+        .await
+        .context("read private build bounds")?;
+    let scope = Scope::Private(subscriber_id);
+    let groups = store::dirty_groups(&mut *tx, &scope, built_through, hwm)
+        .await
+        .context("find dirty private groups")?;
+
+    build_groups(&mut tx, &scope, &groups).await?;
+
+    store::advance_private_build_watermark(&mut *tx, subscriber_id, hwm)
+        .await
+        .context("advance private watermark")?;
+    tx.commit().await.context("commit private build txn")?;
+
+    Ok(groups.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,25 +190,65 @@ mod tests {
     };
     use chrono::TimeZone;
     use proptest::prelude::*;
+    use std::collections::{HashMap, HashSet};
     use uuid::Uuid;
 
     fn ev(secs: i64, title: &str) -> Event {
+        ev_scoped(Scope::Public, SourceKind::Rss, "g", secs, title)
+    }
+
+    /// An `Event` with an explicit scope + group, for the isolation proptests.
+    fn ev_scoped(
+        scope: Scope,
+        source: SourceKind,
+        group_key: &str,
+        secs: i64,
+        title: &str,
+    ) -> Event {
         Event {
             id: Uuid::nil(),
             fingerprint: Fingerprint([0u8; 32]),
-            source: SourceKind::Rss,
-            scope: Scope::Public,
+            source,
+            scope,
             event_time: Utc.timestamp_opt(secs, 0).single().unwrap(),
             title: title.to_owned(),
             body: None,
             links: vec![format!("https://example.com/{title}")],
-            group_key: "g".to_owned(),
+            group_key: group_key.to_owned(),
             content_kind: ContentKind::Longform,
             entities: Vec::new(),
             severity_hint: None,
             ingest_time: Utc.timestamp_opt(secs, 0).single().unwrap(),
             raw: None,
         }
+    }
+
+    // Two distinct subscribers for the scope-invariant proptests.
+    fn sub_a() -> Uuid {
+        Uuid::from_u128(0xA)
+    }
+    fn sub_b() -> Uuid {
+        Uuid::from_u128(0xB)
+    }
+
+    /// Maps a small Debug-able tag (`0`/`1`/`2`) to a scope drawn from `{public, private(a),
+    /// private(b)}`. The proptests generate tags (which print on failure), not `Event`s.
+    fn scope_of(tag: u8) -> Scope {
+        match tag {
+            0 => Scope::Public,
+            1 => Scope::Private(sub_a()),
+            _ => Scope::Private(sub_b()),
+        }
+    }
+
+    /// Build a mixed multi-tenant event set from `(scope_tag, group, secs)` specs.
+    fn events_of(specs: &[(u8, String, i64)]) -> Vec<Event> {
+        specs
+            .iter()
+            .map(|(tag, group, secs)| {
+                ev_scoped(scope_of(*tag), SourceKind::Github, group, *secs, "x")
+            })
+            .collect()
     }
 
     #[test]
@@ -144,6 +272,57 @@ mod tests {
             let events: Vec<Event> = times.iter().map(|&t| ev(t, "x")).collect();
             let r = rollup(&events).unwrap();
             prop_assert_eq!(r.last_event_time.timestamp(), *times.iter().max().unwrap());
+        }
+
+        // ── Scope-invariant properties (a primary isolation defense, design §12) ──
+
+        // The public build reads only public events (`scope_kind = 'public'`) and writes Public
+        // clusters. Modelled by grouping the public subset on `cluster_key`: every cluster it
+        // produces is keyed Public and holds only public events — a private event can never land in
+        // a public cluster, because scope is part of the cluster identity.
+        #[test]
+        fn public_build_never_clusters_a_private_event(
+            specs in prop::collection::vec((0u8..3, "[a-c]", 0i64..1000), 0..40),
+        ) {
+            let events = events_of(&specs);
+            let mut clusters: HashMap<ClusterKey, Vec<&Event>> = HashMap::new();
+            for ev in &events {
+                if matches!(ev.scope, Scope::Public) {
+                    clusters.entry(cluster_key(ev)).or_default().push(ev);
+                }
+            }
+            for (key, members) in &clusters {
+                prop_assert_eq!(&key.scope, &Scope::Public);
+                for m in members {
+                    prop_assert!(matches!(m.scope, Scope::Public));
+                }
+            }
+        }
+
+        // A subscriber's digest candidate set (`public ∪ own-private`) never contains another
+        // subscriber's private cluster, and never hides their own — `visible_to` is exactly the
+        // `candidates_in_lookback` predicate, pinned here so a query change can't silently leak.
+        #[test]
+        fn candidate_set_isolates_private_clusters(
+            specs in prop::collection::vec((0u8..3, "[a-c]", 0i64..1000), 0..40),
+        ) {
+            let events = events_of(&specs);
+            let keys: HashSet<ClusterKey> = events.iter().map(cluster_key).collect();
+            for key in &keys {
+                match &key.scope {
+                    // Public clusters are shared with everyone.
+                    Scope::Public => {
+                        prop_assert!(visible_to(&key.scope, sub_a()));
+                        prop_assert!(visible_to(&key.scope, sub_b()));
+                    }
+                    // A private cluster is visible to its owner and to no one else.
+                    Scope::Private(owner) => {
+                        prop_assert!(visible_to(&key.scope, *owner));
+                        let other = if *owner == sub_a() { sub_b() } else { sub_a() };
+                        prop_assert!(!visible_to(&key.scope, other));
+                    }
+                }
+            }
         }
     }
 }

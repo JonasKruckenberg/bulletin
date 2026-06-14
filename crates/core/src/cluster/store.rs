@@ -6,6 +6,7 @@ use crate::cluster::ClusterRollup;
 use crate::common::{
     event::{from_row, Event},
     kind::SourceKind,
+    scope::Scope,
 };
 use chrono::{DateTime, Utc};
 use sqlx::{postgres::PgRow, PgExecutor, Row};
@@ -37,18 +38,25 @@ pub async fn build_bounds(
     Ok((row.get("built_through"), row.get("hwm")))
 }
 
-/// Distinct public `(source, group_key)` groups touched by events ingested in `(lo, hi]` —
-/// the "dirty" groups PublicBuild must recompute this pass.
-pub async fn dirty_public_groups(
+/// Distinct `(source, group_key)` groups *in `scope`* touched by events ingested in `(lo, hi]` — the
+/// "dirty" groups a build (public or private) must recompute this pass. `IS NOT DISTINCT FROM`
+/// matches the scope's nullable subscriber uniformly: public's NULL against NULL rows, a private
+/// owner against their own — the isolation boundary, shared by both builds.
+pub async fn dirty_groups(
     executor: impl PgExecutor<'_>,
+    scope: &Scope,
     lo: DateTime<Utc>,
     hi: DateTime<Utc>,
 ) -> Result<Vec<(SourceKind, String)>, sqlx::Error> {
+    let (scope_kind, scope_subscriber_id) = scope.to_columns();
     sqlx::query(
         "SELECT DISTINCT source, group_key
          FROM event
-         WHERE scope_kind = 'public' AND ingest_time > $1 AND ingest_time <= $2",
+         WHERE scope_kind = $1 AND scope_subscriber_id IS NOT DISTINCT FROM $2
+           AND ingest_time > $3 AND ingest_time <= $4",
     )
+    .bind(scope_kind)
+    .bind(scope_subscriber_id)
     .bind(lo)
     .bind(hi)
     .try_map(|row: PgRow| Ok((row.try_get("source")?, row.get::<String, _>("group_key"))))
@@ -56,17 +64,22 @@ pub async fn dirty_public_groups(
     .await
 }
 
-/// Upserts the recomputed rollup for one group. Idempotent: re-running a build overwrites the
-/// cache in place (durable state is the events, not this row).
+/// Upserts the recomputed rollup for one group in the given `scope`. Idempotent: re-running a build
+/// overwrites the cache in place (durable state is the events, not this row). Scope is part of the
+/// cluster identity, so a public and a private group with the same `(source, group_key)` are
+/// distinct rows — a private event can never land in a public cluster.
 pub async fn upsert_cluster(
     executor: impl PgExecutor<'_>,
+    scope: &Scope,
     source: SourceKind,
     group_key: &str,
     r: &ClusterRollup,
 ) -> Result<Uuid, sqlx::Error> {
+    let (scope_kind, scope_subscriber_id) = scope.to_columns();
     let row = sqlx::query(
-        "INSERT INTO cluster (source, group_key, title, link, last_event_time, updated_at)
-         VALUES ($1, $2, $3, $4, $5, now())
+        "INSERT INTO cluster
+            (scope_kind, scope_subscriber_id, source, group_key, title, link, last_event_time, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, now())
          ON CONFLICT ON CONSTRAINT cluster_identity DO UPDATE SET
             title = EXCLUDED.title,
             link = EXCLUDED.link,
@@ -74,6 +87,8 @@ pub async fn upsert_cluster(
             updated_at = now()
          RETURNING id",
     )
+    .bind(scope_kind)
+    .bind(scope_subscriber_id)
     .bind(source)
     .bind(group_key)
     .bind(&r.title)
@@ -113,25 +128,95 @@ pub async fn unbuilt_public_events_exist(
     Ok(row.get("dirty"))
 }
 
-/// Loads every public event in one within-source group `(source, group_key)`, ordered by
-/// `(event_time, id)` so the pure `rollup` is deterministic. The build's drain-read over the
-/// event log — called once per dirty group.
-pub async fn list_public_group_events(
+/// Loads every event *in `scope`* within one source group `(source, group_key)`, ordered by
+/// `(event_time, id)` so the pure `rollup` is deterministic. The build's drain-read over the event
+/// log — called once per dirty group, by both the public and private build. The
+/// `scope_subscriber_id IS NOT DISTINCT FROM` clause is the isolation boundary: a private read can
+/// only see its owner's events, a public read only the shared ones.
+pub async fn list_group_events(
     executor: impl PgExecutor<'_>,
+    scope: &Scope,
     source: SourceKind,
     group_key: &str,
 ) -> Result<Vec<Event>, sqlx::Error> {
+    let (scope_kind, scope_subscriber_id) = scope.to_columns();
     sqlx::query(
         "SELECT id, fingerprint, source, scope_kind, scope_subscriber_id,
                 event_time, title, body, links, group_key, entities,
                 content_kind, severity_hint, ingest_time, raw
          FROM event
-         WHERE scope_kind = 'public' AND source = $1 AND group_key = $2
+         WHERE scope_kind = $1 AND scope_subscriber_id IS NOT DISTINCT FROM $2
+           AND source = $3 AND group_key = $4
          ORDER BY event_time, id",
     )
+    .bind(scope_kind)
+    .bind(scope_subscriber_id)
     .bind(source)
     .bind(group_key)
     .try_map(from_row)
     .fetch_all(executor)
     .await
+}
+
+// ── Private build (per subscriber, watermark-bounded) ─────────────────────
+
+/// A 64-bit seed for the per-subscriber PrivateBuild advisory lock — combined with the subscriber
+/// id via `hashtextextended` so each subscriber's build serializes independently (mirrors the
+/// public build's single `BUILD_LOCK_KEY`). Auto-released at transaction end.
+const PRIVATE_BUILD_LOCK_SEED: i64 = 0x6275_6c6c_6574_6e02; // "bulletn\x02"
+
+/// Tries to take the PrivateBuild advisory lock for `subscriber_id` on `executor`'s transaction.
+/// Returns `false` if another build for the same subscriber holds it — the caller then no-ops (its
+/// events are covered by the holder), exactly like the public build.
+pub async fn try_private_build_lock(
+    executor: impl PgExecutor<'_>,
+    subscriber_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let row =
+        sqlx::query("SELECT pg_try_advisory_xact_lock(hashtextextended($1::text, $2)) AS locked")
+            .bind(subscriber_id)
+            .bind(PRIVATE_BUILD_LOCK_SEED)
+            .fetch_one(executor)
+            .await?;
+    Ok(row.get("locked"))
+}
+
+/// Reads `(built_through, now())` for one subscriber's private build. A missing watermark row is the
+/// epoch, so the first build covers all of the subscriber's private history; thereafter the
+/// half-open range `(built_through, hwm]` bounds the work (mirrors `build_bounds`).
+pub async fn private_build_bounds(
+    executor: impl PgExecutor<'_>,
+    subscriber_id: Uuid,
+) -> Result<(DateTime<Utc>, DateTime<Utc>), sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT coalesce(
+                  (SELECT built_through FROM private_build_watermark WHERE subscriber_id = $1),
+                  'epoch'::timestamptz
+                ) AS built_through,
+                now() AS hwm",
+    )
+    .bind(subscriber_id)
+    .fetch_one(executor)
+    .await?;
+    Ok((row.get("built_through"), row.get("hwm")))
+}
+
+/// Advances one subscriber's private build watermark to `hwm` (monotonic via GREATEST), creating the
+/// row on first build.
+pub async fn advance_private_build_watermark(
+    executor: impl PgExecutor<'_>,
+    subscriber_id: Uuid,
+    hwm: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO private_build_watermark (subscriber_id, built_through)
+         VALUES ($1, $2)
+         ON CONFLICT (subscriber_id) DO UPDATE
+            SET built_through = GREATEST(private_build_watermark.built_through, EXCLUDED.built_through)",
+    )
+    .bind(subscriber_id)
+    .bind(hwm)
+    .execute(executor)
+    .await?;
+    Ok(())
 }

@@ -22,6 +22,10 @@ pub enum DebugCommand {
         config: String,
         #[arg(long, default_value = "900")]
         poll_interval: i64,
+        /// Owning subscriber id — required for a source that can see private repos (its private
+        /// events bind to this owner's scope). Omit for a global/public source like RSS.
+        #[arg(long)]
+        owner: Option<Uuid>,
     },
     /// List all connection rows
     ConnectionList,
@@ -85,13 +89,23 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> R
             source,
             config,
             poll_interval,
+            owner,
         } => {
             let source = SourceKind::try_from(source.as_str()).map_err(|_| {
                 anyhow::anyhow!("unknown source '{}'; valid: rss, github, slack", source)
             })?;
+            // A private-capable source must be owned, or its private events would have no scope to
+            // bind to (the DB CHECK enforces this too; this is the friendly up-front error).
+            if source.can_emit_private() && owner.is_none() {
+                anyhow::bail!(
+                    "a {} connection can see private content and must be owned — pass --owner <subscriber-id>",
+                    source.as_str()
+                );
+            }
             let config: serde_json::Value =
                 serde_json::from_str(&config).context("--config is not valid JSON")?;
-            let id = ingest::store::insert_connection(pool, source, config, poll_interval).await?;
+            let id = ingest::store::insert_connection(pool, source, config, poll_interval, owner)
+                .await?;
             println!("{id}");
         }
         DebugCommand::ConnectionList => {

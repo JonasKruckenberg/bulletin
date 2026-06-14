@@ -89,7 +89,7 @@ fn to_events_maps_fields_correctly() {
     ));
 
     assert_eq!(builders.len(), 1);
-    let ev = builders.into_iter().next().unwrap().finalize(Scope::Public);
+    let ev = builders.into_iter().next().unwrap().finalize(None);
 
     assert_eq!(ev.source, SourceKind::Rss);
     assert_eq!(ev.title, "Hello World");
@@ -108,7 +108,7 @@ fn to_events_omits_link_when_absent() {
         .into_iter()
         .next()
         .unwrap()
-        .finalize(Scope::Public);
+        .finalize(None);
     assert!(ev.links.is_empty());
 }
 
@@ -125,7 +125,7 @@ fn same_item_produces_same_fingerprint() {
         .into_iter()
         .next()
         .unwrap()
-        .finalize(Scope::Public)
+        .finalize(None)
         .fingerprint;
     let fp2 = conn
         .to_events(item(
@@ -136,7 +136,7 @@ fn same_item_produces_same_fingerprint() {
         .into_iter()
         .next()
         .unwrap()
-        .finalize(Scope::Public)
+        .finalize(None)
         .fingerprint;
 
     assert_eq!(

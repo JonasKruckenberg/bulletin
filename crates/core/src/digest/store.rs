@@ -42,25 +42,33 @@ fn map_render_item(row: &PgRow) -> Result<RenderItem, sqlx::Error> {
     })
 }
 
-/// The digest's candidate set: clusters built/updated since the **consideration floor**
-/// `min(last_run, now − horizon_days)` — a freshness-scored lookback, not a window partition. The
-/// floor always reaches back to the last delivery (so nothing since then is missed, even a backdated
-/// event, since the bound is on `cluster.updated_at` = ingest/build recency) and pulls in older
-/// context up to the horizon. Ordered newest-first; the pure `select()` applies the cap. A cluster
-/// may legitimately appear in consecutive digests (design §9.4). `last_run = None` ⇒ floor is just
-/// `now − horizon_days`.
+/// The digest's candidate set for `subscriber_id`: clusters in their **scope** — `public ∪
+/// own-private` — built/updated since the **consideration floor** `min(last_run, now −
+/// horizon_days)`. A freshness-scored lookback, not a window partition. The floor always reaches
+/// back to the last delivery (so nothing since then is missed, even a backdated event, since the
+/// bound is on `cluster.updated_at` = ingest/build recency) and pulls in older context up to the
+/// horizon. Ordered newest-first; the pure `select()` applies the cap. A cluster may legitimately
+/// appear in consecutive digests (design §9.4). `last_run = None` ⇒ floor is just `now −
+/// horizon_days`.
+///
+/// The `scope_kind = 'public' OR scope_subscriber_id = $1` predicate is the **isolation boundary**:
+/// a subscriber's candidates are only ever public clusters or their own private ones — never another
+/// subscriber's private cluster. (Phase 4 backs this with RLS so it holds even against a logic bug.)
 pub async fn candidates_in_lookback(
     executor: impl PgExecutor<'_>,
+    subscriber_id: Uuid,
     last_run: Option<DateTime<Utc>>,
     horizon_days: i32,
 ) -> Result<Vec<Candidate>, sqlx::Error> {
     sqlx::query(
-        // LEAST ignores NULL, so a null last_run ($1) yields just `now() - horizon`.
+        // LEAST ignores NULL, so a null last_run ($2) yields just `now() - horizon`.
         "SELECT id, last_event_time
          FROM cluster
-         WHERE updated_at >= LEAST($1, now() - make_interval(days => $2))
+         WHERE (scope_kind = 'public' OR scope_subscriber_id = $1)
+           AND updated_at >= LEAST($2, now() - make_interval(days => $3))
          ORDER BY last_event_time DESC",
     )
+    .bind(subscriber_id)
     .bind(last_run)
     .bind(horizon_days)
     .try_map(|row: PgRow| {

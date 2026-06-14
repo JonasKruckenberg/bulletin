@@ -39,6 +39,16 @@ pub struct GithubEvent {
     pub created_at: DateTime<Utc>,
     #[serde(default)]
     pub payload: serde_json::Value,
+    /// Repo visibility, as the REST events feed reports it (`public = false` for private-repo
+    /// activity). Defaults to `true` (public) when absent; the poll also folds in the repo-list
+    /// privacy, and [`from_webhook`] sets it from `repository.private`. `to_builder` passes
+    /// `is_private = !public` to the builder, where `finalize` binds it to the owner's scope.
+    #[serde(default = "default_public")]
+    pub public: bool,
+}
+
+fn default_public() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -268,6 +278,12 @@ pub fn from_webhook(event_type: &str, delivery_id: &str, body: serde_json::Value
         .unwrap_or_default()
         .to_string();
     let created_at = webhook_time(&kind, &body).unwrap_or_else(Utc::now);
+    // Webhooks carry repo visibility directly (`repository.private`); absent ⇒ treat as public.
+    let private = body
+        .get("repository")
+        .and_then(|r| r.get("private"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     GithubEvent {
         id: delivery_id.to_string(),
         kind,
@@ -275,6 +291,7 @@ pub fn from_webhook(event_type: &str, delivery_id: &str, body: serde_json::Value
         actor: ActorRef { login: actor },
         created_at,
         payload: body,
+        public: !private,
     }
 }
 
@@ -310,4 +327,6 @@ pub fn to_builder(ev: GithubEvent) -> EventBuilder {
     .content_kind(content_kind(&ev.kind))
     .links(links)
     .entities(entities)
+    // The adapter reports only the structural bool; `finalize` binds it to the connection's owner.
+    .private(!ev.public)
 }
