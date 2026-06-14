@@ -351,6 +351,21 @@ New apalis job kind: `thread_maintenance` alongside
 
 ## 9. Phased plan — shippable, independently evaluable, performance-safe at each step
 
+> **Implementation status (2026-06-14).** Implemented on top of M3 linking (so the **story** is the
+> linking unit, as designed). Entities are M3's namespaced tokens (`common::entity`); there is no
+> separate `canonical_entities` on the cluster — the thread layer consumes `cluster.entities` and a
+> story's spine is the union of its members'. Landed: the **graded** identity resolver
+> (`core::identity` — lexical + feedback `must_link` equivalence edges, components ≥ θ with a
+> max-spanning-tree confidence band, id-forwarding; `cannot_link` materialized as a durable veto in
+> `entity_edge`); the `thread`/`entity_edge`/`feedback` schema + `subscriber.affinity` weight map; the
+> `thread_maintenance` job (co-occurrence over stories, deterministic label propagation, state machine,
+> decay, weight projection), **due-gated** per subscriber; the fire-time relevance term + **best-effort**
+> thread-assignment; and a thread chip rendered with its confidence band ("possibly part of …"). The
+> fire-time consumption is behind the **`thread-weighting` cargo feature** (compile-time kill switch).
+> Deferred: the avatar / "?" correction UI, thread-grouped layout + delta lines, embedding edges,
+> persisted entity-component id-forwarding, transitive `cannot_link`, and the `digest-explain`-gated A/B
+> evaluation below.
+
 Each phase is gated behind config and evaluated **read-only** via the existing `digest-explain` harness
 before it touches a real digest. The layer as a whole lands **after** roadmap M3 (linking) and M4
 (relevance).

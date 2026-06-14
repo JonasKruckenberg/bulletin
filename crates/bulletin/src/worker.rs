@@ -49,6 +49,15 @@ pub struct GenerateDigestJob {
     pub subscriber_id: Uuid,
 }
 
+/// thread_maintenance for one subscriber (design `digest-thread-layer.md` §5.1): the write-side,
+/// best-effort job that rebuilds the subscriber's identity graph + threads and projects the
+/// entity-weight map. Coalesced to a relaxed cadence by an hourly idempotency key, and never on the
+/// punctual digest path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadMaintenanceJob {
+    pub subscriber_id: Uuid,
+}
+
 /// A verified webhook delivery, taken off the HTTP edge for off-request-path processing. Carries the
 /// raw body plus the two header values the body itself doesn't hold: the activity `event_type` and
 /// the `delivery_id` (also the enqueue idempotency key — GitHub retries on a non-2xx). `body` is the
@@ -214,6 +223,69 @@ async fn generate_digest(
     .await
 }
 
+/// Run one subscriber's thread_maintenance pass. Best-effort by contract: a failure is logged and
+/// surfaced as a failed job (so apalis retries), but it never blocks or corrupts a digest — the
+/// prior thread state simply stands until the next pass succeeds.
+async fn thread_maintenance(
+    job: ThreadMaintenanceJob,
+    task_id: TaskId<Ulid>,
+    attempt: Attempt,
+    pool: Data<PgPool>,
+) -> Result<(), BoxDynError> {
+    traced("thread_maintenance", task_id, attempt, async move {
+        let cfg = bulletin_core::thread::MaintenanceConfig::default();
+        match bulletin_core::thread::maintain(&pool, job.subscriber_id, Utc::now(), &cfg).await {
+            Ok(stats) => tracing::info!(
+                subscriber_id = %job.subscriber_id,
+                sources = stats.sources,
+                entities = stats.entities,
+                communities = stats.communities,
+                threads = stats.threads_written,
+                weighted_entities = stats.weighted_entities,
+                "thread maintenance complete"
+            ),
+            Err(e) => return Err(format!("{e:#}").into()),
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// How often a subscriber's thread-maintenance pass runs (a relaxed, off-path cadence).
+#[cfg(feature = "thread-weighting")]
+const MAINTENANCE_CADENCE_HOURS: i64 = 1;
+
+/// Enqueue a thread-maintenance pass for each subscriber **due** for one (last run older than the
+/// cadence), coalesced by an hourly idempotency key so re-ticks before the pass runs collapse. Only
+/// the small due set is touched — not the whole subscriber table every minute. A no-op build without
+/// the `thread-weighting` feature.
+#[cfg(feature = "thread-weighting")]
+async fn enqueue_due_maintenance(pool: &PgPool) -> Result<(), BoxDynError> {
+    let cadence = chrono::Duration::hours(MAINTENANCE_CADENCE_HOURS);
+    let due = bulletin_core::thread::store::due_for_maintenance(pool, cadence).await?;
+    if due.is_empty() {
+        return Ok(());
+    }
+    let mut storage: PostgresStorage<ThreadMaintenanceJob> = PostgresStorage::new(pool);
+    let bucket = Utc::now().timestamp() / (MAINTENANCE_CADENCE_HOURS * 3600);
+    for subscriber_id in due {
+        let task = TaskBuilder::new(ThreadMaintenanceJob { subscriber_id })
+            .with_idempotency_key(format!("thread_maint:{subscriber_id}:{bucket}"))
+            .build();
+        match storage.push_task(task).await {
+            Ok(()) => {}
+            Err(e) if is_duplicate_enqueue(&e) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "thread-weighting"))]
+async fn enqueue_due_maintenance(_: &PgPool) -> Result<(), BoxDynError> {
+    Ok(())
+}
+
 // ── Cron tick: the three due-sweeps ────────────────────────────────────
 
 /// A duplicate-enqueue of a `GenerateDigest` for an already-seen `(subscriber, window)` hits
@@ -289,6 +361,11 @@ async fn run_tick(pool: Data<PgPool>) -> Result<(), BoxDynError> {
         }
     }
 
+    // 4. Thread maintenance (write-side, off the punctual path) — only the subscribers actually due
+    //    for a pass (a watermark-gated due query, like the digest sweep), not a full scan every tick.
+    //    Compiled out entirely without the `thread-weighting` feature.
+    enqueue_due_maintenance(&pool).await?;
+
     // Refresh the Prometheus gauges from the same cheap aggregates `debug status` reads, once per
     // tick — keeps the DB read off the scrape path. A gather failure must not fail the tick.
     match bulletin_core::status::gather(&pool).await {
@@ -316,6 +393,7 @@ pub async fn start(pool: PgPool, email: EmailConfig, connectors: ConnectorCtx) -
     let pool_build = pool.clone();
     let pool_digest = pool.clone();
     let pool_webhook = pool.clone();
+    let pool_maint = pool.clone();
 
     Monitor::new()
         .register(move |_| {
@@ -360,6 +438,14 @@ pub async fn start(pool: PgPool, email: EmailConfig, connectors: ConnectorCtx) -
                 .backend(storage)
                 .data(pool)
                 .build(process_webhook)
+        })
+        .register(move |_| {
+            let pool = pool_maint.clone();
+            let storage: PostgresStorage<ThreadMaintenanceJob> = PostgresStorage::new(&pool);
+            WorkerBuilder::new("bulletin-thread-maintenance")
+                .backend(storage)
+                .data(pool)
+                .build(thread_maintenance)
         })
         .run()
         .await

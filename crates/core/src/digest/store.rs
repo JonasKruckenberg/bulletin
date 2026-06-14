@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use crate::common::db::{begin_scope, ScopeCtx};
 use crate::common::kind::SourceKind;
+use crate::digest::select::{DecisionRecord, ItemReason};
+use crate::identity::ConfidenceBand;
 use crate::link::ClusterRef;
 use chrono::{DateTime, Utc};
 use sqlx::{postgres::PgRow, PgConnection, PgPool, Row};
@@ -34,6 +36,19 @@ pub struct RenderItem {
     pub source: SourceKind,
     pub last_event_time: DateTime<Utc>,
     pub connections: Vec<Connection>,
+    /// The persistent thread this story was assigned to (design §5.2 thread-grouped render), with its
+    /// identity confidence band — rendered as a chip ("Acme migration" / "possibly …"). `None` until
+    /// `thread_maintenance` has named a thread, so an un-threaded digest renders exactly as before.
+    pub thread: Option<ThreadTag>,
+    /// The decision log behind this item's rank (relevance term + entity spine) — surfaced in the
+    /// debug trace. Empty for a pure-recency selection.
+    pub reason: ItemReason,
+}
+
+/// The thread chip on a rendered item: the thread's label and identity confidence band.
+pub struct ThreadTag {
+    pub label: String,
+    pub confidence: ConfidenceBand,
 }
 
 /// A non-representative member of a story, rendered beneath the headline as "connected" context.
@@ -113,6 +128,8 @@ pub(crate) fn build_render_item(
         source: rep.source,
         last_event_time: rep.last_event_time,
         connections,
+        thread: None,
+        reason: ItemReason::default(),
     })
 }
 
@@ -175,16 +192,28 @@ pub async fn create_with_items(
     Ok(row)
 }
 
-/// The digest's frozen stories, each assembled into a [`RenderItem`] (representative + connections),
-/// in render order. Walks `digest_item → story.clusters → cluster cards`. Touches `digest_item` /
-/// `story` / `cluster` (all RLS-protected) → the caller runs it in the subscriber's scope.
+/// The digest's frozen stories, each assembled into a [`RenderItem`] (representative + connections +
+/// its assigned thread chip), in render order. Walks `digest_item → story.clusters → cluster cards`,
+/// left-joining the assigned thread (fenced to the digest's own subscriber, so a stray `thread_id`
+/// could never surface another tenant's label). Touches `digest_item` / `story` / `cluster` /
+/// `thread` (all RLS-protected) → the caller runs it in the subscriber's scope.
 pub async fn render_items(
     conn: &mut PgConnection,
     digest_id: Uuid,
 ) -> Result<Vec<RenderItem>, sqlx::Error> {
-    let stories: Vec<(i32, Vec<ClusterRef>)> = sqlx::query(
-        "SELECT di.position, s.clusters
-         FROM digest_item di JOIN story s ON s.id = di.story_id
+    // The decision log lives once on the digest; index it by story for the per-item debug trace.
+    let reason_by_story: HashMap<Uuid, ItemReason> = load_decisions(conn, digest_id)
+        .await?
+        .into_iter()
+        .map(|d| (d.story_id, d.reason))
+        .collect();
+
+    let stories: Vec<(Uuid, Vec<ClusterRef>, Option<ThreadTag>)> = sqlx::query(
+        "SELECT di.story_id, s.clusters, t.label AS thread_label, t.confidence AS thread_confidence
+         FROM digest_item di
+         JOIN digest d ON d.id = di.digest_id
+         JOIN story s  ON s.id = di.story_id
+         LEFT JOIN thread t ON t.id = di.thread_id AND t.subscriber_id = d.subscriber_id
          WHERE di.digest_id = $1
          ORDER BY di.position",
     )
@@ -193,39 +222,108 @@ pub async fn render_items(
         let clusters: serde_json::Value = row.get("clusters");
         let members: Vec<ClusterRef> =
             serde_json::from_value(clusters).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
-        Ok((row.get::<i32, _>("position"), members))
+        let tag = row
+            .get::<Option<String>, _>("thread_label")
+            .map(|label| ThreadTag {
+                label,
+                confidence: ConfidenceBand::parse(&row.get::<String, _>("thread_confidence")),
+            });
+        Ok((row.get::<Uuid, _>("story_id"), members, tag))
     })
     .fetch_all(&mut *conn)
     .await?;
 
-    assemble_items(conn, stories.into_iter().map(|(_, m)| m).collect()).await
+    let stories = stories
+        .into_iter()
+        .map(|(story_id, members, tag)| {
+            (
+                members,
+                tag,
+                reason_by_story.get(&story_id).cloned().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assemble_items(conn, stories).await
 }
 
 /// Render items for an explicit, ordered set of linked stories — the ad-hoc dispatch / preview path,
-/// whose selection isn't frozen into `digest_item` rows. Preserves the given order. Reads `cluster`
+/// whose selection isn't frozen into `digest_item` rows. `reasons` (keyed by story id, supplied by
+/// the in-memory selection) carries the same decision log the frozen path persists. Reads `cluster`
 /// (RLS-protected) → runs in the subscriber's scope.
 pub async fn render_items_for_stories(
     conn: &mut PgConnection,
     stories: &[crate::link::LinkedStory],
+    reasons: &HashMap<Uuid, ItemReason>,
 ) -> Result<Vec<RenderItem>, sqlx::Error> {
-    assemble_items(conn, stories.iter().map(|s| s.clusters.clone()).collect()).await
+    let stories = stories
+        .iter()
+        .map(|s| {
+            (
+                s.clusters.clone(),
+                None,
+                reasons.get(&s.id).cloned().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assemble_items(conn, stories).await
 }
 
 /// Shared assembler: fetch every referenced cluster's card once, then build a `RenderItem` per story
-/// (in input order). Stories that resolve to no card (tombstoned/empty) are skipped.
+/// (in input order), attaching its thread tag + decision-log reason. Stories that resolve to no card
+/// (tombstoned/empty) are skipped.
 async fn assemble_items(
     conn: &mut PgConnection,
-    stories: Vec<Vec<ClusterRef>>,
+    stories: Vec<(Vec<ClusterRef>, Option<ThreadTag>, ItemReason)>,
 ) -> Result<Vec<RenderItem>, sqlx::Error> {
     let ids: Vec<Uuid> = stories
         .iter()
-        .flat_map(|members| members.iter().map(|m| m.cluster_id))
+        .flat_map(|(members, _, _)| members.iter().map(|m| m.cluster_id))
         .collect();
     let cards = cluster_cards(conn, &ids).await?;
     Ok(stories
-        .iter()
-        .filter_map(|members| build_render_item(members, &cards))
+        .into_iter()
+        .filter_map(|(members, tag, reason)| {
+            build_render_item(&members, &cards).map(|mut item| {
+                item.thread = tag;
+                item.reason = reason;
+                item
+            })
+        })
         .collect())
+}
+
+/// Persist the digest's full decision log (design §10.2) as a **structured** jsonb array on the
+/// `digest` row — every candidate story, its `Verdict`, and the reasoning behind its rank, drops
+/// included. Stored structured (typed records, not a flattened string) so a later explain UI / feed
+/// can re-render and query it. Runs on the caller's subscriber-scoped connection; recorded regardless
+/// of the thread-weighting feature.
+pub async fn record_decisions(
+    conn: &mut PgConnection,
+    digest_id: Uuid,
+    decisions: &[DecisionRecord],
+) -> Result<(), sqlx::Error> {
+    let json = serde_json::to_value(decisions).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+    sqlx::query("UPDATE digest SET decisions = $2 WHERE id = $1")
+        .bind(digest_id)
+        .bind(json)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+/// Load a digest's decision log (the structured `digest.decisions` array). Empty for a pre-thread
+/// digest (the `'[]'` default). Used by the render debug trace and any later explain consumer.
+pub async fn load_decisions(
+    conn: &mut PgConnection,
+    digest_id: Uuid,
+) -> Result<Vec<DecisionRecord>, sqlx::Error> {
+    let json: serde_json::Value = sqlx::query("SELECT decisions FROM digest WHERE id = $1")
+        .bind(digest_id)
+        .fetch_optional(&mut *conn)
+        .await?
+        .map(|row| row.get("decisions"))
+        .unwrap_or_else(|| serde_json::json!([]));
+    Ok(serde_json::from_value(json).unwrap_or_default())
 }
 
 /// Marks the digest delivered and advances the subscriber's schedule in one transaction, so the
