@@ -65,23 +65,30 @@ pub async fn due_connections(pool: &PgPool) -> Result<Vec<ConnectionRow>, sqlx::
 /// this connection's private events (`None` for a global/public source like RSS); a GitHub
 /// connection that can see private repos must be owned, or its private events would have no scope to
 /// bind to and `finalize` would treat them as public.
+///
+/// `provider_account_id` is the webhook routing key (GitHub: the installation_id — not a secret).
+/// Setting it at seed time is what lets a lifecycle/content webhook resolve back to THIS row
+/// (`resolve_connection_by_provider`); a GitHub connection seeded without it polls fine but never
+/// receives webhooks. It comes from our own seed config, never a payload (the IDOR boundary).
 pub async fn insert_connection(
     pool: &PgPool,
     source: SourceKind,
     config: serde_json::Value,
     poll_interval_secs: i64,
     owner: Option<Uuid>,
+    provider_account_id: Option<&str>,
 ) -> Result<Uuid, sqlx::Error> {
     let mut tx = begin_scope(pool, ScopeCtx::Admin).await?;
     let row = sqlx::query(
-        "INSERT INTO connection (source, config, poll_interval_secs, subscriber_id)
-         VALUES ($1, $2, $3, $4)
+        "INSERT INTO connection (source, config, poll_interval_secs, subscriber_id, provider_account_id)
+         VALUES ($1, $2, $3, $4, $5)
          RETURNING id",
     )
     .bind(source)
     .bind(config)
     .bind(poll_interval_secs)
     .bind(owner)
+    .bind(provider_account_id)
     .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;

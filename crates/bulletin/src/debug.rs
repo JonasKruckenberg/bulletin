@@ -104,8 +104,29 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> R
             }
             let config: serde_json::Value =
                 serde_json::from_str(&config).context("--config is not valid JSON")?;
-            let id = ingest::store::insert_connection(pool, source, config, poll_interval, owner)
-                .await?;
+            // Webhook routing key. For GitHub the installation_id (already in --config, not a secret)
+            // doubles as `provider_account_id`, so lifecycle/content webhooks resolve to THIS row —
+            // derived from our own seed config, never a delivery payload (the IDOR boundary). Without
+            // it a seeded GitHub connection would poll but silently drop every webhook as unrouted.
+            let provider_account_id = match source {
+                SourceKind::Github => Some(
+                    config
+                        .get("installation_id")
+                        .and_then(|v| v.as_i64())
+                        .context("a github --config needs an integer \"installation_id\"")?
+                        .to_string(),
+                ),
+                _ => None,
+            };
+            let id = ingest::store::insert_connection(
+                pool,
+                source,
+                config,
+                poll_interval,
+                owner,
+                provider_account_id.as_deref(),
+            )
+            .await?;
             println!("{id}");
         }
         DebugCommand::ConnectionList => {

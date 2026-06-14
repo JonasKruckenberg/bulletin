@@ -1,5 +1,6 @@
 mod debug;
 mod metric;
+mod secrets;
 mod transport;
 mod webhook;
 mod worker;
@@ -17,9 +18,10 @@ struct Cli {
     command: Command,
     /// Runtime DB connection string — the **least-privilege role** (`bulletin_app`: non-owner,
     /// no `BYPASSRLS`) that `serve` / `worker` / `debug` log in as. Under it the two-context RLS
-    /// policies (design §12) physically confine each query to its scope.
+    /// policies (design §12) physically confine each query to its scope. Required for every role,
+    /// but not for the offline `secrets` key tooling.
     #[arg(long, env = "DATABASE_URL")]
-    database_url: String,
+    database_url: Option<String>,
     /// Migration DB connection string — the **owner/migration role** that owns the DDL and runs
     /// `migrate`. Defaults to `--database-url` when unset (single-role dev). In production this is a
     /// separate, more-privileged role from the runtime one, so a runtime credential can never alter
@@ -35,14 +37,23 @@ struct Cli {
     /// Log output format: `text` (human) or `json` (one structured line per event, for Loki).
     #[arg(long, env = "BULLETIN_LOG_FORMAT", default_value = "text")]
     log_format: LogFormat,
-    /// GitHub App webhook signing secret — the HMAC-SHA256 key for `X-Hub-Signature-256` over the
-    /// raw body (`serve` / `all`). Plumbed now; sealed at rest in a later phase ("plumbing now,
-    /// secrets later"). Absent → `/webhooks/github` fails closed (rejects every delivery).
-    #[arg(long, env = "BULLETIN_GITHUB_WEBHOOK_SECRET")]
-    github_webhook_secret: Option<String>,
+    /// Credential-at-rest config: the app master key + the (sealed) GitHub App key / webhook secret
+    /// the runtime roles unseal at startup, plus the `secrets` tools that produce them.
+    #[command(flatten)]
+    secrets: secrets::SecretConfig,
     /// Email delivery config (worker + `debug digest-run`); defaults to local file transport.
     #[command(flatten)]
     email: transport::EmailConfig,
+}
+
+impl Cli {
+    /// The runtime DB URL, required for every DB-touching role. (The offline `secrets` tooling never
+    /// calls this, so it can run without a database configured.)
+    fn database_url(&self) -> Result<&str> {
+        self.database_url
+            .as_deref()
+            .context("DATABASE_URL is required (set --database-url or the env var)")
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -61,6 +72,11 @@ enum Command {
         #[command(subcommand)]
         command: debug::DebugCommand,
     },
+    /// Offline credential tooling: generate the master key, seal secrets for config. No database.
+    Secrets {
+        #[command(subcommand)]
+        command: secrets::SecretsCommand,
+    },
 }
 
 #[tokio::main]
@@ -69,13 +85,18 @@ async fn main() -> Result<()> {
     init_tracing(cli.log_format);
 
     match cli.command {
+        // Offline key tooling — handled before any DB connect so it needs no DATABASE_URL.
+        Command::Secrets { command } => {
+            return secrets::run(&cli.secrets, command);
+        }
         Command::Migrate => {
             // Migrate as the owner role: it owns the DDL, creates the runtime role + RLS policies,
             // and (afterwards) grants the runtime role its table access.
             let migration_url = cli
                 .migration_database_url
                 .as_deref()
-                .unwrap_or(&cli.database_url);
+                .map(Ok)
+                .unwrap_or_else(|| cli.database_url())?;
             let pool = connect_pool(migration_url).await?;
             tracing::info!("running bulletin migrations");
             bulletin_core::migrate(&pool)
@@ -94,31 +115,37 @@ async fn main() -> Result<()> {
             tracing::info!("migrations complete");
         }
         Command::Serve => {
-            let pool = connect_pool(&cli.database_url).await?;
+            let pool = connect_pool(cli.database_url()?).await?;
+            let webhook_secret = cli.secrets.webhook_secret()?;
             tracing::info!(addr = %cli.http_addr, "starting HTTP server");
-            serve(cli.http_addr, pool, cli.github_webhook_secret.clone()).await?;
+            serve(cli.http_addr, pool, webhook_secret).await?;
         }
         Command::Worker => {
             metric::init(cli.metrics_addr)?;
-            let pool = connect_pool(&cli.database_url).await?;
+            let pool = connect_pool(cli.database_url()?).await?;
+            let connectors = cli.secrets.connector_ctx()?;
             tracing::info!("starting worker");
-            worker::start(pool, cli.email.clone(), connector_ctx()).await?;
+            worker::start(pool, cli.email.clone(), connectors).await?;
         }
         Command::All => {
             metric::init(cli.metrics_addr)?;
-            let pool = connect_pool(&cli.database_url).await?;
+            let pool = connect_pool(cli.database_url()?).await?;
+            let webhook_secret = cli.secrets.webhook_secret()?;
+            let connectors = cli.secrets.connector_ctx()?;
             tracing::info!(addr = %cli.http_addr, "starting server + worker");
             tokio::try_join!(
-                serve(
-                    cli.http_addr,
-                    pool.clone(),
-                    cli.github_webhook_secret.clone()
-                ),
-                worker::start(pool, cli.email.clone(), connector_ctx())
+                serve(cli.http_addr, pool.clone(), webhook_secret),
+                worker::start(pool, cli.email.clone(), connectors)
             )?;
         }
         Command::Debug { command } => {
-            let pool = connect_pool(&cli.database_url).await?;
+            // `command` is moved out here, so reach the URL by field (a `self` method would borrow
+            // the partially-moved `cli`).
+            let url = cli
+                .database_url
+                .as_deref()
+                .context("DATABASE_URL is required (set --database-url or the env var)")?;
+            let pool = connect_pool(url).await?;
             debug::run(&pool, &cli.email, command).await?;
         }
     }
@@ -133,22 +160,15 @@ async fn connect_pool(database_url: &str) -> Result<PgPool> {
         .context("failed to connect to database")
 }
 
-/// The app-level connector context the worker hands to each poll. GitHub's App credentials are
-/// envelope-encrypted at rest in a later phase, so `github` is `None` here — a GitHub connection
-/// polled now is skipped with a clear log, while RSS works unchanged ("plumbing now, secrets later").
-fn connector_ctx() -> bulletin_core::ingest::ConnectorCtx {
-    bulletin_core::ingest::ConnectorCtx::default()
-}
-
 /// The HTTP server (`serve` / `all`): liveness `/health` + the webhook catcher (`/webhooks/github`),
 /// separate from the metrics exporter the worker installs. Needs the pool (for the apalis enqueue
 /// handle) and the webhook secret (for edge HMAC verification).
 async fn serve(
     addr: SocketAddr,
     pool: PgPool,
-    github_webhook_secret: Option<String>,
+    github_webhook_secret: Option<Vec<u8>>,
 ) -> Result<()> {
-    let app = webhook::router(pool, github_webhook_secret.map(String::into_bytes));
+    let app = webhook::router(pool, github_webhook_secret);
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("failed to bind to {addr}"))?;
