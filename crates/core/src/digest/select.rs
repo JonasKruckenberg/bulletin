@@ -34,6 +34,30 @@ use crate::common::kind::ContentKind;
 use crate::identity::CanonicalId;
 use crate::link::LinkedStory;
 
+// ── Default scoring tunables ─────────────────────────────────────────────────
+// The code-side defaults backing [`ScoringConfig::default`], named here so they are easy to find and
+// tune in one place. The *runtime* values come from the `digest_config` table; these mirror its
+// migration defaults and back tests + off-DB reasoning. The two decay half-lives are the main dials:
+// recency fades a story over days, the thread term over weeks (so an invested thread lingers longer).
+
+/// Inclusion gate (design §8.4): admit everything until feedback drives a thread term negative.
+const RELEVANCE_FLOOR: f32 = 0.0;
+/// Relevance bonus for a story including the subscriber's own private content (design §8.3).
+const SCOPE_BONUS: f32 = 0.5;
+/// Priority boost per point of a story's `max_severity`.
+const SEVERITY_WEIGHT: f32 = 0.1;
+/// Recency decay half-life (days): the recency-bound priority halves every this many days of age.
+const RECENCY_HALF_LIFE_DAYS: f64 = 3.0;
+/// Thread-term decay half-life (days): deliberately ≫ recency, so an invested thread stays promoted
+/// for weeks but still eventually ages out (design §8.3 + §9.4).
+const THREAD_HALF_LIFE_DAYS: f64 = 21.0;
+/// Max Stories per digest (design §8.4: ~3–5).
+const STORY_CAP: usize = 5;
+/// Max Notes per digest (~15–25).
+const NOTE_CAP: usize = 20;
+/// Re-surface damping (design §9.4): a no-news re-surface keeps this fraction of its priority.
+const RESURFACE_PENALTY: f32 = 0.25;
+
 /// Story (rich, multi-faceted) vs Note (atomic, thin) — a **rendering** classification from the
 /// candidate's richness, not importance (design §8.4: a high-priority Note can sit above a
 /// lower-priority Story).
@@ -95,14 +119,14 @@ pub struct ScoringConfig {
 impl Default for ScoringConfig {
     fn default() -> Self {
         Self {
-            relevance_floor: 0.0,
-            scope_bonus: 0.5,
-            severity_weight: 0.1,
-            recency_half_life_days: 3.0,
-            thread_half_life_days: 21.0,
-            story_cap: 5,
-            note_cap: 20,
-            resurface_penalty: 0.25,
+            relevance_floor: RELEVANCE_FLOOR,
+            scope_bonus: SCOPE_BONUS,
+            severity_weight: SEVERITY_WEIGHT,
+            recency_half_life_days: RECENCY_HALF_LIFE_DAYS,
+            thread_half_life_days: THREAD_HALF_LIFE_DAYS,
+            story_cap: STORY_CAP,
+            note_cap: NOTE_CAP,
+            resurface_penalty: RESURFACE_PENALTY,
         }
     }
 }
