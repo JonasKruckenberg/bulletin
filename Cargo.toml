@@ -34,6 +34,16 @@ base64            = "0.22"  # encode the sealed envelope + master key as transpo
 ulid        = "1"  # read enqueue time from the apalis TaskId for job wait/run timing
 clap        = { version = "4", features = ["derive", "env"] }
 axum        = "0.7"
+# gRPC service API (tonic 0.14 split: `tonic` core + `tonic-prost` codec + `tonic-prost-build` codegen).
+# Protos are compiled with the pure-Rust `protox` (no system protoc) — see crates/bulletin/build.rs.
+tonic            = "0.14"
+tonic-prost      = "0.14"
+tonic-reflection = "0.14"
+tonic-health     = "0.14"
+tonic-prost-build = "0.14"
+protox           = "0.9"
+prost            = "0.14"
+prost-types      = "0.14"
 sqlx        = { version = "0.8", features = ["postgres", "uuid", "chrono", "runtime-tokio"] }
 cron        = "0.16"
 apalis          = { version = "=1.0.0-rc.9" }

@@ -182,14 +182,17 @@ Almost every RPC is a thin wrapper over a function that exists today:
 | `SubscriberService.ListMyDigests` | `digest::store::list_digests` (own, RLS-filtered) | Subscriber |
 | `SubscriberService.GetMyDigest` | `digest::store::render_items*` | Subscriber |
 
-**The one structural change in `core`:** most of these store fns take a bare `pool: &PgPool` and run with
-**no** scope GUC set (the CLI gets away with it because dev runs a single role). Under the API they MUST
-run inside the caller's `ScopeCtx`. So make the list/CRUD store fns **executor-generic** — take
-`impl PgExecutor<'_>` (or `&mut PgConnection`) instead of `&PgPool` — so the handler can call them inside
-a `with_scope` / `begin_scope` transaction that has pinned the GUC. This is a mechanical, mostly
-type-signature refactor; the SQL is unchanged. The CLI keeps working by passing `&pool` (which derefs to
-an executor) — though we should make `debug` route through `ScopeCtx::Admin` too, closing the same latent
-gap. **This refactor is the real work of the first cut; the proto/handlers are glue on top.**
+**The scoped-core question — already solved (verified during A1).** The original premise of this doc was
+that the store fns run on a bare `pool` with no scope GUC and would need an executor-generic refactor.
+Reading the code showed that is **not** the case: every control-plane store fn already opens its **own**
+`begin_scope` transaction in the correct context — `list_connections` / `insert_connection` /
+`insert_subscriber` / `list_subscribers` / `delete_*` and `status::gather` / `list_digests` all pin
+`ScopeCtx::Admin`; `load_subscriber` / `update_preferences` pin `ScopeCtx::Subscriber(id)` from their `id`
+argument. So the API handlers just call these fns directly with `&pool` and inherit the right scope for
+free — no refactor, no `with_scope` ceremony in the handlers. The only bare-pool reader is
+`ingest::store::list_events`, which touches the `event` **content** table (public-only under any context),
+so it is correct as-is. **A0 was therefore already satisfied by the engine; the first cut is purely the
+gRPC glue (A1).**
 
 ---
 
@@ -303,13 +306,15 @@ and `tonic-health` (standard `grpc.health.v1`) are cheap, standard add-ons. `sha
 
 ## 12. Phasing / plan of work
 
-- **A0 — scoped core (the real work).** Make the list/CRUD store fns executor-generic and route `debug`
-  through `ScopeCtx::Admin`. Pure refactor, no behavior change; unblocks running any store fn under a
-  caller's scope. *Exit:* existing CLI + tests green, with every store call demonstrably scope-pinned.
-- **A1 — the `api` role + admin plane.** `build.rs` + proto, the interceptor (admin key only at first),
-  `AdminService` over the A0 functions, reflection + health, `Command::Api`, join into `All`. *Exit:*
-  `grpcurl` can list/create/delete connections & subscribers and read status — full operator parity with
-  `debug` (management + read) over the wire.
+- **A0 — scoped core.** ✅ *Already satisfied by the engine* (see §5): the core store fns self-scope, so no
+  refactor was needed. Confirmed while building A1.
+- **A1 — the `api` role + admin plane.** ✅ *Implemented.* `proto/bulletin/v1/bulletin.proto` compiled
+  protoc-free via `protox` + `tonic-prost-build` (`build.rs`); the admin-bearer auth helper
+  (`src/api/auth.rs`, fail-closed, constant-time, unit-tested); `AdminService` over the self-scoping core
+  fns (`src/api/admin.rs`); domain↔proto in `convert.rs`; gRPC reflection + `grpc.health.v1`; `Command::Api`
+  + `BULLETIN_API_ADDR` / `BULLETIN_API_ADMIN_KEY`, joined into `All`. *Exit:* a `grpcurl` client with the
+  admin key can list/create/delete connections & subscribers and read status/events/digests — operator
+  parity with `debug` (management + read) over the wire.
 - **A2 — subscriber plane.** `api_token` migration, `IssueSubscriberToken`, token resolution in the
   interceptor, `SubscriberService` (`GetMe`, prefs, own digests/stories) under `ScopeCtx::Subscriber`.
   *Exit:* a subscriber token reads **only** its own digest content; a cross-tenant id `NotFound`s.
