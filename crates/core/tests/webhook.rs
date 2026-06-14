@@ -3,12 +3,13 @@
 //! event (fingerprint collapse), the unrouted-delivery drop (IDOR defense), and a lifecycle status
 //! transition. Mirrors `tests/connection.rs::setup`.
 
+use bulletin_core::digest::subscriber::{insert_subscriber, Recurrence};
 use bulletin_core::ingest::github::event_map;
 use bulletin_core::ingest::store::{insert_event, resolve_connection_by_provider};
 use bulletin_core::ingest::{process_webhook, WebhookOutcome};
 use bulletin_core::kind::SourceKind;
-use bulletin_core::scope::Scope;
 use bulletin_core::{connect, migrate};
+use chrono::NaiveTime;
 use serde_json::json;
 use testcontainers::{runners::AsyncRunner, ImageExt};
 use testcontainers_modules::postgres::Postgres;
@@ -40,6 +41,36 @@ async fn seed_github(pool: &sqlx::PgPool, installation_id: i64) -> Uuid {
     .await
     .unwrap();
     row.0
+}
+
+/// Seed a GitHub connection owned by `owner` — its private-repo deliveries finalize to that scope.
+async fn seed_github_owned(pool: &sqlx::PgPool, installation_id: i64, owner: Uuid) -> Uuid {
+    let row: (Uuid,) = sqlx::query_as(
+        "INSERT INTO connection (source, config, provider_account_id, subscriber_id)
+         VALUES ('github', $1::jsonb, $2, $3)
+         RETURNING id",
+    )
+    .bind(json!({ "installation_id": installation_id }).to_string())
+    .bind(installation_id.to_string())
+    .bind(owner)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    row.0
+}
+
+/// Insert a bare subscriber to own a connection.
+async fn seed_subscriber(pool: &sqlx::PgPool, email: &str) -> Uuid {
+    insert_subscriber(
+        pool,
+        email,
+        None,
+        Recurrence::Daily,
+        "UTC",
+        NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+    )
+    .await
+    .unwrap()
 }
 
 async fn count_events(pool: &sqlx::PgPool) -> i64 {
@@ -139,7 +170,7 @@ async fn process_webhook_dedups_against_a_prior_poll() {
         }))
         .unwrap(),
     )
-    .finalize(Scope::Public);
+    .finalize(None);
     insert_event(&pool, &polled)
         .await
         .unwrap()
@@ -208,4 +239,43 @@ async fn process_webhook_revokes_on_installation_deleted() {
         }
     ));
     assert_eq!(connection_status(&pool, id).await, "revoked");
+}
+
+// A private-repo webhook (`repository.private:true`) on an *owned* connection ingests as a private
+// event bound to that owner — derived from OUR connection row, never the payload (IDOR defense).
+#[tokio::test]
+async fn process_webhook_scopes_private_repo_to_owner() {
+    let (pool, _pg) = setup().await;
+    let owner = seed_subscriber(&pool, "owner@example.com").await;
+    seed_github_owned(&pool, 12345, owner).await;
+
+    let body = json!({
+        "action": "opened",
+        "issue": {
+            "id": 999, "number": 7, "title": "secret bug",
+            "updated_at": "2026-06-10T10:00:00Z"
+        },
+        "repository": {"full_name": "octo/secret", "private": true},
+        "sender": {"login": "alice"},
+        "installation": {"id": 12345}
+    })
+    .to_string()
+    .into_bytes();
+
+    let outcome = process_webhook(&pool, SourceKind::Github, "issues", "d-priv", &body)
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        WebhookOutcome::Ingested { inserted: 1, .. }
+    ));
+
+    // The event row is scoped to the connection owner — not public, not another subscriber.
+    let (scope_kind, scope_sub): (String, Option<Uuid>) =
+        sqlx::query_as("SELECT scope_kind, scope_subscriber_id FROM event LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(scope_kind, "private");
+    assert_eq!(scope_sub, Some(owner));
 }

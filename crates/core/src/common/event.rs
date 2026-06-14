@@ -5,7 +5,7 @@ use uuid::Uuid;
 use super::{fingerprint::Fingerprint, kind::ContentKind, kind::SourceKind, scope::Scope};
 
 /// Connector-side event builder. Holds everything the connector knows; `source` is fixed
-/// at construction. Infra seals it by calling `finalize(scope)`, which stamps the scope
+/// at construction. Infra seals it by calling `finalize(owner)`, which stamps the scope
 /// boundary and computes the fingerprint — neither can be touched by a connector.
 pub struct EventBuilder {
     source: SourceKind,
@@ -19,6 +19,10 @@ pub struct EventBuilder {
     entities: Vec<String>,
     severity_hint: Option<i16>,
     raw: Option<Vec<u8>>,
+    /// Structural visibility of the source item (e.g. GitHub's `repo.private`). The adapter reports
+    /// only this bool — it can name no subscriber and construct no `Scope` (design §12 risk #1).
+    /// `finalize` combines it with the connection's owner to decide the actual `Scope`.
+    is_private: bool,
 }
 
 impl EventBuilder {
@@ -43,12 +47,20 @@ impl EventBuilder {
             entities: Vec::new(),
             severity_hint: None,
             raw: None,
+            is_private: false,
         }
     }
 
     /// Sets the depth signal (`message` / `announcement` / `longform`). Defaults to `longform`.
     pub fn content_kind(mut self, kind: ContentKind) -> Self {
         self.content_kind = kind;
+        self
+    }
+
+    /// Marks the item as coming from a private source object (e.g. a private GitHub repo). Defaults
+    /// to `false` (public). The adapter sets only this bool; the subscriber binding is `finalize`'s.
+    pub fn private(mut self, is_private: bool) -> Self {
+        self.is_private = is_private;
         self
     }
 
@@ -77,8 +89,17 @@ impl EventBuilder {
         self
     }
 
-    /// Stamps `scope` and computes the fingerprint. Infra calls this; connectors never do.
-    pub fn finalize(self, scope: Scope) -> NewEvent {
+    /// Stamps the scope and computes the fingerprint. Infra calls this with the connection's owning
+    /// subscriber (`None` for a global/public source like RSS); connectors never do. The scope is
+    /// derived here, *not* by the adapter: a private item from an owned connection is bound to that
+    /// owner, everything else stays public. This is the one place a subscriber binding is created
+    /// from a `(is_private, owner)` pair — an adapter can neither name a subscriber nor force a
+    /// private scope onto a shared (ownerless) source (design §12 risk #1).
+    pub fn finalize(self, owner: Option<Uuid>) -> NewEvent {
+        let scope = match (self.is_private, owner) {
+            (true, Some(subscriber_id)) => Scope::Private(subscriber_id),
+            _ => Scope::Public,
+        };
         let fingerprint = Fingerprint::compute(self.source.as_str(), &self.stable_id);
         NewEvent {
             source: self.source,
@@ -199,9 +220,9 @@ mod tests {
             title_b in ".*",
         ) {
             let a = EventBuilder::new(source, stable_id.clone(), t0(), title_a, "g")
-                .finalize(Scope::Public);
+                .finalize(None);
             let b = EventBuilder::new(source, stable_id, t0(), title_b, "g")
-                .finalize(Scope::Public);
+                .finalize(None);
             prop_assert_eq!(a.fingerprint, b.fingerprint);
         }
 
@@ -213,8 +234,8 @@ mod tests {
             id_b in "[a-z0-9]{1,32}",
         ) {
             prop_assume!(id_a != id_b);
-            let a = EventBuilder::new(source, id_a, t0(), "", "").finalize(Scope::Public);
-            let b = EventBuilder::new(source, id_b, t0(), "", "").finalize(Scope::Public);
+            let a = EventBuilder::new(source, id_a, t0(), "", "").finalize(None);
+            let b = EventBuilder::new(source, id_b, t0(), "", "").finalize(None);
             prop_assert_ne!(a.fingerprint, b.fingerprint);
         }
     }

@@ -64,7 +64,8 @@ async fn select_over_lookback(
     last_run: Option<DateTime<Utc>>,
     horizon_days: i32,
 ) -> Result<Vec<Decision>> {
-    let candidates = candidates_in_lookback(pool, last_run, horizon_days)
+    // Scoped to this subscriber: the candidate set is `public ∪ own-private`, never another's.
+    let candidates = candidates_in_lookback(pool, sub.id, last_run, horizon_days)
         .await
         .context("collect candidates")?;
     Ok(select(candidates, sub.max_items as usize))
@@ -103,6 +104,12 @@ pub async fn generate(
     }
 
     let window_end = sub.next_run_at; // the digest's identity (UNIQUE(subscriber_id, window_end))
+
+    // Build this subscriber's private clusters just-in-time so the candidate set is
+    // `public ∪ own-private` (design §9.1). PublicBuild stays public-only; private is per-owner.
+    crate::cluster::build_private(pool, sub.id)
+        .await
+        .context("build private clusters")?;
 
     let decisions = select_over_lookback(pool, &sub, sub.last_run_at, CONTEXT_HORIZON_DAYS).await?;
     log_selection(sub.id, sub.max_items as usize, &decisions);
@@ -178,6 +185,11 @@ pub async fn dispatch_now(
     content: &DigestContent<'_>,
 ) -> Result<DigestOutcome> {
     let sub = load_required(pool, subscriber_id).await?;
+
+    // Build the subscriber's private clusters so a manual preview includes their own-private items.
+    crate::cluster::build_private(pool, sub.id)
+        .await
+        .context("build private clusters")?;
 
     // Explicit lookback floor = now − lookback_days (last_run_at is ignored — this is off-schedule).
     let decisions = select_over_lookback(pool, &sub, None, lookback_days).await?;

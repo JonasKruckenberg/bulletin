@@ -33,7 +33,7 @@ fn rss(stable_id: &str, title: &str) -> EventBuilder {
 async fn insert_returns_event() {
     let (pool, _pg) = setup().await;
 
-    let new_ev = rss("item-1", "Hello world").finalize(Scope::Public);
+    let new_ev = rss("item-1", "Hello world").finalize(None);
     let event = insert_event(&pool, &new_ev)
         .await
         .unwrap()
@@ -52,7 +52,7 @@ async fn insert_returns_event() {
 async fn repoll_same_item_is_deduped() {
     let (pool, _pg) = setup().await;
 
-    let first = rss("item-1", "Original title").finalize(Scope::Public);
+    let first = rss("item-1", "Original title").finalize(None);
     assert!(insert_event(&pool, &first).await.unwrap().is_some());
 
     let second = EventBuilder::new(
@@ -64,7 +64,7 @@ async fn repoll_same_item_is_deduped() {
     )
     .body("body added on edit")
     .entities(vec!["Rust".into()])
-    .finalize(Scope::Public);
+    .finalize(None);
 
     assert_eq!(
         first.fingerprint, second.fingerprint,
@@ -81,11 +81,11 @@ async fn repoll_same_item_is_deduped() {
 async fn distinct_stable_ids_both_insert() {
     let (pool, _pg) = setup().await;
 
-    let ea = insert_event(&pool, &rss("item-a", "Item A").finalize(Scope::Public))
+    let ea = insert_event(&pool, &rss("item-a", "Item A").finalize(None))
         .await
         .unwrap()
         .expect("item-a should insert");
-    let eb = insert_event(&pool, &rss("item-b", "Item B").finalize(Scope::Public))
+    let eb = insert_event(&pool, &rss("item-b", "Item B").finalize(None))
         .await
         .unwrap()
         .expect("item-b should insert");

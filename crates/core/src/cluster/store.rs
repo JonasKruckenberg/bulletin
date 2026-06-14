@@ -6,6 +6,7 @@ use crate::cluster::ClusterRollup;
 use crate::common::{
     event::{from_row, Event},
     kind::SourceKind,
+    scope::Scope,
 };
 use chrono::{DateTime, Utc};
 use sqlx::{postgres::PgRow, PgExecutor, Row};
@@ -56,17 +57,25 @@ pub async fn dirty_public_groups(
     .await
 }
 
-/// Upserts the recomputed rollup for one group. Idempotent: re-running a build overwrites the
-/// cache in place (durable state is the events, not this row).
+/// Upserts the recomputed rollup for one group in the given `scope`. Idempotent: re-running a build
+/// overwrites the cache in place (durable state is the events, not this row). Scope is part of the
+/// cluster identity, so a public and a private group with the same `(source, group_key)` are
+/// distinct rows — a private event can never land in a public cluster.
 pub async fn upsert_cluster(
     executor: impl PgExecutor<'_>,
+    scope: &Scope,
     source: SourceKind,
     group_key: &str,
     r: &ClusterRollup,
 ) -> Result<Uuid, sqlx::Error> {
+    let (scope_kind, scope_subscriber_id) = match scope {
+        Scope::Public => ("public", None::<Uuid>),
+        Scope::Private(sub) => ("private", Some(*sub)),
+    };
     let row = sqlx::query(
-        "INSERT INTO cluster (source, group_key, title, link, last_event_time, updated_at)
-         VALUES ($1, $2, $3, $4, $5, now())
+        "INSERT INTO cluster
+            (scope_kind, scope_subscriber_id, source, group_key, title, link, last_event_time, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, now())
          ON CONFLICT ON CONSTRAINT cluster_identity DO UPDATE SET
             title = EXCLUDED.title,
             link = EXCLUDED.link,
@@ -74,6 +83,8 @@ pub async fn upsert_cluster(
             updated_at = now()
          RETURNING id",
     )
+    .bind(scope_kind)
+    .bind(scope_subscriber_id)
     .bind(source)
     .bind(group_key)
     .bind(&r.title)
@@ -129,6 +140,53 @@ pub async fn list_public_group_events(
          WHERE scope_kind = 'public' AND source = $1 AND group_key = $2
          ORDER BY event_time, id",
     )
+    .bind(source)
+    .bind(group_key)
+    .try_map(from_row)
+    .fetch_all(executor)
+    .await
+}
+
+// ── Private build (per subscriber, just-in-time) ──────────────────────────
+
+/// Distinct private `(source, group_key)` groups owned by `subscriber_id` — the groups the
+/// just-in-time private build recomputes before a subscriber's digest. Unlike the public build there
+/// is no watermark: private volume per subscriber is small and the rollup is idempotent, so each
+/// digest simply rebuilds the owner's private clusters (design §9.1).
+pub async fn dirty_private_groups(
+    executor: impl PgExecutor<'_>,
+    subscriber_id: Uuid,
+) -> Result<Vec<(SourceKind, String)>, sqlx::Error> {
+    sqlx::query(
+        "SELECT DISTINCT source, group_key
+         FROM event
+         WHERE scope_kind = 'private' AND scope_subscriber_id = $1",
+    )
+    .bind(subscriber_id)
+    .try_map(|row: PgRow| Ok((row.try_get("source")?, row.get::<String, _>("group_key"))))
+    .fetch_all(executor)
+    .await
+}
+
+/// Loads every private event owned by `subscriber_id` in one within-source group, ordered by
+/// `(event_time, id)` so `rollup` is deterministic. The private counterpart to
+/// [`list_public_group_events`]; the `scope_subscriber_id = $1` predicate is the isolation boundary.
+pub async fn list_private_group_events(
+    executor: impl PgExecutor<'_>,
+    subscriber_id: Uuid,
+    source: SourceKind,
+    group_key: &str,
+) -> Result<Vec<Event>, sqlx::Error> {
+    sqlx::query(
+        "SELECT id, fingerprint, source, scope_kind, scope_subscriber_id,
+                event_time, title, body, links, group_key, entities,
+                content_kind, severity_hint, ingest_time, raw
+         FROM event
+         WHERE scope_kind = 'private' AND scope_subscriber_id = $1
+           AND source = $2 AND group_key = $3
+         ORDER BY event_time, id",
+    )
+    .bind(subscriber_id)
     .bind(source)
     .bind(group_key)
     .try_map(from_row)

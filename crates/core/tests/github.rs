@@ -23,6 +23,7 @@ use hmac::{Hmac, Mac};
 use serde_json::json;
 use sha2::Sha256;
 use tokio::net::TcpListener;
+use uuid::Uuid;
 
 fn event(value: serde_json::Value) -> GithubEvent {
     serde_json::from_value(value).expect("fixture is a valid GithubEvent")
@@ -42,7 +43,7 @@ fn issue_event_maps_to_longform_thread() {
     }));
     assert_eq!(event_map::stable_id(&ev), "issue:555:opened");
 
-    let new = event_map::to_builder(ev).finalize(Scope::Public);
+    let new = event_map::to_builder(ev).finalize(None);
     assert_eq!(new.source, SourceKind::Github);
     assert_eq!(new.content_kind, ContentKind::Longform);
     assert_eq!(new.group_key, "gh:octo/repo#issue-42");
@@ -65,7 +66,7 @@ fn release_event_is_an_announcement() {
         }}
     }));
     assert_eq!(event_map::stable_id(&ev), "release:777:published");
-    let new = event_map::to_builder(ev).finalize(Scope::Public);
+    let new = event_map::to_builder(ev).finalize(None);
     assert_eq!(new.content_kind, ContentKind::Announcement);
     assert_eq!(new.group_key, "gh:octo/repo@release-v1.2.0");
 }
@@ -78,7 +79,7 @@ fn push_event_identity_is_head_sha() {
         "payload": {"ref": "refs/heads/main", "head": "abc123"}
     }));
     assert_eq!(event_map::stable_id(&ev), "push:octo/repo:abc123");
-    let new = event_map::to_builder(ev).finalize(Scope::Public);
+    let new = event_map::to_builder(ev).finalize(None);
     assert_eq!(new.content_kind, ContentKind::Message);
     assert_eq!(new.group_key, "gh:octo/repo@refs/heads/main");
 }
@@ -93,7 +94,7 @@ fn unknown_event_is_captured_generically() {
         "payload": {"action": "started"}
     }));
     assert_eq!(event_map::stable_id(&ev), "WatchEvent:103");
-    let new = event_map::to_builder(ev).finalize(Scope::Public);
+    let new = event_map::to_builder(ev).finalize(None);
     assert_eq!(new.content_kind, ContentKind::Message);
     assert_eq!(new.group_key, "gh:octo/repo:WatchEvent");
     assert!(new.title.contains("WatchEvent"));
@@ -109,13 +110,13 @@ fn same_activity_dedups_across_differing_event_ids() {
         "created_at": "2026-06-10T10:00:00Z",
         "payload": {"action": "opened", "issue": {"id": 555, "number": 42, "title": "First title"}}
     })))
-    .finalize(Scope::Public);
+    .finalize(None);
     let b = event_map::to_builder(event(json!({
         "id": "999", "type": "IssuesEvent", "repo": {"name": "octo/repo"},
         "created_at": "2026-06-10T10:05:00Z",
         "payload": {"action": "opened", "issue": {"id": 555, "number": 42, "title": "Edited title"}}
     })))
-    .finalize(Scope::Public);
+    .finalize(None);
     assert_eq!(a.fingerprint, b.fingerprint, "same activity → one event");
 }
 
@@ -126,17 +127,71 @@ fn distinct_activities_never_collide() {
         "created_at": "2026-06-10T10:00:00Z",
         "payload": {"action": "opened", "issue": {"id": 1, "number": 1, "title": "x"}}
     })))
-    .finalize(Scope::Public);
+    .finalize(None);
     let b = event_map::to_builder(event(json!({
         "id": "2", "type": "IssuesEvent", "repo": {"name": "octo/repo"},
         "created_at": "2026-06-10T10:00:00Z",
         "payload": {"action": "closed", "issue": {"id": 1, "number": 1, "title": "x"}}
     })))
-    .finalize(Scope::Public);
+    .finalize(None);
     assert_ne!(
         a.fingerprint, b.fingerprint,
         "open vs close are distinct events"
     );
+}
+
+// ── visibility → scope (Phase 3) ─────────────────────────────────────────
+
+// Visibility threads from the source object all the way to `Scope`: a private-repo event (REST feed
+// `public:false`) finalizes to `Private(owner)`, a public one stays shared even on an owned
+// connection, and a private item from an *ownerless* connection can't be bound to anyone so it stays
+// public. The adapter only ever reports the bool; `finalize` owns the subscriber binding.
+#[test]
+fn visibility_threads_through_to_scope() {
+    let owner = Uuid::from_u128(42);
+
+    let private = event_map::to_builder(event(json!({
+        "id": "500", "type": "IssuesEvent", "repo": {"name": "octo/secret"},
+        "created_at": "2026-06-10T10:00:00Z", "public": false,
+        "payload": {"action": "opened", "issue": {"id": 9, "number": 1, "title": "private"}}
+    })))
+    .finalize(Some(owner));
+    assert_eq!(private.scope, Scope::Private(owner));
+
+    // Public repo (the feed default `public:true`) stays shared even though the connection is owned.
+    let public = event_map::to_builder(event(json!({
+        "id": "501", "type": "IssuesEvent", "repo": {"name": "octo/open"},
+        "created_at": "2026-06-10T10:00:00Z",
+        "payload": {"action": "opened", "issue": {"id": 10, "number": 2, "title": "public"}}
+    })))
+    .finalize(Some(owner));
+    assert_eq!(public.scope, Scope::Public);
+
+    // Private item, ownerless connection → no subscriber to bind to, so it can't become private.
+    let ownerless = event_map::to_builder(event(json!({
+        "id": "502", "type": "IssuesEvent", "repo": {"name": "octo/secret"},
+        "created_at": "2026-06-10T10:00:00Z", "public": false,
+        "payload": {"action": "opened", "issue": {"id": 11, "number": 3, "title": "x"}}
+    })))
+    .finalize(None);
+    assert_eq!(ownerless.scope, Scope::Public);
+}
+
+// A webhook from a private repo carries `repository.private:true` (not a top-level `public` flag);
+// it threads to the same owner scope as the poll path.
+#[test]
+fn private_webhook_finalizes_to_owner_scope() {
+    let owner = Uuid::from_u128(7);
+    let body = json!({
+        "action": "opened",
+        "issue": {"id": 555, "number": 42, "title": "A bug"},
+        "repository": {"full_name": "octo/secret", "private": true},
+        "sender": {"login": "alice"},
+        "installation": {"id": 1}
+    });
+    let ev =
+        event_map::to_builder(event_map::from_webhook("issues", "d-1", body)).finalize(Some(owner));
+    assert_eq!(ev.scope, Scope::Private(owner));
 }
 
 // ── webhook intake: dedup-against-poll, signature verify, routing, lifecycle ──
@@ -154,7 +209,7 @@ fn webhook_issue_dedups_against_polled_event() {
             "html_url": "https://github.com/octo/repo/issues/42"
         }}
     })))
-    .finalize(Scope::Public);
+    .finalize(None);
 
     // The `issues` webhook body: action + issue at the top level, plus repository/sender/installation.
     let body = json!({
@@ -168,8 +223,8 @@ fn webhook_issue_dedups_against_polled_event() {
         "sender": {"login": "alice"},
         "installation": {"id": 12345}
     });
-    let hooked = event_map::to_builder(event_map::from_webhook("issues", "delivery-1", body))
-        .finalize(Scope::Public);
+    let hooked =
+        event_map::to_builder(event_map::from_webhook("issues", "delivery-1", body)).finalize(None);
 
     assert_eq!(
         polled.fingerprint, hooked.fingerprint,
@@ -188,7 +243,7 @@ fn webhook_push_identity_matches_polled_head_sha() {
         "repo": {"name": "octo/repo"}, "created_at": "2026-06-10T09:00:00Z",
         "payload": {"ref": "refs/heads/main", "head": "deadbeef"}
     })))
-    .finalize(Scope::Public);
+    .finalize(None);
 
     let body = json!({
         "ref": "refs/heads/main", "after": "deadbeef",
@@ -197,8 +252,8 @@ fn webhook_push_identity_matches_polled_head_sha() {
         "sender": {"login": "bob"},
         "installation": {"id": 1}
     });
-    let hooked = event_map::to_builder(event_map::from_webhook("push", "delivery-2", body))
-        .finalize(Scope::Public);
+    let hooked =
+        event_map::to_builder(event_map::from_webhook("push", "delivery-2", body)).finalize(None);
 
     assert_eq!(polled.fingerprint, hooked.fingerprint);
 }
@@ -317,7 +372,7 @@ fn content_webhook_normalizes_through_the_dispatch() {
     {
         Inbound::Events(builders) => {
             assert_eq!(builders.len(), 1);
-            let ev = builders.into_iter().next().unwrap().finalize(Scope::Public);
+            let ev = builders.into_iter().next().unwrap().finalize(None);
             assert_eq!(ev.group_key, "gh:o/r#issue-3");
         }
         Inbound::Lifecycle(_) => panic!("expected events"),

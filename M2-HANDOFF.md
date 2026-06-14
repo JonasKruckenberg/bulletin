@@ -110,8 +110,8 @@ or `cargo nextest run`.
 |---|---|---|
 | **1** | Connector trait family seam, `ContentKind`, GitHub poll, `ConnDispatch` | ✅ merged (commit `6236abd`) |
 | **2** | Webhook catcher + `ProcessWebhook` job + HMAC verify + realtime traits | ✅ implemented (branch `claude/m1-phase-2-c1tvgu`) |
-| **3** | Private scope load-bearing + per-subscriber private clusters + scope-invariant proptest | ⬜ next |
-| **4** | Two-context RLS (two roles, two URLs) | ⬜ |
+| **3** | Private scope load-bearing + per-subscriber private clusters + scope-invariant proptest | ✅ implemented (branch `claude/m2-phase-3-s5ewh9`) |
+| **4** | Two-context RLS (two roles, two URLs) | ⬜ next |
 | **5** | Credential-at-rest (interim XChaCha20-Poly1305 envelope) + real GitHub token minting | ⬜ |
 
 ---
@@ -217,6 +217,42 @@ poll↔webhook dedup, lifecycle → status.
 ---
 
 ## 7. Phase 3 — Private scope load-bearing + per-subscriber private clusters
+
+> **Status: implemented** (branch `claude/m2-phase-3-s5ewh9`). What landed, vs. the plan below:
+> - **Migration** `…012_private_scope.sql`: `cluster` gains `scope_kind` + `scope_subscriber_id`
+>   (+ CHECK); `cluster_identity` replaced with `UNIQUE NULLS NOT DISTINCT (scope_kind,
+>   scope_subscriber_id, source, group_key)` (the `NULLS NOT DISTINCT` is load-bearing — without it
+>   the public upsert's `ON CONFLICT` never fires); `cluster_scope_recency` index; `connection`
+>   gains owning `subscriber_id uuid NULL REFERENCES subscriber(id) ON DELETE CASCADE`.
+> - **Visibility-aware finalize**: `EventBuilder` gained `is_private` + `.private(bool)`;
+>   `finalize(scope)` became `finalize(owner: Option<Uuid>)` mapping `(is_private, owner)` →
+>   `Scope` (`private + owner → Private(owner)`, else `Public` — a private item on an ownerless
+>   connection can't be bound, so it stays public rather than inventing an owner). `ingest::poll`
+>   and `process_webhook` finalize per-event with the connection's `subscriber_id` (from OUR row,
+>   never the payload).
+> - **GitHub visibility**: `repos_to_poll` returns `RepoTarget { name, private }` (discovery reads
+>   `/installation/repositories`'s `private`; an allowlist can't, so it reports `private=false`);
+>   `GithubEvent` deserializes the feed's per-event `public` flag (default `true`) and `poll` folds
+>   the repo-list privacy onto each event (never a downgrade); `from_webhook` sets `public` from
+>   `repository.private`; `to_builder` passes `.private(!public)`.
+> - **PrivateBuild**: `cluster::build_private(pool, subscriber_id)` — **no watermark/lock**,
+>   rebuilds the owner's private clusters just-in-time; `GenerateDigest` (and `dispatch_now`) call
+>   it before selecting. `upsert_cluster` is now scope-aware; `cluster::store` gained
+>   `dirty_private_groups` / `list_private_group_events`. `candidates_in_lookback` takes a
+>   `subscriber_id` and filters `scope_kind = 'public' OR scope_subscriber_id = $1` (the isolation
+>   boundary) — `explain` is scope-aware too but stays no-writes (doesn't build private).
+> - **Scope-invariant proptests** (pure, `cluster::tests`): public build never clusters a private
+>   event (scope is part of `ClusterKey`); a subscriber's candidate set (`visible_to`) never holds
+>   another subscriber's private cluster. Plus DB-backed tests (Docker): `pipeline.rs`
+>   per-owner isolation, `webhook.rs` private-repo → owner scope, `github.rs` visibility→scope.
+> - **Debug**: `debug connection-add --owner <subscriber>` binds a connection to its owner.
+> - **Seams left for later phases:** isolation is enforced at the *query* layer (the
+>   `scope_subscriber_id` predicates) — Phase 4 makes it DB-enforced via RLS so it holds against a
+>   logic bug; private clusters are rebuilt every digest (no private watermark) — fine at M2 volume,
+>   revisit if it bites. `cluster_entities` GIN (blocking) is still M3.
+> - **Tests:** `clippy --all-targets` clean; pure suites pass; Docker was unavailable in the build
+>   sandbox so the DB suites (`pipeline`/`webhook`/`event`/`connection`/`poll_rss`) compiled but did
+>   not run.
 
 **Goal:** private-repo events reach only their owner's digest; public stays shared.
 
