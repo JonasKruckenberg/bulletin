@@ -247,12 +247,17 @@ poll↔webhook dedup, lifecycle → status.
 >   now()]` range from `…015_private_build_watermark.sql` (keyed per subscriber), recompute dirtied
 >   groups, upsert, advance the cursor. So it scales with *new* private activity (not lifetime
 >   history) and a quiet private cluster ages out of the candidate floor like a public one.
->   `GenerateDigest` (and `dispatch_now`) call it before selecting. `upsert_cluster` is now
->   scope-aware; `cluster::store` gained `try_private_build_lock` / `private_build_bounds` /
->   `dirty_private_groups` (range-bounded) / `advance_private_build_watermark` /
->   `list_private_group_events`. `candidates_in_lookback` takes a `subscriber_id` and filters
->   `scope_kind = 'public' OR scope_subscriber_id = $1` (the isolation boundary) — `explain` is
->   scope-aware too but stays no-writes (doesn't build private).
+>   `GenerateDigest` (and `dispatch_now`) call it before selecting. The public and private builds
+>   share their code: the group-discovery query (`dirty_groups(scope, lo, hi)`), the per-group
+>   loader (`list_group_events(scope, …)`), and the rollup→upsert loop (`build_groups`) are all
+>   scope-parameterized (via `scope.to_columns()` + `scope_subscriber_id IS NOT DISTINCT FROM`); only
+>   the lock/bounds/watermark differ. `upsert_cluster` is scope-aware too. `candidates_in_lookback`
+>   takes a `subscriber_id` and filters `scope_kind = 'public' OR scope_subscriber_id = $1` (the
+>   isolation boundary) — `explain` is scope-aware too but stays no-writes (doesn't build private).
+>   `…016_candidate_lookback_index.sql` replaces the Phase-3 `cluster_scope_recency` index (keyed on
+>   last_event_time, which served neither the `updated_at` floor nor the scope OR) with two
+>   predicate-aligned indexes the planner bitmap-ORs: a partial `(updated_at) WHERE public` and a
+>   `(scope_subscriber_id, updated_at)`.
 > - **Scope-invariant proptests** (pure, `cluster::tests`): public build never clusters a private
 >   event (scope is part of `ClusterKey`); a subscriber's candidate set (`visible_to`) never holds
 >   another subscriber's private cluster. Plus DB-backed tests (Docker): `pipeline.rs`

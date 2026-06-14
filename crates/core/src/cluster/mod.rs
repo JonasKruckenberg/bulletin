@@ -99,20 +99,11 @@ pub async fn build(pool: &PgPool) -> Result<Option<BuildStats>> {
     let (built_through, hwm) = store::build_bounds(&mut *tx)
         .await
         .context("read build bounds")?;
-    let groups = store::dirty_public_groups(&mut *tx, built_through, hwm)
+    let groups = store::dirty_groups(&mut *tx, &Scope::Public, built_through, hwm)
         .await
         .context("find dirty groups")?;
 
-    for (source, group_key) in &groups {
-        let events = store::list_public_group_events(&mut *tx, *source, group_key)
-            .await
-            .context("load group events")?;
-        if let Some(r) = rollup(&events) {
-            store::upsert_cluster(&mut *tx, &Scope::Public, *source, group_key, &r)
-                .await
-                .context("upsert cluster")?;
-        }
-    }
+    build_groups(&mut tx, &Scope::Public, &groups).await?;
 
     store::advance_build_watermark(&mut *tx, hwm)
         .await
@@ -123,6 +114,29 @@ pub async fn build(pool: &PgPool) -> Result<Option<BuildStats>> {
         dirty_groups: groups.len(),
         built_through: hwm,
     }))
+}
+
+/// The per-group build step both [`build`] and [`build_private`] run: recompute each dirtied group's
+/// rollup over *all* its (scoped) events and upsert the cluster. Only the scope, lock, bounds, and
+/// watermark differ between the two builds; this is the shared body, so a change to how a group is
+/// folded lands in one place. Reads and writes are both fenced by `scope`, so a private build can
+/// only touch its owner's clusters.
+async fn build_groups(
+    conn: &mut sqlx::PgConnection,
+    scope: &Scope,
+    groups: &[(SourceKind, String)],
+) -> Result<()> {
+    for (source, group_key) in groups {
+        let events = store::list_group_events(&mut *conn, scope, *source, group_key)
+            .await
+            .context("load group events")?;
+        if let Some(r) = rollup(&events) {
+            store::upsert_cluster(&mut *conn, scope, *source, group_key, &r)
+                .await
+                .context("upsert cluster")?;
+        }
+    }
+    Ok(())
 }
 
 /// PrivateBuild: drain one subscriber's new private events into their private clusters, ahead of
@@ -151,26 +165,12 @@ pub async fn build_private(pool: &PgPool, subscriber_id: Uuid) -> Result<usize> 
     let (built_through, hwm) = store::private_build_bounds(&mut *tx, subscriber_id)
         .await
         .context("read private build bounds")?;
-    let groups = store::dirty_private_groups(&mut *tx, subscriber_id, built_through, hwm)
+    let scope = Scope::Private(subscriber_id);
+    let groups = store::dirty_groups(&mut *tx, &scope, built_through, hwm)
         .await
         .context("find dirty private groups")?;
 
-    for (source, group_key) in &groups {
-        let events = store::list_private_group_events(&mut *tx, subscriber_id, *source, group_key)
-            .await
-            .context("load private group events")?;
-        if let Some(r) = rollup(&events) {
-            store::upsert_cluster(
-                &mut *tx,
-                &Scope::Private(subscriber_id),
-                *source,
-                group_key,
-                &r,
-            )
-            .await
-            .context("upsert private cluster")?;
-        }
-    }
+    build_groups(&mut tx, &scope, &groups).await?;
 
     store::advance_private_build_watermark(&mut *tx, subscriber_id, hwm)
         .await

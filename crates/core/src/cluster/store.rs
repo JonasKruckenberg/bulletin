@@ -38,18 +38,25 @@ pub async fn build_bounds(
     Ok((row.get("built_through"), row.get("hwm")))
 }
 
-/// Distinct public `(source, group_key)` groups touched by events ingested in `(lo, hi]` —
-/// the "dirty" groups PublicBuild must recompute this pass.
-pub async fn dirty_public_groups(
+/// Distinct `(source, group_key)` groups *in `scope`* touched by events ingested in `(lo, hi]` — the
+/// "dirty" groups a build (public or private) must recompute this pass. `IS NOT DISTINCT FROM`
+/// matches the scope's nullable subscriber uniformly: public's NULL against NULL rows, a private
+/// owner against their own — the isolation boundary, shared by both builds.
+pub async fn dirty_groups(
     executor: impl PgExecutor<'_>,
+    scope: &Scope,
     lo: DateTime<Utc>,
     hi: DateTime<Utc>,
 ) -> Result<Vec<(SourceKind, String)>, sqlx::Error> {
+    let (scope_kind, scope_subscriber_id) = scope.to_columns();
     sqlx::query(
         "SELECT DISTINCT source, group_key
          FROM event
-         WHERE scope_kind = 'public' AND ingest_time > $1 AND ingest_time <= $2",
+         WHERE scope_kind = $1 AND scope_subscriber_id IS NOT DISTINCT FROM $2
+           AND ingest_time > $3 AND ingest_time <= $4",
     )
+    .bind(scope_kind)
+    .bind(scope_subscriber_id)
     .bind(lo)
     .bind(hi)
     .try_map(|row: PgRow| Ok((row.try_get("source")?, row.get::<String, _>("group_key"))))
@@ -121,22 +128,29 @@ pub async fn unbuilt_public_events_exist(
     Ok(row.get("dirty"))
 }
 
-/// Loads every public event in one within-source group `(source, group_key)`, ordered by
-/// `(event_time, id)` so the pure `rollup` is deterministic. The build's drain-read over the
-/// event log — called once per dirty group.
-pub async fn list_public_group_events(
+/// Loads every event *in `scope`* within one source group `(source, group_key)`, ordered by
+/// `(event_time, id)` so the pure `rollup` is deterministic. The build's drain-read over the event
+/// log — called once per dirty group, by both the public and private build. The
+/// `scope_subscriber_id IS NOT DISTINCT FROM` clause is the isolation boundary: a private read can
+/// only see its owner's events, a public read only the shared ones.
+pub async fn list_group_events(
     executor: impl PgExecutor<'_>,
+    scope: &Scope,
     source: SourceKind,
     group_key: &str,
 ) -> Result<Vec<Event>, sqlx::Error> {
+    let (scope_kind, scope_subscriber_id) = scope.to_columns();
     sqlx::query(
         "SELECT id, fingerprint, source, scope_kind, scope_subscriber_id,
                 event_time, title, body, links, group_key, entities,
                 content_kind, severity_hint, ingest_time, raw
          FROM event
-         WHERE scope_kind = 'public' AND source = $1 AND group_key = $2
+         WHERE scope_kind = $1 AND scope_subscriber_id IS NOT DISTINCT FROM $2
+           AND source = $3 AND group_key = $4
          ORDER BY event_time, id",
     )
+    .bind(scope_kind)
+    .bind(scope_subscriber_id)
     .bind(source)
     .bind(group_key)
     .try_map(from_row)
@@ -187,30 +201,6 @@ pub async fn private_build_bounds(
     Ok((row.get("built_through"), row.get("hwm")))
 }
 
-/// Distinct private `(source, group_key)` groups owned by `subscriber_id` and touched by events
-/// ingested in `(lo, hi]` — the private groups PrivateBuild must recompute this pass. The
-/// `scope_subscriber_id = $1` predicate is the isolation boundary; the ingest-time range is what
-/// makes the build incremental rather than a full rescan of the owner's history.
-pub async fn dirty_private_groups(
-    executor: impl PgExecutor<'_>,
-    subscriber_id: Uuid,
-    lo: DateTime<Utc>,
-    hi: DateTime<Utc>,
-) -> Result<Vec<(SourceKind, String)>, sqlx::Error> {
-    sqlx::query(
-        "SELECT DISTINCT source, group_key
-         FROM event
-         WHERE scope_kind = 'private' AND scope_subscriber_id = $1
-           AND ingest_time > $2 AND ingest_time <= $3",
-    )
-    .bind(subscriber_id)
-    .bind(lo)
-    .bind(hi)
-    .try_map(|row: PgRow| Ok((row.try_get("source")?, row.get::<String, _>("group_key"))))
-    .fetch_all(executor)
-    .await
-}
-
 /// Advances one subscriber's private build watermark to `hwm` (monotonic via GREATEST), creating the
 /// row on first build.
 pub async fn advance_private_build_watermark(
@@ -229,30 +219,4 @@ pub async fn advance_private_build_watermark(
     .execute(executor)
     .await?;
     Ok(())
-}
-
-/// Loads every private event owned by `subscriber_id` in one within-source group, ordered by
-/// `(event_time, id)` so `rollup` is deterministic. The private counterpart to
-/// [`list_public_group_events`]; the `scope_subscriber_id = $1` predicate is the isolation boundary.
-pub async fn list_private_group_events(
-    executor: impl PgExecutor<'_>,
-    subscriber_id: Uuid,
-    source: SourceKind,
-    group_key: &str,
-) -> Result<Vec<Event>, sqlx::Error> {
-    sqlx::query(
-        "SELECT id, fingerprint, source, scope_kind, scope_subscriber_id,
-                event_time, title, body, links, group_key, entities,
-                content_kind, severity_hint, ingest_time, raw
-         FROM event
-         WHERE scope_kind = 'private' AND scope_subscriber_id = $1
-           AND source = $2 AND group_key = $3
-         ORDER BY event_time, id",
-    )
-    .bind(subscriber_id)
-    .bind(source)
-    .bind(group_key)
-    .try_map(from_row)
-    .fetch_all(executor)
-    .await
 }

@@ -4,8 +4,7 @@
 //! Postgres.
 
 use bulletin_core::cluster::store::{
-    advance_build_watermark, build_bounds, dirty_public_groups, list_public_group_events,
-    upsert_cluster,
+    advance_build_watermark, build_bounds, dirty_groups, list_group_events, upsert_cluster,
 };
 use bulletin_core::digest::select::{select, Verdict};
 use bulletin_core::digest::store::{
@@ -109,9 +108,9 @@ async fn insert_private(
 /// Runs PublicBuild's core loop inline (the binary's `build::run`, minus the advisory lock).
 async fn build_all(pool: &PgPool) {
     let (lo, hi) = build_bounds(pool).await.unwrap();
-    let groups = dirty_public_groups(pool, lo, hi).await.unwrap();
+    let groups = dirty_groups(pool, &Scope::Public, lo, hi).await.unwrap();
     for (source, group_key) in &groups {
-        let events = list_public_group_events(pool, *source, group_key)
+        let events = list_group_events(pool, &Scope::Public, *source, group_key)
             .await
             .unwrap();
         if let Some(r) = rollup(&events) {
@@ -148,7 +147,7 @@ async fn build_groups_events_into_clusters() {
     assert_eq!(cluster_count(&pool).await, 3);
 
     // The shared cluster is represented by its latest event.
-    let shared = list_public_group_events(&pool, SourceKind::Rss, "shared")
+    let shared = list_group_events(&pool, &Scope::Public, SourceKind::Rss, "shared")
         .await
         .unwrap();
     assert_eq!(rollup(&shared).unwrap().title, "Shared latest");
