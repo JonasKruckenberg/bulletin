@@ -378,6 +378,14 @@ A few things this research surfaced that affect the *core* design, not just the 
 5. **The generic-webhook envelope is itself a mini canonical-event contract.** Designing it
    well (§9) is essentially extending the `Event` model to untrusted external callers —
    same scope-assignment and SSRF/auth concerns as any connector (§12 of the design doc).
+6. **Source-native ids are the backbone of tiered identity** (`digest-thread-layer.md` §3 /
+   design §8.7). Most sources mint authoritative, exact identifiers for people/orgs/objects —
+   GitHub node ids, Slack `U…`/`C…` ids, email addresses, DOIs, CVE ids — which form the
+   `confidence = 1.0` tier of the resolver and, crucially, **carry their own avatars** (the
+   only case where rendering a guaranteed profile picture is safe, §10.4). Surface-form names
+   ("Acme Corp") fall to the graded tier. Connectors should surface native ids + avatar URLs in
+   `entities`, not just display strings, so identity resolution and the confidence-rendered
+   frontend have anchors to work from.
 
 ---
 

@@ -1,8 +1,10 @@
 # Digest System — Architecture & Design
 
 **Status:** Draft
-**Last updated:** 13 June 2026
+**Last updated:** 14 June 2026
 **Scope:** End-to-end design for v1 (purely scheduled digests), plus forward-compatible decisions that let later features slot in without rework.
+
+**Revision (14 June 2026) — the Thread layer & tiered identity.** A designed-for, deferred layer that turns the aggregator from a *stateless topical filter* into a *stateful model of the user*. The content graph gains a fourth phase — **`Thread`**: the persistent, per-subscriber weave that runs the full height of time (the Acme migration over months; the on-call rotation), of which a `Story` is one moment. Feeding it is a **tiered probabilistic identity** layer (authority-minted ids as the exact backbone; graded, revisable `entity_edge`s above), and **confidence becomes a first-class signal** that flows to rendering (real avatar vs question-mark) and back through feedback. It lands *after* per-subscriber linking and relevance (roadmap M3/M4); everything is schema-additive. Full design: **`digest-thread-layer.md`**. Touchpoints below: §1, §2, §6, §8.3–§8.4, §8.6–§8.7, §9.5, §10.3–§10.4, §11, §13.
 
 **Revision (13 June 2026) — read/write split.** The runtime is reframed as two decoupled pipelines — **materialization** (write side; durable, best-effort) and **projection** (read side; per-subscriber, punctual) — communicating only through durable shared state (CQRS / materialized-view). This supersedes the earlier *chained* `public-build → generate` tick (§3.1) and the hard *window-partition* selection (§9.4): selection is now a **freshness-scored lookback** over a durable event log, "no loss" is a **durability** guarantee on that log rather than a property of window partitioning, and missed boundaries **coalesce** into one catch-up digest. Cadence is **daily/weekly** at a local time (monthly dropped). Stories are the **per-subscriber read-model** at the head of the projection side.
 
@@ -13,7 +15,8 @@
 The job is to *suppress noise and elevate the few things that matter* — in a way the user **trusts**. Two consequences shape the whole design:
 
 - **Draw connections across sources.** Surface things the user would have missed because the signal was split across GitHub, Slack, email, RSS, etc. with no obvious link between them.
-- **Earn trust through transparency and control.** A filter that hides things is only useful if the user can see *why* a decision was made, drill into the data behind it, and correct it.
+- **Weave events into the threads of a user's life.** Beyond one cross-source *happening*, the persistent things a life is made of — projects, roles, relationships — span *many* happenings over *time*. **`Thread`s** (§8.6) model these as durable, per-subscriber state, so relevance becomes "does this advance a thread you've invested in?" rather than "does this match a keyword?" — a designed-for, deferred layer (`digest-thread-layer.md`).
+- **Earn trust through transparency and control.** A filter that hides things is only useful if the user can see *why* a decision was made, drill into the data behind it, and correct it — *including its own uncertainty*: identity/link confidence is rendered (a guaranteed person vs a question mark, §10.4), and the rendered doubt is itself the correction affordance.
 
 Everything in a **Digest** has cleared the same per-user **relevance** bar. Within that set, each item renders as either a **Story** (rich and expandable: many related events, or one substantive item like a followed author's new article) or a **Note** (compact: relevant but atomic — a followed library's release, an album drop). Story vs Note is about *how much material backs the item*, not how much it matters; a Note can outrank a Story in priority. Digests are delivered on a configurable recurrence — **daily or weekly at a chosen local time** (e.g. "weekly, Tuesdays at 17:00"), in the subscriber's timezone.
 
@@ -39,6 +42,7 @@ Everything in a **Digest** has cleared the same per-user **relevance** bar. With
 - Gmail / email (cost — the `gmail.readonly` restricted scope requires annual Google verification + a CASA security assessment, commonly $15k–$75k/yr; **Slack is the v1 private source instead** — see §7 matrix).
 - Forward-looking (prospective) events — calendar, delivery ETAs, later ML-predicted patterns. **Deferred including the model support** (future-valued `event_time`, the signed-gap salience curve, `confidence`); v1 events are all retrospective and the priority time-term is plain recency decay (§8.5). Forward-compatible: re-add without schema rework.
 - A **shared public-story cache** — v1 derives every story per-subscriber (§4, §6); memoizing pure-public stories across subscribers is the scale optimization (split-trigger: per-subscriber linking cost / embeddings).
+- **The Thread layer & tiered identity** (`digest-thread-layer.md`) — the persistent per-subscriber `Thread` weave (§8.6), the probabilistic `entity_edge` identity graph (§8.7), and confidence-as-rendered-signal (§10.4). **Designed-for, deferred** to *after* linking + relevance (roadmap M3/M4); schema-additive, one new background job (`thread_maintenance`) off the punctual path. v1 entities stay freeform `Vec<String>` matched exactly; v1 relevance is flat per-entity affinity with no thread memory.
 - Scale-only persistence (event partitioning, dedup gate, normalized blocking signals, normalized `story_cluster` membership, multi-channel delivery table) — see split-triggers in §6.
 
 ---
@@ -48,7 +52,7 @@ Everything in a **Digest** has cleared the same per-user **relevance** bar. With
 Three logical layers:
 
 - **Ingress** — interfaces with every source (push + pull), normalizes everything into a canonical event.
-- **Aggregation** — dedupes, groups, links, scores, and selects events into stories/notes.
+- **Aggregation** — dedupes, groups, links, scores, and selects events into stories/notes. *(Deferred extension: weaves stories into persistent per-subscriber `Thread`s — §8.6 / `digest-thread-layer.md`.)*
 - **Generation** — produces and delivers per-subscriber digests on schedule.
 
 ```
@@ -182,7 +186,7 @@ Eight domain tables in three groups, plus the library-provided work queue:
 - **`subscriber`** — `kind`, delivery prefs (**recurrence**: `freq` daily|weekly, `at_time` local time-of-day, `timezone`, `on_weekday` for weekly; `max_stories`, `max_notes`, channels, quiet hours), plus `filters` jsonb (sources, mutes, keywords) and `affinity` jsonb (relevance weights, updated by feedback).
 - **`connection`** — a linked source: owning `subscriber_id`, `source_type`, `creds_ref` (KMS reference, **not** the secret), `config`, poll `cursor`, `status`. Declares whether its events are public or private.
 
-**Shared content graph** (3 phases: dedup → group → aggregate; append-only, only upward FKs)
+**Shared content graph** (3 phases: dedup → group → aggregate; append-only, only upward FKs). *(Deferred 4th phase: per-subscriber `Thread`s weave stories across time — adds `thread` + `entity_edge` tables, `canonical_entities` on `cluster`/`story`, and `story.thread_id`; all additive, see `digest-thread-layer.md` §8.)*
 - **`event`** — canonical event (§5). `UNIQUE(fingerprint)` for dedup. Unpartitioned in v1.
 - **`cluster`** — a within-source group: events sharing `(scope, source, group_key)` (one PR, one Slack thread). **Public clusters are shared** (materialization side; rebuilt as public events arrive, decoupled from generate); **private clusters are per-subscriber**. Carries a build-maintained rollup (`event_count`, `max_severity`, `content_depth`, `entities`). Membership is by `group_key` — no per-event pointer. Carries **no `story_id`** (a public cluster belongs to many subscribers' stories).
 - **`story`** — the **per-subscriber** cross-source aggregation a digest references: a set of linked clusters, **owned by one subscriber** (`subscriber_id`). Holds members as `clusters` jsonb (`[{cluster_id, link_reason}]`) plus **cached signals** (`event_count`, `source_diversity`, `content_depth`, `max_severity`, `entities`). Stable `id`; `merged_into` forwards a retro-merged story to its survivor (§8.2).
@@ -345,7 +349,7 @@ Equality grouping — indexable, no ML, high precision. These are the **atoms**.
 
 Three signals (a fourth, `confidence`, is deferred — §2/§8.5). Volume never gates inclusion — folding it into relevance would bury high-relevance/low-volume items like a single album drop.
 
-**Relevance** (per-user) — *do you care?* Subscription match (hard filter), entity affinity (tracked repos/people/keywords), scope bonus (own private content), mutes as hard zeros. Relevance **gates** inclusion (a single `relevance_floor`) and is the primary ranking key.
+**Relevance** (per-user) — *do you care?* Subscription match (hard filter), entity affinity (tracked repos/people/keywords), scope bonus (own private content), mutes as hard zeros. Relevance **gates** inclusion (a single `relevance_floor`) and is the primary ranking key. *(Deferred — the Thread term, §8.6: relevance also sums the precomputed weight of the active threads a story advances, so a story whose individual pieces each fall below the floor still clears it by advancing a thread you've invested in — the rescue for the missed-because-split case.)*
 
 **Richness** (global) — *how much material backs the cluster?* `richness = combine(breadth, depth)`:
 - **breadth** = f(`event_count`, `source_diversity`)
@@ -353,7 +357,7 @@ Three signals (a fourth, `confidence`, is deferred — §2/§8.5). Volume never 
 
 Richness does **not** gate; it only decides rendering format (§8.4). It is derived from cached inputs, not stored.
 
-**Priority** (per-user, for ordering and caps) — relevance-led, boosted by `max_severity`, and aged by **recency decay** over `now − last_event_time` (applied at read time). v1 is retrospective only; the generalization to a signed-gap salience curve that also handles future-valued items is deferred (§8.5).
+**Priority** (per-user, for ordering and caps) — relevance-led, boosted by `max_severity`, and aged by **recency decay** over `now − last_event_time` (applied at read time). v1 is retrospective only; the generalization to a signed-gap salience curve that also handles future-valued items is deferred (§8.5). *(Deferred — two ML-free terms arrive with Threads, §8.6: **corroboration**, where `source_diversity` feeds priority and not only richness/format — independent sources lighting up is importance, not a render hint — and **reactivation/novelty**, a bump when a story lands on a dormant thread or a thread spikes over its baseline rate.)*
 
 **Confidence** (global) — *deferred.* Every v1 source is deterministic, so confidence would be a near-constant. Forward-compatible (§8.5): when estimate/prediction sources land, confidence is adapter-assigned per event, rolled up per cluster and **attenuated by link strength**, and **modulates priority** without gating. Re-adds as a column + a multiplier.
 
@@ -364,7 +368,7 @@ Richness does **not** gate; it only decides rendering format (§8.4). It is deri
 3. **Classify format** (rendering, not importance):
    - **Story** if richness is high — multi-event OR multi-source OR a substantive single item (`content_kind = longform`).
    - **Note** otherwise — relevant but atomic/thin.
-4. **Cap** by priority rank: Stories cap at N (~3–5), Notes at M (~15–25). A Note is never dropped *for being a Note*, only for losing the priority race.
+4. **Cap** by priority rank: Stories cap at N (~3–5), Notes at M (~15–25). A Note is never dropped *for being a Note*, only for losing the priority race. *(Deferred — a **thread-diversity cap** (§8.6) bounds stories-per-thread (≈ ≤2) so one busy thread can't monopolize the digest, forcing breadth across the user's life.)*
 5. **Order** the digest by priority with format per item — a high-priority Note can sit above a lower-priority Story (**format ≠ importance**).
 
 The selection function should be a **pure function over precomputed features** — testable against fixtures, swappable. The `relevance_floor`, richness threshold, and caps live in a config table in v1.
@@ -378,6 +382,25 @@ v1 events are all **retrospective** (`event_time ≤ ingest_time`). The model is
 - **Windowing** extends the candidate **upper** bound to `now + lookahead` (a single global knob); v1's candidate set is a freshness-scored **lookback** ending at the fire instant (§9.4).
 - **`confidence`** (§8.3) carries a prospective item's certainty (calendar high, ETA medium, ML low). An ML predictor is then just another connector emitting prospective, low-confidence events.
 - **Recurrence (RRULE)** expands lazily inside the lookahead horizon against the subscriber's wall clock (DST-correct; technical architecture doc §13).
+
+### 8.6 Threads — the persistent weave  *(DESIGNED — deferred; full design in `digest-thread-layer.md`)*
+
+A **`Thread`** is the fourth phase of the content graph (`Event → Cluster → Story → Thread`): the persistent, per-subscriber weave that runs the *full height of time*, of which a `Story` is one moment. It is what turns the aggregator from a stateless topical filter into a **stateful model of the user** — the projects, roles, and relationships a life is made of, each spanning many stories over weeks and months.
+
+Three load-bearing properties (each preserves an existing invariant):
+- **Always Private, one owner** — `subscriber_id`-scoped exactly like `story` (§4); membership/affinity never shared. No new cross-tenant path (§12 risk #1).
+- **Cache over the durable log** — a Thread's durable *inputs* are the event + `feedback` logs + user declarations; the rows are a **recomputable cache** (same status as `cluster`/`story`). The CQRS guarantee (§3.0) holds.
+- **Formed in the background, read on the hot path** — Threads evolve in a new write-side job, `thread_maintenance` (world's clock, best-effort, per-subscriber, off the punctual path, §11); projection only *reads* their precomputed product.
+
+What it changes (all deferred): **relevance** gains a Thread term (§8.3 — the missed-because-split rescue); **priority** gains corroboration + reactivation/novelty (§8.3); **selection** gains a thread-diversity cap (§8.4); **rendering** groups by Thread with a per-thread delta line (§9.5); **feedback** gains thread-level care-more/less/done (§10.3). `thread_maintenance` forms threads by community detection over the subscriber's canonical-entity co-occurrence graph, with the §8.2 connected-components-and-`merged_into` id-forwarding reused one level up. Performance: nothing asymptotic added to the fire path — see §11.
+
+### 8.7 Tiered identity resolution — the prerequisite  *(DESIGNED — deferred)*
+
+Threads (and linking) are only as good as entity identity, and a **rigid 1:1 canonical map is a dead end** — identity is not committed once. The design is a **tiered resolver producing probabilistic, revisable equivalence edges**, where exactness is the high-confidence floor, not the whole thing:
+- **Authority-minted ids** (GitHub node id, Slack `U0123`, email, DOI, CVE, normalized URL) are exact *by construction* — the certain backbone, kept as hard `confidence = 1.0` edges.
+- **Surface forms** ("Acme Corp", "@dlewis") get graded `entity_edge`s (normalized / lexical / later embedding). **Soft edges weight, they don't collapse** identity; only 1.0 edges hard-merge; a conflicting authoritative id is a `cannot-link` veto. Canonical identity = connected components over edges ≥ θ (id-forwarded — the §8.2 trick one level down).
+
+It is **revisable** through the §10.3 feedback channel extended to the entity level, and needs **no embeddings in v1** while staying forward-compatible (embedding is "one more edge source with a confidence"). Resolution runs as a sub-pass of `thread_maintenance`; `canonical_entities` is written at build time so the hot path reads resolved ids directly. See §10.4 for how the resulting **confidence** is rendered.
 
 ---
 
@@ -413,7 +436,7 @@ Selection is a **freshness-scored lookback**, not a hard window partition (this 
 
 ### 9.5 Rendering & delivery
 
-The digest renders as a single **priority-ordered list with format per item** (§8.4): Stories as rich expandable cards (headline + timeline + backing links), Notes as compact one-liners. Email is sent as a **notification + authenticated deep-link** to the full digest, not by dumping private content into the inbox. Story lifecycle is *derived*, not stored: a story is active while it has recent events; its rows and links stay referenceable forever (append-only).
+The digest renders as a single **priority-ordered list with format per item** (§8.4): Stories as rich expandable cards (headline + timeline + backing links), Notes as compact one-liners. Email is sent as a **notification + authenticated deep-link** to the full digest, not by dumping private content into the inbox. Story lifecycle is *derived*, not stored: a story is active while it has recent events; its rows and links stay referenceable forever (append-only). *(Deferred, §8.6: items group under their `Thread` with a per-thread **delta line** — "Acme migration — staging cutover landed; 2 follow-ups assigned to you" — computed like the §9.4 recently-surfaced damping; identities render with confidence bands per §10.4.)*
 
 ---
 
@@ -439,9 +462,19 @@ These are **free** — just the signals already computed during the decision, se
 ### 10.3 Feedback — three signals, two loops
 
 - **"Care a lot" / "Don't care"** → *relevance feedback*. Extract the item's entities/sources, up/down-weight them in the subscriber's `affinity`, feed the relevance term next tick. (The only loop that affects what gets *included*, since relevance is the gate.)
-- **"This aggregation is wrong"** → *linking correction*. Modeled as a pairwise constraint (cannot-link / must-link) on the subscriber's edge graph. Because linking is **per-subscriber** (§8.2), the constraint is just an edge dropped/added in *that* subscriber's next recompute — it takes effect on the next digest, with nothing shared to mutate. One person's click only ever changes their own view.
+- **"This aggregation is wrong"** → *linking correction*. Modeled as a pairwise constraint (cannot-link / must-link) on the subscriber's edge graph. Because linking is **per-subscriber** (§8.2), the constraint is just an edge dropped/added in *that* subscriber's next recompute — it takes effect on the next digest, with nothing shared to mutate. One person's click only ever changes their own view. *(Deferred, §8.7: the same must-link/cannot-link signal extends one level down to the **entity_edge** graph — the rendered "?" on an uncertain identity is its click target, so confirming/denying "is this the same person?" hardens or breaks an identity edge for that subscriber's future digests.)*
+- **"This whole thread matters" / "I'm done with this"** *(deferred, §8.6)* → *thread feedback*. Targets a `Thread` (`target_type='thread'`): adjusts its `affinity` (or archives it on *done*). The loop that was missing — you can up/down-weight a *project*, not only an entity.
 
 All feedback is an **append-only log**, processed async on the next tick, never blocking delivery. It is also the **eval signal**: story precision and false-positive rate are how you measure whether overwhelm is actually decreasing.
+
+### 10.4 Confidence as a rendered signal  *(DESIGNED — deferred; with §8.7)*
+
+The tiered resolver's (§8.7) **confidence is a product surface, not only an internal knob** — the honest face of the trust thesis (§1). It flows to rendering and back through feedback:
+- **Frontend sees a band, not a float** — `Confirmed | Probable | Uncertain` maps to treatment (real avatar / avatar + badge / question-mark placeholder); the raw score stays server-side. One vocabulary spans identity *and* edges (a story→thread or cluster→cluster assignment renders "possibly part of *X*" the same way as "possibly Dana").
+- **Avatar provenance must equal identity provenance** *(the one footgun)* — a false-confident avatar misleads and can attach the wrong face to private content (§12). Show the guaranteed avatar *only* when the image comes from the authority that minted the exact id (the Slack `U0123` carries its avatar); otherwise the placeholder.
+- **The "?" is the correction affordance** — it is the click target for the §10.3 entity-level feedback, so rendered doubt *is* the resolution UI (the flywheel).
+
+Two guardrails: **the weight and the render come from the same number** (a 0.6 identity edge that contributed 0.6× to relevance must also render Uncertain — never a silent inflate); and **budget the doubt** (cap visible "?"s, aggregate the tail — "…and 3 possibly-related items"). The render contract is `{ display_name, canonical_id?, confidence_band, evidence, avatar_ref? (authoritative-only) }` — the §10.2 reason-record reshaped, so it is free.
 
 ---
 
@@ -451,6 +484,7 @@ Hotspots, by risk:
 
 1. **Per-subscriber generation fan-out** is the real scaling axis (public grouping/rollups are shared/amortized; linking + scoring are per subscriber per cadence). Keep it cheap: cluster rollups are precomputed once per cluster; the per-subscriber candidate set is a **blocking-seeded** index lookup over clusters (`cluster_entities` GIN + `cluster_candidates`), *not* a scan of all public clusters; linking over that bounded set is union-find; only relevance and priority are per-user. Embarrassingly parallel over `SKIP LOCKED` job rows, bucketed by cadence + timezone.
 2. **Linking** (per subscriber) — blocking bounds the candidate set to the subscriber's interests + cross-boundary key matches; v1 unnests rolled-up `entities` (`GIN`), scaling to a normalized `cluster_signal` self-join; embed clusters not events; ANN top-k if embeddings arrive. If per-subscriber linking ever dominates, the lever is the **shared public-story cache** (memoize pure-public stories once).
+   - **Threads add nothing asymptotic to the fire path** *(deferred, §8.6)*. Thread-aware relevance is the *same* unnest-and-sum already done for affinity (richer weights, identical op); story→thread assignment reuses the `cluster_entities` GIN blocking pattern (bounded); corroboration/novelty are O(1) cached reads. All genuine work — identity resolution, community detection, decay, weight projection — lives in the new **`thread_maintenance`** job: per-subscriber, bounded by the (small) entity graph, best-effort, coalescing, **off the punctual path** (the `public-build` "fall behind, never wrong" contract). Reserve levers: a **shared public co-occurrence baseline** (public entity graph is identical across subscribers) and the `relevance_weight` table split-trigger.
 3. **Event growth** — v1 leaves `event` unpartitioned (comfortable into the millions of rows). Deferred lever: range-partition by `ingest_time` + BRIN index + partition pruning. Raw payloads are TOASTed out-of-line, so they don't bloat hot scans; offloading to object storage (`raw_ref`) is a later move.
 4. **Hydration I/O** — batch per source API, parallelize per connection, respect backoff.
 5. **Webhook catcher** — verify, enqueue a job, return; never block on downstream.
@@ -491,8 +525,9 @@ Hotspots, by risk:
 - Two-context row-level security + KMS-backed credential storage + SSRF-guarded fetching.
 
 **Defer (designed-for, with split-triggers in §6):**
+- **The Thread layer & tiered identity** (`digest-thread-layer.md`) — per-subscriber `Thread`s (§8.6) + the probabilistic `entity_edge` identity graph (§8.7) + confidence-as-rendered-signal (§10.4). Lands after linking + relevance (M3/M4); one new background job (`thread_maintenance`), no fire-path cost (§11).
 - `confidence` + forward-looking/prospective events (future-valued `event_time`, signed-gap salience curve) + `velocity`.
-- Embedding/ANN semantic linking (`vector` column + HNSW).
+- Embedding/ANN semantic linking (`vector` column + HNSW) — also an additive `entity_edge` source for identity (§8.7).
 - **Shared public-story cache** — memoize pure-public stories across subscribers (promote the shareable slice of projection into materialization — §3.0).
 - Real-time in-app feed.
 - Teams / shared scopes.
@@ -550,3 +585,4 @@ Engagement is a *private-scope* feature.
 - Initial weight/threshold values and the eval harness that uses the feedback log.
 - Email rendering: how much content in the body vs behind the authenticated link.
 - The B→A trigger: at what per-subscriber-linking cost (or when embeddings land) to add the shared public-story cache.
+- **Thread layer & tiered identity** (`digest-thread-layer.md` §10): community-detection choice (LPA vs Louvain) + the story→thread overlap `k`; per-edge-source `θ` and the confidence-band thresholds; dormancy/archive horizons + affinity decay; single-primary `thread_id` vs a `story_thread` join; cold-start bootstrap; the visible-doubt budget per digest; where the shared public co-occurrence baseline is amortized.

@@ -269,9 +269,17 @@ data is already provably RLS-confined since M2.)
   **Hacker News** + the broad RSS layer, **package registries** filtered against the user's manifests.
 
 **Other deferred-by-design upgrades** (each schema-additive, with split-triggers in design §6):
-embedding/ANN linking, the shared public-story cache, teams/shared scopes, learned scoring, LLM
-summarization, the entropy/variety budget, engagement ("already dealt-with") suppression, event
-partitioning + normalized signal tables, object-storage raw offload, multi-channel delivery.
+the **Thread layer & tiered identity** (`digest-thread-layer.md` — depends on M3 linking + M4 relevance;
+its own phased plan; one new background job `thread_maintenance`, no fire-path cost), embedding/ANN
+linking, the shared public-story cache, teams/shared scopes, learned scoring, LLM summarization, the
+entropy/variety budget, engagement ("already dealt-with") suppression, event partitioning + normalized
+signal tables, object-storage raw offload, multi-channel delivery.
+
+> **Note (2026-06-14):** the design docs gained a deferred **Thread layer & tiered identity**
+> (`digest-thread-layer.md`; design §8.6–§8.7, §10.4) — the persistent per-subscriber `Thread` weave,
+> probabilistic `entity_edge` identity, and confidence-as-rendered-signal. It sequences *after* M3/M4
+> (it builds on linking + relevance) and is itself phased (identity → threads-shadow → thread-weighted
+> relevance → assignment/render → thread feedback). Milestone sequencing M1–M6 is otherwise unchanged.
 
 ---
 
@@ -319,3 +327,5 @@ attaches to the milestone that surfaces them:
 - `relevance_floor` / richness threshold / caps tuning, `content_kind` taxonomy per source → **M4**.
 - Crate-graph names & granularity → revisit end of **M2** once real dependencies exist.
 - Data lifecycle / GDPR delete cascade, KPI definitions + eval harness over the feedback log → **M5**.
+- Thread-layer & identity tuning (community detection, edge `θ`/confidence bands, dormancy/decay,
+  cold-start) → its own phased rollout **after M3/M4** (`digest-thread-layer.md` §9–§10).

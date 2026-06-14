@@ -32,6 +32,17 @@ Note are small but highly relevant. They represent events that do not warrant a 
 
 Notes are rendered in a compact format with one or two sentences max.
 
+## `Thread` *(designed; deferred — see `digest-thread-layer.md`)*
+
+Where a `Story` weaves sources together at one *moment*, a `Thread` weaves *stories together across
+time*: the persistent threads of a user's life (a project running for months, an on-call rotation, a
+relationship). Threads are durable, per-subscriber state — the system's *memory* — so relevance becomes
+"does this advance a thread you've invested in?" rather than keyword matching. They are formed in a
+background job (`thread_maintenance`) off the digest hot path, fed by a **tiered identity** layer that
+resolves entities probabilistically (exact ids as a certain backbone; graded, revisable matches above)
+and carries a **confidence** that is rendered to the user — a guaranteed person shows their avatar, an
+uncertain one a question mark that doubles as the "is this the same?" correction control.
+
 # Deployment (NixOS)
 
 Bulletin ships a flake `package`, an `overlay`, and a `nixosModule`. Your server's own
