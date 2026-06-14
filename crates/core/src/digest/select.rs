@@ -32,6 +32,7 @@ use uuid::Uuid;
 
 use crate::common::kind::ContentKind;
 use crate::identity::CanonicalId;
+use crate::link::LinkedStory;
 
 /// Story (rich, multi-faceted) vs Note (atomic, thin) — a **rendering** classification from the
 /// candidate's richness, not importance (design §8.4: a high-priority Note can sit above a
@@ -77,6 +78,10 @@ pub struct ScoringConfig {
     pub severity_weight: f32,
     /// Priority halves every this-many days of age (recency decay at read time).
     pub recency_half_life_days: f64,
+    /// The **thread** relevance term ages on a slower cadence than recency — it halves every
+    /// this-many days (typically ≫ `recency_half_life_days`), so a story you've invested a thread in
+    /// stays promoted for weeks but still eventually fades (design §8.3 + §9.4).
+    pub thread_half_life_days: f64,
     /// Max Stories rendered (design §8.4: ~3–5).
     pub story_cap: usize,
     /// Max Notes rendered (~15–25).
@@ -94,6 +99,7 @@ impl Default for ScoringConfig {
             scope_bonus: 0.5,
             severity_weight: 0.1,
             recency_half_life_days: 3.0,
+            thread_half_life_days: 21.0,
             story_cap: 5,
             note_cap: 20,
             resurface_penalty: 0.25,
@@ -160,8 +166,7 @@ pub struct Candidate {
 
 impl Candidate {
     /// A candidate with no thread relevance yet and neutral rollups — the simple `(id, time,
-    /// entities)` shape for tests. The digest flow builds the full struct (with the story's rollups)
-    /// directly.
+    /// entities)` shape for tests.
     pub fn new(id: Uuid, last_event_time: DateTime<Utc>, entities: Vec<CanonicalId>) -> Self {
         Candidate {
             id,
@@ -174,6 +179,28 @@ impl Candidate {
             max_severity: None,
             has_private: false,
             last_shown: None,
+        }
+    }
+
+    /// Build a candidate from a linked story's precomputed rollups + its resolved entity spine and
+    /// last-shown snapshot — the digest flow's mapping, in one place so adding a scoring feature
+    /// touches a single site. `relevance` is `0` until [`apply_thread_weights`] fills the thread term.
+    pub fn from_story(
+        story: &LinkedStory,
+        entities: Vec<CanonicalId>,
+        last_shown: Option<Shown>,
+    ) -> Self {
+        Candidate {
+            id: story.id,
+            last_event_time: story.last_event_time,
+            entities,
+            relevance: 0.0,
+            event_count: story.event_count,
+            source_diversity: story.source_diversity,
+            content_depth: story.content_depth,
+            max_severity: story.max_severity,
+            has_private: story.has_private,
+            last_shown,
         }
     }
 }
@@ -258,11 +285,19 @@ fn relevance(c: &Candidate, cfg: &ScoringConfig) -> f32 {
 }
 
 /// Priority — relevance-led, boosted by `max_severity`, aged by recency decay at read time
-/// (design §8.3).
+/// (design §8.3). The recency-bound part (base relevance + scope bonus + severity) decays on the
+/// recency half-life; the **thread** term (`c.relevance`) decays on the slower `thread_half_life_days`
+/// so an invested thread stays promoted for weeks yet still eventually ages out (§9.4). With no thread
+/// term this is exactly the single-decay form (`relevance × recency_decay`).
 fn priority(c: &Candidate, relevance: f32, cfg: &ScoringConfig, now: DateTime<Utc>) -> f32 {
     let sev = c.max_severity.unwrap_or(0) as f32;
-    let decay = recency_decay(now, c.last_event_time, cfg.recency_half_life_days) as f32;
-    (relevance + cfg.severity_weight * sev) * decay
+    let recency = recency_decay(now, c.last_event_time, cfg.recency_half_life_days) as f32;
+    let thread_decay = recency_decay(now, c.last_event_time, cfg.thread_half_life_days) as f32;
+    // `relevance` = base + scope_bonus + thread term; split the thread term back out so it can age on
+    // its own slower cadence.
+    let thread = c.relevance;
+    let recency_bound = relevance - thread + cfg.severity_weight * sev;
+    recency_bound * recency + thread * thread_decay
 }
 
 /// Richness → render format + a human phrase (design §8.4). Story when multi-source, multi-event, or a
@@ -301,9 +336,14 @@ struct Gated {
 /// Story/Note, cap each format, and order the result by global priority (format ≠ importance). Returns
 /// a [`Decision`] for **every** candidate — selected (by render position), then over-cap (by rank),
 /// then dropped — so the trace is complete. `now` is injected (no ambient clock), keeping it pure.
+///
+/// `max_items` is the subscriber's overall ceiling, applied *on top of* the per-format caps: a digest
+/// never renders more than `min(max_items, story_cap + note_cap)` items, the lowest-priority overflow
+/// falling to `OverCap`.
 pub fn select(
     candidates: Vec<Candidate>,
     cfg: &ScoringConfig,
+    max_items: usize,
     now: DateTime<Utc>,
 ) -> Vec<Decision> {
     // 1. Gate. Dropped candidates get a terminal Decision now; the rest carry forward to ranking.
@@ -366,9 +406,10 @@ pub fn select(
             .then(a.id.cmp(&b.id))
     });
 
-    // 3. Cap per format, assigning render positions in the global priority order (Stories and Notes
-    //    interleave by priority). A Note is never dropped *for being a Note* — only for losing the
-    //    Note cap race; same for Stories.
+    // 3. Cap per format AND by the subscriber's overall `max_items`, assigning render positions in the
+    //    global priority order (Stories and Notes interleave by priority). A Note is never dropped
+    //    *for being a Note* — only for losing the Note cap race; same for Stories. `position` doubles
+    //    as the count of items selected so far, so it enforces the overall ceiling.
     let (mut stories, mut notes, mut position) = (0usize, 0usize, 0usize);
     let mut selected: Vec<Decision> = Vec::new();
     let mut over_cap: Vec<Decision> = Vec::new();
@@ -377,7 +418,7 @@ pub fn select(
             Format::Story => (&mut stories, cfg.story_cap),
             Format::Note => (&mut notes, cfg.note_cap),
         };
-        let verdict = if *count < cap {
+        let verdict = if *count < cap && position < max_items {
             *count += 1;
             let pos = position;
             position += 1;
@@ -463,7 +504,7 @@ mod tests {
             last_event_time: at(100),
             format: Format::Story,
         });
-        let out = select(vec![c], &cfg, at(100));
+        let out = select(vec![c], &cfg, 1000, at(100));
         assert_eq!(out[0].format, Format::Note);
         assert_eq!(out[0].richness, "still developing");
     }
@@ -478,7 +519,7 @@ mod tests {
             last_event_time: at(100),
             format: Format::Story,
         });
-        let out = select(vec![c], &cfg, at(100));
+        let out = select(vec![c], &cfg, 1000, at(100));
         assert_eq!(
             out[0].format,
             Format::Note,
@@ -499,7 +540,7 @@ mod tests {
             last_event_time: at(100),
             format: Format::Story,
         });
-        let out = select(vec![c], &cfg, at(200));
+        let out = select(vec![c], &cfg, 1000, at(200));
         assert_eq!(out[0].format, Format::Story);
         assert_ne!(out[0].richness, "still developing");
     }
@@ -513,7 +554,7 @@ mod tests {
             last_event_time: at(100),
             format: Format::Note, // last shown as a Note, no new events
         });
-        let out = select(vec![c], &cfg, at(100));
+        let out = select(vec![c], &cfg, 1000, at(100));
         assert_eq!(out[0].format, Format::Story);
         assert_ne!(out[0].richness, "still developing");
     }
@@ -527,7 +568,7 @@ mod tests {
             format: Format::Story,
         });
         let fresh = story(2, 100); // same recency, never shown
-        let out = select(vec![stale, fresh], &cfg, at(100));
+        let out = select(vec![stale, fresh], &cfg, 1000, at(100));
         // The fresh Story out-ranks the damped "still developing" note.
         assert_eq!(out[0].id, Uuid::from_u128(2));
         assert_eq!(out[0].format, Format::Story);
@@ -542,7 +583,7 @@ mod tests {
         let bare = story(1, 100);
         let mut private = story(2, 100);
         private.has_private = true;
-        let out = select(vec![bare, private], &cfg, at(100));
+        let out = select(vec![bare, private], &cfg, 1000, at(100));
         assert_eq!(selected_ids(&out), vec![Uuid::from_u128(2)]);
         let dropped = out.iter().find(|d| d.id == Uuid::from_u128(1)).unwrap();
         assert!(matches!(
@@ -559,7 +600,7 @@ mod tests {
         let cfg = ScoringConfig::default();
         let mut c = story(1, 100);
         c.relevance = -1.5;
-        let out = select(vec![c], &cfg, at(100));
+        let out = select(vec![c], &cfg, 1000, at(100));
         assert!(matches!(out[0].verdict, Verdict::Dropped { .. }));
     }
 
@@ -568,7 +609,7 @@ mod tests {
         let cfg = ScoringConfig::default();
         let older = story(1, 0);
         let newer = story(2, 10 * 86_400);
-        let out = select(vec![older, newer], &cfg, at(10 * 86_400));
+        let out = select(vec![older, newer], &cfg, 1000, at(10 * 86_400));
         assert_eq!(out[0].id, Uuid::from_u128(2));
     }
 
@@ -583,7 +624,7 @@ mod tests {
         let mut invested = story(1, 100);
         invested.relevance = 5.0;
         let fresher = story(2, 300);
-        let out = select(vec![invested, fresher], &cfg, at(300));
+        let out = select(vec![invested, fresher], &cfg, 1000, at(300));
         assert_eq!(selected_ids(&out), vec![Uuid::from_u128(1)]);
     }
 
@@ -610,6 +651,7 @@ mod tests {
                 mk(4, 70, true),   // Note (over the note cap)
             ],
             &cfg,
+            1000,
             at(1000),
         );
         let sel = selected_ids(&out);
@@ -624,13 +666,65 @@ mod tests {
     }
 
     #[test]
+    fn max_items_caps_the_total_below_the_per_format_caps() {
+        // Per-format caps are generous (5/20), but the subscriber's overall ceiling is 2 → only the
+        // top-2-by-priority select, the rest fall to OverCap.
+        let cfg = ScoringConfig::default();
+        let out = select(
+            vec![story(1, 400), story(2, 300), story(3, 200), story(4, 100)],
+            &cfg,
+            2,
+            at(400),
+        );
+        assert_eq!(
+            selected_ids(&out),
+            vec![Uuid::from_u128(1), Uuid::from_u128(2)]
+        );
+        assert_eq!(
+            out.iter()
+                .filter(|d| matches!(d.verdict, Verdict::OverCap { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn thread_term_ages_out_but_slower_than_recency() {
+        // At 10 days old an invested story would lose to a fresh trivial one under a single decay, but
+        // the slower thread half-life keeps it promoted; pushed far enough out it still ages away.
+        let cfg = ScoringConfig::default();
+        let invested = |secs| {
+            let mut c = story(1, secs);
+            c.relevance = 4.0; // a strong thread term
+            c
+        };
+        let ten_days = 10 * 86_400;
+        let now = at(ten_days);
+        let out = select(vec![invested(0), story(2, ten_days)], &cfg, 1, now);
+        assert_eq!(
+            selected_ids(&out),
+            vec![Uuid::from_u128(1)],
+            "the invested story stays promoted at 10 days"
+        );
+
+        // 90 days on, the thread term has decayed away and the fresh story wins.
+        let ninety = 90 * 86_400;
+        let out = select(vec![invested(0), story(2, ninety)], &cfg, 1, at(ninety));
+        assert_eq!(
+            selected_ids(&out),
+            vec![Uuid::from_u128(2)],
+            "eventually it ages out"
+        );
+    }
+
+    #[test]
     fn high_priority_note_outranks_a_story() {
         // A fresh Note vs a stale Story: format ≠ importance, the Note renders first.
         let cfg = ScoringConfig::default();
         let mut note = story(1, 100 * 86_400);
         note.content_depth = ContentKind::Announcement;
         let stale_story = story(2, 0);
-        let out = select(vec![stale_story, note], &cfg, at(100 * 86_400));
+        let out = select(vec![stale_story, note], &cfg, 1000, at(100 * 86_400));
         assert_eq!(out[0].id, Uuid::from_u128(1));
         assert_eq!(out[0].format, Format::Note);
     }
@@ -663,7 +757,7 @@ mod tests {
             let cands: Vec<Candidate> = specs.into_iter().filter(|c| seen.insert(c.id)).collect();
             let n = cands.len();
             let cfg = ScoringConfig { story_cap, note_cap, ..Default::default() };
-            let out = select(cands, &cfg, at(1000));
+            let out = select(cands, &cfg, 1000, at(1000));
 
             prop_assert_eq!(out.len(), n);
             let mut ids: Vec<Uuid> = out.iter().map(|d| d.id).collect();
@@ -690,7 +784,7 @@ mod tests {
                 .collect();
             let n = cands.len();
             let cfg = ScoringConfig { story_cap: 1000, note_cap: 1000, ..Default::default() };
-            let out = select(cands, &cfg, at(1000));
+            let out = select(cands, &cfg, 1000, at(1000));
             let sel: Vec<_> = out.iter().filter(|d| matches!(d.verdict, Verdict::Selected { .. })).collect();
             prop_assert_eq!(sel.len(), n, "0 floor admits everything");
             for w in sel.windows(2) {

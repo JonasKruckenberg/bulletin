@@ -177,12 +177,7 @@ async fn select_stories(
         .iter()
         .map(|s| Candidate::new(s.id, s.last_event_time, Vec::new()))
         .collect();
-    let cfg = ScoringConfig {
-        story_cap: max_items,
-        note_cap: max_items,
-        ..Default::default()
-    };
-    select(candidates, &cfg, Utc::now())
+    select(candidates, &ScoringConfig::default(), max_items, Utc::now())
         .into_iter()
         .filter(|d| matches!(d.verdict, Verdict::Selected { .. }))
         .map(|d| FrozenItem {
@@ -234,7 +229,7 @@ async fn build_groups_events_into_clusters() {
         story_cap: 2,
         ..Default::default()
     };
-    let selected = select(cands, &cfg, Utc::now())
+    let selected = select(cands, &cfg, 1000, Utc::now())
         .into_iter()
         .filter(|d| matches!(d.verdict, Verdict::Selected { .. }))
         .count();
@@ -1147,20 +1142,9 @@ async fn scoring_classifies_story_and_note() {
     let cands: Vec<Candidate> = assignment
         .stories
         .iter()
-        .map(|s| Candidate {
-            id: s.id,
-            last_event_time: s.last_event_time,
-            entities: Vec::new(),
-            relevance: 0.0,
-            event_count: s.event_count,
-            source_diversity: s.source_diversity,
-            content_depth: s.content_depth,
-            max_severity: s.max_severity,
-            has_private: s.has_private,
-            last_shown: None,
-        })
+        .map(|s| Candidate::from_story(s, Vec::new(), None))
         .collect();
-    let decisions = select(cands, &ScoringConfig::default(), Utc::now());
+    let decisions = select(cands, &ScoringConfig::default(), 1000, Utc::now());
 
     let sel_fmt = |f: Format| {
         decisions
@@ -1202,26 +1186,16 @@ async fn resurface_without_new_events_fades_to_note() {
     // Second window, a day later, with no new events: the snapshot is read back and the story is
     // damped to a "still developing" Note.
     let w2 = w1 + Duration::days(1);
-    let shown = last_shown(&mut pool.acquire().await.unwrap(), sub, w2)
+    let shown = last_shown(&mut pool.acquire().await.unwrap(), sub, w2, 30)
         .await
         .unwrap();
     assert!(
         shown.contains_key(&story.id),
         "the prior digest is the snapshot"
     );
-    let cand = Candidate {
-        id: story.id,
-        last_event_time: story.last_event_time, // unchanged → no new events
-        entities: Vec::new(),
-        relevance: 0.0,
-        event_count: story.event_count,
-        source_diversity: story.source_diversity,
-        content_depth: story.content_depth,
-        max_severity: story.max_severity,
-        has_private: story.has_private,
-        last_shown: shown.get(&story.id).copied(),
-    };
-    let decisions = select(vec![cand], &ScoringConfig::default(), Utc::now());
+    // last_event_time unchanged → no new events since shown.
+    let cand = Candidate::from_story(&story, Vec::new(), shown.get(&story.id).copied());
+    let decisions = select(vec![cand], &ScoringConfig::default(), 1000, Utc::now());
     assert_eq!(decisions[0].format, Format::Note);
     assert_eq!(decisions[0].richness, "still developing");
 }

@@ -14,7 +14,7 @@ use uuid::Uuid;
 pub async fn load_config(pool: &PgPool) -> Result<ScoringConfig, sqlx::Error> {
     let row = sqlx::query(
         "SELECT relevance_floor, scope_bonus, severity_weight, recency_half_life_days,
-                story_cap, note_cap, resurface_penalty
+                thread_half_life_days, story_cap, note_cap, resurface_penalty
          FROM digest_config WHERE id = true",
     )
     .fetch_one(pool)
@@ -24,6 +24,7 @@ pub async fn load_config(pool: &PgPool) -> Result<ScoringConfig, sqlx::Error> {
         scope_bonus: row.get::<f64, _>("scope_bonus") as f32,
         severity_weight: row.get::<f64, _>("severity_weight") as f32,
         recency_half_life_days: row.get("recency_half_life_days"),
+        thread_half_life_days: row.get("thread_half_life_days"),
         story_cap: row.get::<i32, _>("story_cap") as usize,
         note_cap: row.get::<i32, _>("note_cap") as usize,
         resurface_penalty: row.get::<f64, _>("resurface_penalty") as f32,
@@ -39,25 +40,35 @@ pub struct FrozenItem {
 }
 
 /// Per story, the snapshot of how it was last shown to this subscriber — the most recent prior
-/// `digest_item` strictly *before* `window_end` (so the digest being built doesn't shadow itself on
-/// an idempotent re-run). Feeds the re-surface suppression in selection (design §9.4). Runs in the
-/// subscriber's RLS context (digest/digest_item are fenced to their owner).
+/// `digest_item` in the half-open window `[window_end − horizon, window_end)` (strictly *before*
+/// `window_end` so an idempotent re-run doesn't shadow itself; bounded *below* by `horizon_days` so
+/// the scan stays small and matches the candidate lookback — a story unseen for longer than the
+/// horizon has aged out of the candidate set anyway). Feeds the re-surface suppression in selection
+/// (design §9.4). Runs in the subscriber's RLS context (digest/digest_item are fenced to their owner).
+///
+/// `story_last_event_time IS NOT NULL AND format IS NOT NULL` also skips pre-M4 `digest_item` rows
+/// (added before migration 024 had the snapshot columns): such a story isn't damped on its first
+/// post-migration re-fire, then self-heals once it's been frozen with a snapshot — a one-cycle grace.
 pub async fn last_shown(
     conn: &mut PgConnection,
     subscriber_id: Uuid,
     window_end: DateTime<Utc>,
+    horizon_days: i32,
 ) -> Result<HashMap<Uuid, Shown>, sqlx::Error> {
     sqlx::query(
         "SELECT DISTINCT ON (di.story_id)
                 di.story_id, di.story_last_event_time, di.format
          FROM digest_item di
          JOIN digest d ON d.id = di.digest_id
-         WHERE d.subscriber_id = $1 AND d.window_end < $2
+         WHERE d.subscriber_id = $1
+           AND d.window_end < $2
+           AND d.window_end >= $2 - make_interval(days => $3)
            AND di.story_last_event_time IS NOT NULL AND di.format IS NOT NULL
          ORDER BY di.story_id, d.window_end DESC",
     )
     .bind(subscriber_id)
     .bind(window_end)
+    .bind(horizon_days)
     .try_map(|row: PgRow| {
         let format = Format::try_from(row.get::<String, _>("format").as_str())
             .map_err(|e| sqlx::Error::Decode(e.into()))?;

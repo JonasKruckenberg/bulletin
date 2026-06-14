@@ -88,7 +88,7 @@ async fn link_and_select(
             let prior = link::store::load_prior_members(&mut *conn, sub_id)
                 .await
                 .context("load prior story assignment")?;
-            let shown = last_shown(&mut *conn, sub_id, shown_before)
+            let shown = last_shown(&mut *conn, sub_id, shown_before, CONTEXT_HORIZON_DAYS)
                 .await
                 .context("load last-shown snapshots")?;
             Ok((clusters, prior, shown))
@@ -120,27 +120,17 @@ async fn link_and_select(
     let mut candidates: Vec<Candidate> = assignment
         .stories
         .iter()
-        .map(|s| Candidate {
-            id: s.id,
-            last_event_time: s.last_event_time,
-            entities: story_entities[&s.id].clone(),
-            relevance: 0.0,
-            event_count: s.event_count,
-            source_diversity: s.source_diversity,
-            content_depth: s.content_depth,
-            max_severity: s.max_severity,
-            has_private: s.has_private,
-            last_shown: shown.get(&s.id).copied(),
-        })
+        .map(|s| Candidate::from_story(s, story_entities[&s.id].clone(), shown.get(&s.id).copied()))
         .collect();
     // Add the Thread relevance term before ranking (compiled out when the feature is off; a no-op
     // until thread_maintenance has projected weights) — it folds into the M4 relevance score.
     apply_weighting(pool, sub.id, &mut candidates).await?;
     // M4 scoring + selection (design §8.4): relevance gates, richness classifies Story/Note, priority
-    // (relevance + severity, recency-decayed) orders + per-format caps. `now` is read-time so the
-    // decay reflects when the digest fires; config is the global `digest_config` row.
+    // (relevance + severity, recency-decayed) orders + per-format caps, bounded by the subscriber's
+    // overall `max_items`. `now` is read-time so the decay reflects when the digest fires; config is
+    // the global `digest_config` row.
     let cfg = load_config(pool).await.context("load scoring config")?;
-    let decisions = select(candidates, &cfg, Utc::now());
+    let decisions = select(candidates, &cfg, sub.max_items as usize, Utc::now());
     Ok((assignment.stories, decisions, story_entities))
 }
 

@@ -24,6 +24,9 @@ CREATE TABLE digest_config (
     -- Priority recency decay: a story's priority halves every this-many days of age at read time
     -- (design §8.3 "aged by recency decay over now − last_event_time").
     recency_half_life_days double precision NOT NULL DEFAULT 3,
+    -- The thread relevance term ages on a slower cadence than recency (halves every this-many days),
+    -- so a story you've invested a thread in stays promoted for weeks but still eventually fades.
+    thread_half_life_days  double precision NOT NULL DEFAULT 21,
     -- Per-format caps (design §8.4): Stories ~3–5, Notes ~15–25. A Note is never dropped for being a
     -- Note, only for losing the priority race within its own cap.
     story_cap              integer NOT NULL DEFAULT 5,
