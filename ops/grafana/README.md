@@ -15,7 +15,8 @@ datasource (the dashboard exposes a `datasource` variable, so it isn't pinned to
 - **Jobs** — throughput, outcomes, duration p50/p95/p99 (real histogram quantiles), retries.
 - **Queue / backlog** — depth, oldest-pending age (the real "stuck worker" signal), failures,
   unbuilt events.
-- **Ingestion** — ingest rate, dedup ratio, poll failures, time-since-last-ingest.
+- **Ingestion** — ingest rate (split by `intake`: poll backstop vs realtime webhook), dedup ratio,
+  poll failures, time-since-last-ingest.
 - **Digests / delivery** — outcomes, items per digest, pending, time-since-last-delivery,
   cadence mix.
 
