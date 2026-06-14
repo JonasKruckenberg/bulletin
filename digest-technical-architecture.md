@@ -11,6 +11,12 @@ testing, reproducibility, security mechanisms).
 and the **`Connector`/`Connection` two-layer trait family** are DECIDED (§5.2–5.4); reason records +
 the pure selection function are next (§5.5).
 
+**Deferred layer (designed 2026-06-14 — product §8.6–§8.7, §10.4; full design `digest-thread-layer.md`):**
+a fourth content-graph phase **`Thread`** (the persistent per-subscriber weave) fed by **tiered
+probabilistic identity** (`entity_edge` graph) with **confidence as a rendered signal**. Adds one
+write-side job, **`thread_maintenance`** (off the punctual path), and is schema-additive. Lands after
+linking + relevance; modeled here only as forward-compatibility notes (§5.3, §5.5, §10).
+
 All library versions below are research snapshots as of **2026-06** — treat as "latest known
 good," re-verify before locking `Cargo.toml`.
 
@@ -114,6 +120,10 @@ Key properties:
   the processing jobs (domain logic); the cron singleton/leader concern (solved by `unique-jobs`).
 - **Job queue:** the work queue (product doc §6) uses the **apalis-managed schema** — same
   `FOR UPDATE SKIP LOCKED` semantics, library-owned.
+- **Deferred job kind:** the Thread layer adds **`thread_maintenance`** (per-subscriber, relaxed
+  cadence: enqueued post-`GenerateDigest` + a nightly sweep, `unique-jobs` key = `subscriber_id`,
+  coalescing). Write-side, best-effort, **off the punctual path** — it never blocks a fire; projection
+  only reads the weights/threads it produced (product §8.6, `digest-thread-layer.md` §5).
 
 ### Durable execution / Temporal  *(DECIDED — defer)*
 
@@ -394,7 +404,9 @@ may render as hex `text` instead if psql-debuggability beats index size.
 Three phases: **`Event`** (deduplicated) → **`Cluster`** (grouped within one source) → **`Story`**
 (linked across sources). **Grouping** (events→clusters) is deterministic; **linking** (clusters→story)
 is **per-subscriber** (product §4/§8.2). The product doc's self-referential `cluster` (`parent_id`) is
-gone; so is a single shared story object.
+gone; so is a single shared story object. *(Deferred 4th phase — `Thread`: the persistent per-subscriber
+weave over many stories across time, plus a `canonical_entities` field on `Cluster`/`Story` from tiered
+identity resolution. Types sketched in `digest-thread-layer.md` §8; product §8.6–§8.7. All additive.)*
 
 **Clusters are a recomputed batch artifact (materialization side); stories are the per-subscriber read-model, rebuilt at fire time from a snapshot of the cluster caches (projection side).**
 - `PublicBuild` recomputes **public** cluster rollups as public events arrive (shared, amortized; decoupled from generate).
@@ -555,6 +567,13 @@ installation token; Slack: bot token, or 12h access + single-use refresh if rota
   product). `now` is injected (§6 Reliability), never ambient.
 - **Per-subscriber linking** — connected-components over the candidate-cluster edge graph + the
   id-forwarding/`merged_into` rule (product §8.2). Pure over `(clusters, edges, prior assignment)`.
+- **Deferred — Thread layer & tiered identity** (`digest-thread-layer.md` §8): `Thread` +
+  `ConfidenceBand { Confirmed, Probable, Uncertain }` + the `entity_edge` graph; the `thread_maintenance`
+  job logic (identity resolution → community detection → id-forwarding → state/decay → weight
+  projection) is pure over `(entity_edges, prior threads, feedback, now)` and reuses the §8.2
+  connected-components/`merged_into` machinery one level up. The render contract
+  `{ display_name, canonical_id?, confidence_band, evidence, avatar_ref? }` is the reason-record (above)
+  reshaped for the frontend (frontend itself is out of this design track — §1).
 
 ---
 
@@ -741,3 +760,9 @@ Proposed sequence (next-up first):
     as a priority modulator + cached rollup. Re-adds without schema rework.
 13. **Data lifecycle/retention** — inline raw-payload horizon (`event.raw`, TOASTed; object-storage
     offload via `raw_ref` deferred), GDPR per-subscriber deletion cascading to `raw` + reasons.
+14. **Deferred — Thread layer & tiered identity** (sequences after linking/relevance; `digest-thread-layer.md`):
+    the `thread`/`entity_edge` schema + the `thread_maintenance` job (community detection w/ LPA-vs-Louvain
+    choice, id-forwarding, dormancy/decay, weight projection); the pure resolution + thread-formation
+    functions (proptest determinism + id-stability, like linking); `ConfidenceBand` + the render contract;
+    GDPR delete must also cascade to `thread`/`entity_edge`. RLS: `thread_maintenance` runs in the
+    subscriber context (no new cross-tenant path).
