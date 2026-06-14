@@ -25,6 +25,67 @@ pub struct Batch<I, C> {
     pub cursor: C,
 }
 
+/// The poll interval (seconds) a new connection takes when the caller leaves it unset.
+pub const DEFAULT_POLL_INTERVAL_SECS: i64 = 900;
+
+/// Validated inputs for [`store::insert_connection`], produced by [`prepare_connection`].
+pub struct NewConnection {
+    pub source: SourceKind,
+    pub config: serde_json::Value,
+    pub poll_interval_secs: i64,
+    pub owner: Option<Uuid>,
+    pub provider_account_id: Option<String>,
+}
+
+/// Validate + normalize the inputs for a new connection — the single place the CLI
+/// (`debug connection-add`) and the gRPC admin API agree on what a valid connection is, so the rules
+/// can't drift between them. Centralizes: the source vocabulary, the private-source-must-be-owned
+/// guard (mirrors the `connection_private_source_owned` DB CHECK), and the GitHub `installation_id` →
+/// `provider_account_id` webhook routing key (the IDOR boundary — derived from our own config, never a
+/// delivery payload). Returns a human-readable message on invalid input; the caller maps it to its own
+/// error type (`anyhow` for the CLI, `Status::invalid_argument` for the API).
+pub fn prepare_connection(
+    source: &str,
+    config_json: &str,
+    poll_interval_secs: i64,
+    owner: Option<Uuid>,
+) -> Result<NewConnection, String> {
+    let source = SourceKind::try_from(source)
+        .map_err(|_| format!("unknown source '{source}'; valid: rss, github, slack"))?;
+    if source.can_emit_private() && owner.is_none() {
+        return Err(format!(
+            "a {} connection can see private content and must be owned — provide an owner",
+            source.as_str()
+        ));
+    }
+    let config: serde_json::Value =
+        serde_json::from_str(config_json).map_err(|e| format!("config is not valid JSON: {e}"))?;
+    // The webhook routing key, set at seed time so a content/lifecycle delivery resolves back to THIS
+    // row. Only GitHub has one today (the installation_id); a future private source needs its own here.
+    let provider_account_id = match source {
+        SourceKind::Github => Some(
+            config
+                .get("installation_id")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| "a github config needs an integer \"installation_id\"".to_string())?
+                .to_string(),
+        ),
+        _ => None,
+    };
+    let poll_interval_secs = if poll_interval_secs > 0 {
+        poll_interval_secs
+    } else {
+        DEFAULT_POLL_INTERVAL_SECS
+    };
+    Ok(NewConnection {
+        source,
+        config,
+        poll_interval_secs,
+        owner,
+        provider_account_id,
+    })
+}
+
 #[derive(Debug)]
 pub enum SourceError {
     Request(String),

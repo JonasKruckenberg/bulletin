@@ -1,20 +1,31 @@
 //! Request authentication for the gRPC API. The first cut has one credential — the **admin bearer**
-//! — checked at the top of every admin-plane RPC. (Subscriber tokens, an async DB lookup, land with the
-//! subscriber plane in A2; the helper shape here generalizes to that.)
+//! — enforced by an interceptor over the whole `AdminService` (so a newly-added RPC can't ship
+//! unauthenticated by forgetting a per-handler check). (Subscriber tokens, an async DB lookup, land
+//! with the subscriber plane in A2; the `AuthState` seam generalizes to that.)
 //!
 //! The core store fns already self-scope to `ScopeCtx::Admin`, so auth's job is purely *authentication*
 //! — prove the caller may use the admin plane — not scope injection.
 
-use tonic::{metadata::MetadataMap, Status};
+use std::sync::Arc;
+
+use bulletin_core::secret::ct_eq;
+use tonic::{metadata::MetadataMap, Request, Status};
 
 pub struct AuthState {
-    /// The configured admin bearer. `None` = admin plane not configured → every admin RPC is rejected
-    /// (fail-closed), mirroring how the webhook catcher rejects deliveries without a secret.
+    /// The configured admin bearer (trimmed). `None`/empty = admin plane not configured → every admin
+    /// RPC is rejected (fail-closed), mirroring how the webhook catcher rejects deliveries without a
+    /// secret.
     admin_key: Option<String>,
 }
 
 impl AuthState {
     pub fn new(admin_key: Option<String>) -> Self {
+        // Trim both the configured key (here) and the presented token (in `bearer`) so a stray
+        // trailing newline — common when a key is sourced from a file/env — can't lock the plane out.
+        // An empty-after-trim key is treated as "not configured" (fail-closed), never a match.
+        let admin_key = admin_key
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty());
         Self { admin_key }
     }
 
@@ -26,7 +37,7 @@ impl AuthState {
             .as_deref()
             .ok_or_else(|| Status::unauthenticated("admin API is not configured"))?;
         let presented = bearer(md)?;
-        if constant_time_eq(presented.as_bytes(), configured.as_bytes()) {
+        if ct_eq(presented.as_bytes(), configured.as_bytes()) {
             Ok(())
         } else {
             Err(Status::unauthenticated("invalid admin credentials"))
@@ -34,7 +45,20 @@ impl AuthState {
     }
 }
 
-/// Extracts the `authorization: Bearer <token>` value from request metadata.
+/// A gRPC interceptor enforcing the admin bearer on every method of the service it wraps. Hoisting auth
+/// here — rather than a check at the top of each handler — means a newly-added RPC can't ship
+/// unauthenticated by omission, and gives the subscriber plane (A2) a single identity-resolution seam.
+pub fn admin_interceptor(
+    auth: Arc<AuthState>,
+) -> impl Clone + FnMut(Request<()>) -> Result<Request<()>, Status> {
+    move |req: Request<()>| {
+        auth.require_admin(req.metadata())?;
+        Ok(req)
+    }
+}
+
+/// Extracts the `authorization: Bearer <token>` value from request metadata (scheme case-insensitive,
+/// surrounding whitespace trimmed).
 fn bearer(md: &MetadataMap) -> Result<String, Status> {
     let raw = md
         .get("authorization")
@@ -45,19 +69,6 @@ fn bearer(md: &MetadataMap) -> Result<String, Status> {
         .or_else(|| raw.strip_prefix("bearer "))
         .map(|t| t.trim().to_string())
         .ok_or_else(|| Status::unauthenticated("authorization must be a Bearer token"))
-}
-
-/// Length-checked constant-time byte comparison. Leaking the *length* of a high-entropy key is
-/// harmless; leaking byte positions via early-exit is not.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 #[cfg(test)]
@@ -90,10 +101,16 @@ mod tests {
     }
 
     #[test]
-    fn require_admin_fails_closed_when_unconfigured() {
-        let auth = AuthState::new(None);
-        let err = auth.require_admin(&md_with_auth("Bearer anything")).unwrap_err();
-        assert_eq!(err.code(), Code::Unauthenticated);
+    fn require_admin_fails_closed_when_unconfigured_or_blank() {
+        for key in [None, Some(String::new()), Some("   ".to_string())] {
+            let auth = AuthState::new(key);
+            assert_eq!(
+                auth.require_admin(&md_with_auth("Bearer anything"))
+                    .unwrap_err()
+                    .code(),
+                Code::Unauthenticated
+            );
+        }
     }
 
     #[test]
@@ -101,7 +118,9 @@ mod tests {
         let auth = AuthState::new(Some("s3cret".to_string()));
         assert!(auth.require_admin(&md_with_auth("Bearer s3cret")).is_ok());
         assert_eq!(
-            auth.require_admin(&md_with_auth("Bearer nope")).unwrap_err().code(),
+            auth.require_admin(&md_with_auth("Bearer nope"))
+                .unwrap_err()
+                .code(),
             Code::Unauthenticated
         );
         assert_eq!(
@@ -111,9 +130,9 @@ mod tests {
     }
 
     #[test]
-    fn constant_time_eq_basics() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"ab")); // length mismatch
+    fn key_and_token_are_trimmed_consistently() {
+        // A key with surrounding whitespace still authenticates a (trimmed) presented token.
+        let auth = AuthState::new(Some(" s3cret \n".to_string()));
+        assert!(auth.require_admin(&md_with_auth("Bearer s3cret")).is_ok());
     }
 }

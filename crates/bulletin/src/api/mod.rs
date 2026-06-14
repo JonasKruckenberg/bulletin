@@ -27,7 +27,7 @@ pub mod proto {
         include_bytes!(concat!(env!("OUT_DIR"), "/bulletin_descriptor.bin"));
 }
 
-use auth::AuthState;
+use auth::{admin_interceptor, AuthState};
 use proto::admin_service_server::AdminServiceServer;
 
 /// Runs the gRPC API server until shutdown. `admin_key` authorizes the admin plane; without it every
@@ -40,7 +40,10 @@ pub async fn serve(addr: SocketAddr, pool: PgPool, admin_key: Option<String>) ->
         );
     }
     let auth = Arc::new(AuthState::new(admin_key));
-    let admin = admin::AdminApi::new(pool, auth);
+    // Auth is enforced by an interceptor over the whole AdminService (below), so the handlers
+    // themselves carry no per-RPC auth check — one chokepoint, no by-omission gap.
+    let admin =
+        AdminServiceServer::with_interceptor(admin::AdminApi::new(pool), admin_interceptor(auth));
 
     // gRPC server reflection (v1) so tooling can list services/methods over the wire.
     let reflection = tonic_reflection::server::Builder::configure()
@@ -56,7 +59,7 @@ pub async fn serve(addr: SocketAddr, pool: PgPool, admin_key: Option<String>) ->
 
     tracing::info!(%addr, "gRPC API listening");
     Server::builder()
-        .add_service(AdminServiceServer::new(admin))
+        .add_service(admin)
         .add_service(reflection)
         .add_service(health_service)
         .serve(addr)

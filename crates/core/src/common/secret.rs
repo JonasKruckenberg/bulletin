@@ -34,6 +34,21 @@ const ENVELOPE_VERSION: u8 = 1;
 /// bare tag. A shorter blob is structurally invalid (rejected before any crypto).
 const MIN_ENVELOPE_LEN: usize = 1 + NONCE_LEN + WRAPPED_DEK_LEN + NONCE_LEN + TAG_LEN;
 
+/// Constant-time byte-slice equality, for comparing a presented credential (an API bearer token, a
+/// key) against the expected one. Length-checked — leaking the *length* of a high-entropy secret is
+/// harmless, leaking byte positions via an early return is not. The one audited compare every
+/// credential check should route through, rather than hand-rolling its own.
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// What went wrong handling a secret. Deliberately coarse: a caller can't act on *why* a decrypt
 /// failed (and a precise reason would be an oracle), only that the material is unusable.
 #[derive(Debug)]

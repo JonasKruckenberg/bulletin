@@ -4,7 +4,7 @@
 
 use bulletin_core::common::event::Event;
 use bulletin_core::digest::store::DigestRow;
-use bulletin_core::digest::subscriber::{Recurrence, SubscriberRow};
+use bulletin_core::digest::subscriber::SubscriberRow;
 use bulletin_core::ingest::store::ConnectionRow;
 use bulletin_core::status::{
     BuildStatus, ClusterStats, ConnectionStats, DigestStats, EventStats, QueueStats, StatusReport,
@@ -14,7 +14,8 @@ use chrono::{DateTime, Utc};
 
 use super::proto;
 
-/// A UTC instant as a protobuf `Timestamp`. Sub-second nanos are always < 1e9, so the cast is exact.
+/// A UTC instant as a protobuf `Timestamp`. For the non-leap-second instants we store, the sub-second
+/// component is < 1e9 and fits an `i32` exactly.
 pub fn ts(dt: DateTime<Utc>) -> prost_types::Timestamp {
     prost_types::Timestamp {
         seconds: dt.timestamp(),
@@ -42,15 +43,12 @@ pub fn connection(row: ConnectionRow) -> proto::Connection {
 }
 
 pub fn subscriber(row: SubscriberRow) -> proto::Subscriber {
-    let (freq, weekday) = match row.recurrence {
-        Recurrence::Daily => ("daily".to_string(), None),
-        Recurrence::Weekly { weekday } => ("weekly".to_string(), Some(weekday)),
-    };
+    let (freq, weekday) = row.recurrence.columns();
     proto::Subscriber {
         id: row.id.to_string(),
         email: row.email,
         name: row.name,
-        freq,
+        freq: freq.to_string(),
         weekday,
         max_items: row.max_items,
         timezone: row.timezone,
@@ -69,7 +67,11 @@ pub fn event_summary(ev: Event) -> proto::EventSummary {
     }
 }
 
-pub fn digest_summary(row: DigestRow, subscriber_email: String, item_count: i64) -> proto::DigestSummary {
+pub fn digest_summary(
+    row: DigestRow,
+    subscriber_email: String,
+    item_count: i64,
+) -> proto::DigestSummary {
     proto::DigestSummary {
         id: row.id.to_string(),
         subscriber_email,
