@@ -324,8 +324,12 @@ attaches to the milestone that surfaces them:
 
 - Group-key strategies & near-dup thresholds per source → **M1 (RSS), M2 (GitHub)**.
 - Linking edge-strength cutoffs + the asymmetric merge bar → **M3**.
-- `relevance_floor` / richness threshold / caps tuning, `content_kind` taxonomy per source → **M4**.
+- `relevance_floor` / richness threshold / caps tuning, `content_kind` taxonomy per source → **M4**
+  (the deterministic scorer + the offline tuning harness that resolves these are specced in
+  `digest-scorer-and-eval.md`).
 - Crate-graph names & granularity → revisit end of **M2** once real dependencies exist.
-- Data lifecycle / GDPR delete cascade, KPI definitions + eval harness over the feedback log → **M5**.
+- Data lifecycle / GDPR delete cascade → **M5**. KPI definitions + eval harness over the feedback log
+  specced in `digest-scorer-and-eval.md` (online KPI gauges + offline counterfactual replay); the
+  harness lands with the M4 feedback log, formal KPI dashboards/retention with M5.
 - Thread-layer & identity tuning (community detection, edge `θ`/confidence bands, dormancy/decay,
   cold-start) → its own phased rollout **after M3/M4** (`digest-thread-layer.md` §9–§10).
