@@ -109,7 +109,7 @@ pub fn link(
 ) -> Assignment {
     let edges = score_edges(clusters);
     let components = components(clusters, &edges, prior);
-    let reasons = member_reasons(clusters, &edges);
+    let reasons = member_reasons(clusters, &edges, &components);
     forward_ids(clusters, &components, &reasons, prior, &mut mint)
 }
 
@@ -164,36 +164,31 @@ fn score_edges(clusters: &[LinkCluster]) -> Vec<Edge> {
 
 /// Score one candidate pair → `(strong, score, reason)` if it forms an edge, else `None`. A shared
 /// *strong* key (CVE/URL) is a strong edge at score 1.0; otherwise a weighted blend of entity Jaccard
-/// and temporal closeness must clear [`WEAK_EDGE_THRESHOLD`].
+/// and temporal closeness must clear [`WEAK_EDGE_THRESHOLD`]. The shared entities are computed once
+/// here and reused for both the reason and the Jaccard count.
 fn scored_edge(a: &LinkCluster, b: &LinkCluster) -> Option<(bool, f64, String)> {
-    if let Some(key) = shared_strong_key(a, b) {
+    let shared = shared_entities(a, b); // sorted; entities are deduped sets, so this is the ∩
+    if let Some(key) = shared
+        .iter()
+        .find(|e| link_strength(e) == Some(LinkStrength::Strong))
+    {
         return Some((true, 1.0, format!("shared {key}")));
     }
-    let score = W_JACCARD * jaccard(a, b) + W_TEMPORAL * temporal_closeness(a, b);
+    let score = W_JACCARD * jaccard(shared.len(), a.entities.len(), b.entities.len())
+        + W_TEMPORAL * temporal_closeness(a, b);
     if score >= WEAK_EDGE_THRESHOLD {
-        let key = shared_weak_key(a, b)?; // there is overlap (blocking guaranteed it)
+        // A shared domain isn't linkable, so the weak reason is a repo/user (blocking guaranteed one).
+        let key = shared
+            .iter()
+            .find(|e| link_strength(e) == Some(LinkStrength::Weak))?;
         Some((false, score, format!("shared {key}")))
     } else {
         None
     }
 }
 
-/// The smallest shared strong entity (CVE/URL), if any — smallest so the reason is stable.
-fn shared_strong_key(a: &LinkCluster, b: &LinkCluster) -> Option<String> {
-    shared_entities(a, b)
-        .into_iter()
-        .find(|e| link_strength(e) == Some(LinkStrength::Strong))
-}
-
-/// The smallest shared *linkable-weak* entity (repo/user), for a weak edge's reason. A shared domain
-/// is not linkable, so it is never a reason.
-fn shared_weak_key(a: &LinkCluster, b: &LinkCluster) -> Option<String> {
-    shared_entities(a, b)
-        .into_iter()
-        .find(|e| link_strength(e) == Some(LinkStrength::Weak))
-}
-
-/// Sorted shared entities of two clusters (entities are stored sorted+deduped, so this is a merge).
+/// The shared entities of two clusters, sorted. Entities are stored sorted+deduped (genuine sets),
+/// so this is their intersection and `.len()` is `|∩|`.
 fn shared_entities(a: &LinkCluster, b: &LinkCluster) -> Vec<String> {
     let sb: BTreeSet<&String> = b.entities.iter().collect();
     a.entities
@@ -203,16 +198,15 @@ fn shared_entities(a: &LinkCluster, b: &LinkCluster) -> Vec<String> {
         .collect()
 }
 
-/// Jaccard similarity over the two clusters' entity sets — |∩| / |∪|.
-fn jaccard(a: &LinkCluster, b: &LinkCluster) -> f64 {
-    let sa: BTreeSet<&String> = a.entities.iter().collect();
-    let sb: BTreeSet<&String> = b.entities.iter().collect();
-    if sa.is_empty() && sb.is_empty() {
-        return 0.0;
+/// Jaccard similarity from set sizes — `|∩| / |∪|`, with `|∪| = |a| + |b| − |∩|`. No set rebuild:
+/// the entity vecs are already deduped, so the counts suffice.
+fn jaccard(intersection: usize, a_len: usize, b_len: usize) -> f64 {
+    let union = (a_len + b_len - intersection) as f64;
+    if union == 0.0 {
+        0.0
+    } else {
+        intersection as f64 / union
     }
-    let inter = sa.intersection(&sb).count() as f64;
-    let union = sa.union(&sb).count() as f64;
-    inter / union
 }
 
 /// Temporal closeness in `0..=1`: 1.0 for same-instant clusters, decaying linearly to 0 across
@@ -224,21 +218,23 @@ fn temporal_closeness(a: &LinkCluster, b: &LinkCluster) -> f64 {
 
 // ── Stage 3: connected components (union-find) with the asymmetric guard ─────
 
-/// Disjoint-set forest over cluster indices, carrying per-component "is this component established"
-/// (contains a cluster from an already-delivered story) for the asymmetric-merge guard.
+/// Disjoint-set forest over cluster indices, carrying per-component the set of **already-delivered
+/// prior story ids** it contains — the state the asymmetric-merge guard needs. A set (not a bool):
+/// the guard must distinguish "re-linking two clusters of the *same* delivered story" (allowed) from
+/// "merging two *different* delivered stories" (weak edges may not).
 struct UnionFind {
     parent: Vec<usize>,
     rank: Vec<u8>,
-    established: Vec<bool>,
+    delivered: Vec<BTreeSet<Uuid>>,
 }
 
 impl UnionFind {
-    fn new(established: Vec<bool>) -> Self {
-        let n = established.len();
+    fn new(delivered: Vec<BTreeSet<Uuid>>) -> Self {
+        let n = delivered.len();
         Self {
             parent: (0..n).collect(),
             rank: vec![0; n],
-            established,
+            delivered,
         }
     }
 
@@ -250,7 +246,8 @@ impl UnionFind {
         x
     }
 
-    /// Union the sets of `x` and `y` (no-op if already joined). Establishment is OR-ed onto the root.
+    /// Union the sets of `x` and `y` (no-op if already joined); the delivered-story sets merge onto
+    /// the surviving root.
     fn union(&mut self, x: usize, y: usize) {
         let (mut rx, mut ry) = (self.find(x), self.find(y));
         if rx == ry {
@@ -263,12 +260,20 @@ impl UnionFind {
         if self.rank[rx] == self.rank[ry] {
             self.rank[rx] += 1;
         }
-        self.established[rx] = self.established[rx] || self.established[ry];
+        let absorbed = std::mem::take(&mut self.delivered[ry]);
+        self.delivered[rx].extend(absorbed);
     }
 
-    fn is_established(&mut self, x: usize) -> bool {
-        let r = self.find(x);
-        self.established[r]
+    /// Whether a weak edge between `a` and `b` would merge **two different** delivered stories — the
+    /// case the guard forbids. False when either side carries no delivered story (a fresh cluster may
+    /// attach) or when they share one (re-linking the same story, not a cross-story merge).
+    fn merges_distinct_delivered(&mut self, a: usize, b: usize) -> bool {
+        let (ra, rb) = (self.find(a), self.find(b));
+        if ra == rb {
+            return false;
+        }
+        let (da, db) = (&self.delivered[ra], &self.delivered[rb]);
+        !da.is_empty() && !db.is_empty() && da.is_disjoint(db)
     }
 }
 
@@ -276,33 +281,37 @@ impl UnionFind {
 ///
 /// Two passes encode the asymmetric guard (design §8.2): **strong edges first** (a shared CVE/URL may
 /// merge anything, including two delivered stories — this is the intended retro-merge), then **weak
-/// edges**, each skipped if it would merge two *already-established* components (both contain a
-/// delivered story) — so weak entity-overlap can attach a fresh cluster but never collapse two
-/// stories the subscriber has already seen as distinct. Weak edges are processed strongest-first so a
-/// fresh cluster attaches to its best connection; ties broken by index, keeping the result a pure
-/// function of the inputs.
+/// edges**, each skipped if it would merge two *different* already-delivered stories — so weak
+/// entity-overlap can attach a fresh cluster, and re-link clusters of the same story, but never
+/// collapse two stories the subscriber has already seen as distinct. Weak edges are processed
+/// strongest-first so a fresh cluster attaches to its best connection; ties broken by index, keeping
+/// the result a pure function of the inputs.
 fn components(
     clusters: &[LinkCluster],
     edges: &[Edge],
     prior: &[PriorMember],
 ) -> BTreeMap<usize, Vec<usize>> {
-    let delivered: BTreeSet<Uuid> = prior
+    let prior_story: BTreeMap<Uuid, Uuid> =
+        prior.iter().map(|p| (p.cluster_id, p.story_id)).collect();
+    let delivered_stories: BTreeSet<Uuid> = prior
         .iter()
         .filter(|p| p.delivered)
         .map(|p| p.story_id)
         .collect();
-    let prior_story: BTreeMap<Uuid, Uuid> =
-        prior.iter().map(|p| (p.cluster_id, p.story_id)).collect();
-    let established: Vec<bool> = clusters
+    // Per cluster: the delivered prior story it belongs to (a singleton set), else empty.
+    let delivered: Vec<BTreeSet<Uuid>> = clusters
         .iter()
         .map(|c| {
             prior_story
                 .get(&c.id)
-                .is_some_and(|s| delivered.contains(s))
+                .filter(|s| delivered_stories.contains(s))
+                .into_iter()
+                .copied()
+                .collect()
         })
         .collect();
 
-    let mut uf = UnionFind::new(established);
+    let mut uf = UnionFind::new(delivered);
 
     for e in edges.iter().filter(|e| e.strong) {
         uf.union(e.a, e.b);
@@ -317,7 +326,7 @@ fn components(
             .then((x.a, x.b).cmp(&(y.a, y.b)))
     });
     for e in weak {
-        if uf.is_established(e.a) && uf.is_established(e.b) && uf.find(e.a) != uf.find(e.b) {
+        if uf.merges_distinct_delivered(e.a, e.b) {
             continue; // would collapse two already-delivered stories — only a strong edge may
         }
         uf.union(e.a, e.b);
@@ -334,19 +343,33 @@ fn components(
     comps
 }
 
-/// Each cluster's `link_reason`: the strongest edge incident to it — a strong edge outranks any weak
-/// one, then higher score wins — formatted from that edge. A cluster with no incident edge (a
-/// singleton story) gets `None`, so it renders exactly like a pre-M3 one-cluster item.
-fn member_reasons(clusters: &[LinkCluster], edges: &[Edge]) -> Vec<Option<String>> {
+/// Each cluster's `link_reason`: the strongest edge incident to it **within its own story** — a
+/// strong edge outranks any weak one, then higher score wins. Edges the asymmetric guard skipped (a
+/// weak edge across two delivered stories) are excluded by the same-component check, so a member never
+/// cites a cluster it isn't actually grouped with. A cluster with no intra-story edge (a singleton
+/// story) gets `None`, rendering exactly like a pre-M3 one-cluster item.
+fn member_reasons(
+    clusters: &[LinkCluster],
+    edges: &[Edge],
+    components: &BTreeMap<usize, Vec<usize>>,
+) -> Vec<Option<String>> {
+    // cluster index → its component root, to keep only edges realized within one story.
+    let mut root = vec![0usize; clusters.len()];
+    for (&r, members) in components {
+        for &m in members {
+            root[m] = r;
+        }
+    }
+
     // Per cluster, the best incident edge ranked by (strong, score).
     let mut best: Vec<Option<(bool, f64)>> = vec![None; clusters.len()];
     let mut reason: Vec<Option<String>> = vec![None; clusters.len()];
-    for e in edges {
+    for e in edges.iter().filter(|e| root[e.a] == root[e.b]) {
         let rank = (e.strong, e.score);
         for &i in &[e.a, e.b] {
             let beats = match best[i] {
                 None => true,
-                Some((s, sc)) => rank.0 && !s || rank.0 == s && rank.1 > sc,
+                Some((s, sc)) => (rank.0 && !s) || (rank.0 == s && rank.1 > sc),
             };
             if beats {
                 best[i] = Some(rank);
@@ -426,19 +449,14 @@ fn forward_ids(
     let mut stories = Vec::new();
     for (members, &id) in ordered.iter().zip(&survivors) {
         // Members in cluster-id order; representative recency span is the component's min/max.
-        let mut refs: Vec<(Uuid, ClusterRef)> = members
+        let mut clusters_out: Vec<ClusterRef> = members
             .iter()
-            .map(|&i| {
-                (
-                    clusters[i].id,
-                    ClusterRef {
-                        cluster_id: clusters[i].id,
-                        link_reason: reasons[i].clone(),
-                    },
-                )
+            .map(|&i| ClusterRef {
+                cluster_id: clusters[i].id,
+                link_reason: reasons[i].clone(),
             })
             .collect();
-        refs.sort_by_key(|(id, _)| *id);
+        clusters_out.sort_by_key(|r| r.cluster_id);
 
         let first = members
             .iter()
@@ -453,7 +471,7 @@ fn forward_ids(
 
         stories.push(LinkedStory {
             id,
-            clusters: refs.into_iter().map(|(_, r)| r).collect(),
+            clusters: clusters_out,
             first_event_time: first,
             last_event_time: last,
         });
@@ -634,6 +652,38 @@ mod tests {
     }
 
     #[test]
+    fn weak_linked_delivered_story_survives_recompute() {
+        // A delivered story formed by a *weak* edge (shared repo, same day). On recompute both
+        // clusters are delivered+established — the guard must NOT split them: they are the same
+        // story, not two different ones.
+        let s = Uuid::from_u128(0x10);
+        let clusters = vec![
+            cluster(1, &["repo:acme/api", "user:alice"], 1),
+            cluster(2, &["repo:acme/api", "user:bob"], 1),
+        ];
+        let prior = vec![
+            PriorMember {
+                cluster_id: clusters[0].id,
+                story_id: s,
+                delivered: true,
+            },
+            PriorMember {
+                cluster_id: clusters[1].id,
+                story_id: s,
+                delivered: true,
+            },
+        ];
+        let a = link(&clusters, &prior, minter());
+        assert_eq!(
+            a.stories.len(),
+            1,
+            "a weak-linked delivered story must not split"
+        );
+        assert_eq!(a.stories[0].id, s);
+        assert_eq!(a.stories[0].clusters.len(), 2);
+    }
+
+    #[test]
     fn weak_edge_attaches_fresh_cluster_to_delivered_story() {
         // A delivered story plus a brand-new cluster sharing a weak key: the fresh one attaches.
         let delivered = Uuid::from_u128(0x10);
@@ -650,6 +700,44 @@ mod tests {
         assert_eq!(a.stories.len(), 1);
         assert_eq!(a.stories[0].id, delivered); // keeps the established id
         assert_eq!(a.stories[0].clusters.len(), 2);
+    }
+
+    #[test]
+    fn link_reason_never_cites_a_cluster_in_another_story() {
+        // A,B form delivered story S1 (weak repo link). C is delivered story S2. A's *strongest*
+        // incident edge is the guard-skipped A–C (shared user:carol, higher score than A–B) — but
+        // that edge crosses stories, so A's reason must come from its intra-story A–B edge.
+        let s1 = Uuid::from_u128(0x10);
+        let s2 = Uuid::from_u128(0x20);
+        let clusters = vec![
+            cluster(1, &["repo:acme/api", "user:carol"], 1), // A
+            cluster(2, &["repo:acme/api", "user:bob"], 1),   // B
+            cluster(3, &["user:carol"], 1),                  // C
+        ];
+        let prior = vec![
+            PriorMember {
+                cluster_id: clusters[0].id,
+                story_id: s1,
+                delivered: true,
+            },
+            PriorMember {
+                cluster_id: clusters[1].id,
+                story_id: s1,
+                delivered: true,
+            },
+            PriorMember {
+                cluster_id: clusters[2].id,
+                story_id: s2,
+                delivered: true,
+            },
+        ];
+        let a = link(&clusters, &prior, minter());
+        let s1_story = a.stories.iter().find(|s| s.id == s1).unwrap();
+        assert_eq!(s1_story.clusters.len(), 2);
+        for m in &s1_story.clusters {
+            // The reason must be the intra-story repo link, never the cross-story user:carol.
+            assert_eq!(m.link_reason.as_deref(), Some("shared repo:acme/api"));
+        }
     }
 
     // ── Strategy + invariants (the load-bearing reliability guarantees, §6) ──

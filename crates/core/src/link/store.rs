@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{postgres::PgRow, PgExecutor, PgPool, Row};
 use uuid::Uuid;
 
-use crate::link::{Assignment, ClusterRef, LinkCluster, PriorMember};
+use crate::link::{Assignment, LinkCluster, PriorMember};
 
 /// The subscriber's candidate clusters for linking: their scope (`public ∪ own-private`) within the
 /// freshness floor, carrying the blocking substrate (`entities`) and recency span. The pre-M3 digest
@@ -122,24 +122,6 @@ pub async fn persist_assignment(
     }
 
     tx.commit().await
-}
-
-/// A story's member clusters, resolving a tombstone to its survivor first (one hop suffices — a
-/// survivor is always the oldest id, so it is never itself a loser, keeping `merged_into` chains
-/// flat). Used by the render path to walk a frozen `digest_item.story_id` to its clusters.
-pub async fn story_members(pool: &PgPool, story_id: Uuid) -> Result<Vec<ClusterRef>, sqlx::Error> {
-    let clusters: Option<serde_json::Value> = sqlx::query_scalar(
-        "SELECT clusters FROM story
-         WHERE id = COALESCE((SELECT merged_into FROM story WHERE id = $1), $1)",
-    )
-    .bind(story_id)
-    .fetch_optional(pool)
-    .await?;
-
-    match clusters {
-        Some(v) => serde_json::from_value(v).map_err(|e| sqlx::Error::Decode(Box::new(e))),
-        None => Ok(Vec::new()),
-    }
 }
 
 /// Marks every story carried by a delivered digest as delivered (`last_delivered_at`). Called inside
