@@ -119,9 +119,13 @@ GenerateDigest(subscriber):
   (`W_JACCARD`, `W_TEMPORAL`, `WEAK_EDGE_THRESHOLD`, `TEMPORAL_WINDOW_DAYS`) move to a config table.
 - **RLS (M2 Phase 4).** Story reads/writes are fenced by `subscriber_id` at the query layer, exactly
   like clusters; when RLS lands, `story` joins the FORCE-RLS set and the `with_scope` wrapper.
-- **Scale levers (design §11).** Blocking moves to a normalized `cluster_signal` self-join; the
-  shared public-story cache memoizes pure-public stories; embeddings add a `vector` column + ANN —
-  all schema-additive, none needed at single-operator dogfood scale.
+- **Blocking (design §8.2/§11).** `candidate_clusters` already GIN-seeds the **cross-boundary** half
+  of the blocking set — public clusters sharing a strong key (`cve:`/`url:`) with the subscriber's own
+  private clusters, beyond the freshness floor (so a fresh private incident links to an aged public
+  advisory). The other half — public clusters matching the subscriber's **affinity** — lands with
+  relevance in **M4**; until then the in-floor arm carries the public set. Further levers: a normalized
+  `cluster_signal` self-join, the shared public-story cache, and embeddings (`vector` + ANN) — all
+  schema-additive, none needed at single-operator dogfood scale.
 - **`digest-explain` already shows stories + per-member `link_reason`**; a dedicated linking
   inspector could come later but `digest-explain` covers it.
 

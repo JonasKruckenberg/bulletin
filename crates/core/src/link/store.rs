@@ -12,12 +12,24 @@ use uuid::Uuid;
 
 use crate::link::{Assignment, LinkCluster, PriorMember};
 
-/// The subscriber's candidate clusters for linking: their scope (`public ∪ own-private`) within the
-/// freshness floor, carrying the blocking substrate (`entities`) and recency span. The pre-M3 digest
-/// selected over exactly this predicate (clusters directly) — the same isolation boundary
-/// (`scope_kind = 'public' OR scope_subscriber_id = $1`) and the same `updated_at` floor — so linking
-/// sees exactly the clusters the digest would have considered pre-M3. Ordered by id for a
-/// deterministic linking input.
+/// The subscriber's candidate clusters for linking: their scope (`public ∪ own-private`), carrying
+/// the blocking substrate (`entities`) and recency span. Two arms, unioned (`scope_kind = 'public' OR
+/// scope_subscriber_id = $1` is the isolation boundary — never another subscriber's private cluster):
+///
+///  1. **In-floor** — public ∪ own-private clusters updated since the freshness floor `min(last_run,
+///     now − horizon)`. The bulk of the candidate set, served by the `cluster_*_recency` indexes.
+///  2. **Cross-boundary seed** — public clusters that share a **strong key** (a `cve:`/`url:`, mirrors
+///     `entity::is_strong`) with the subscriber's *active* (in-floor) private clusters, **regardless
+///     of the freshness floor on the public side**. This is the design's blocking seed (§8.2):
+///     without it, a fresh private incident referencing `CVE-X` would never link to the public
+///     advisory about `CVE-X` if that advisory has aged out of the floor — the exact cross-source
+///     connection the product is built to surface. GIN-served via the `cluster_entities` index
+///     (`entities && <strong keys>`). Public-only, so the seed keys filter shared clusters but no
+///     private datum ever crosses scope.
+///
+/// (The other half of the design's blocking seed — public clusters matching the subscriber's
+/// *affinity* — lands with relevance in M4; until then the in-floor arm carries the public set.)
+/// Ordered by id for a deterministic linking input.
 pub async fn candidate_clusters(
     executor: impl PgExecutor<'_>,
     subscriber_id: Uuid,
@@ -25,10 +37,35 @@ pub async fn candidate_clusters(
     horizon_days: i32,
 ) -> Result<Vec<LinkCluster>, sqlx::Error> {
     sqlx::query(
-        "SELECT id, entities, first_event_time, last_event_time
-         FROM cluster
-         WHERE (scope_kind = 'public' OR scope_subscriber_id = $1)
-           AND updated_at >= LEAST($2, now() - make_interval(days => $3))
+        "WITH floor AS (SELECT LEAST($2, now() - make_interval(days => $3)) AS lo),
+              in_floor AS (
+                  SELECT id, entities, first_event_time, last_event_time
+                  FROM cluster
+                  WHERE (scope_kind = 'public' OR scope_subscriber_id = $1)
+                    AND updated_at >= (SELECT lo FROM floor)
+              ),
+              -- The strong keys (cve:/url:, mirrors entity::is_strong) the subscriber's *active*
+              -- private clusters carry — floored like in_floor, so the seed scales with recent
+              -- private activity (a fresh incident), not lifetime history. NULL when they have
+              -- none, which makes the seed below a no-op.
+              private_strong AS (
+                  SELECT array_agg(DISTINCT e) AS keys
+                  FROM cluster c, unnest(c.entities) AS e
+                  WHERE c.scope_subscriber_id = $1
+                    AND c.updated_at >= (SELECT lo FROM floor)
+                    AND (e LIKE 'cve:%' OR e LIKE 'url:%')
+              ),
+              -- Public clusters sharing a strong key with those — *regardless of the floor*, so an
+              -- aged-out advisory still links (a strong CVE/URL edge ignores temporal distance).
+              cross_boundary AS (
+                  SELECT id, entities, first_event_time, last_event_time
+                  FROM cluster
+                  WHERE scope_kind = 'public'
+                    AND entities && (SELECT keys FROM private_strong)
+              )
+         SELECT * FROM in_floor
+         UNION
+         SELECT * FROM cross_boundary
          ORDER BY id",
     )
     .bind(subscriber_id)

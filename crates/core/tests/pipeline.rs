@@ -423,6 +423,68 @@ async fn private_clusters_are_isolated_to_their_owner() {
     assert_eq!(cluster_count(&pool).await, 3);
 }
 
+// The cross-boundary blocking seed (design §8.2): a public advisory that has aged out of the
+// freshness floor is still pulled into linking when it shares a strong key (a CVE) with the
+// subscriber's *fresh* private incident — via the GIN `entities &&` lookup. Without the seed, the
+// floor would drop the advisory and the cross-source link would be silently missed.
+#[tokio::test]
+async fn cross_boundary_seed_pulls_aged_public_for_a_fresh_private_link() {
+    let (pool, _pg) = setup().await;
+    let alice = insert_subscriber(
+        &pool,
+        "alice@x.com",
+        None,
+        Recurrence::Daily,
+        "UTC",
+        nine_am(),
+    )
+    .await
+    .unwrap();
+
+    // A public advisory naming the CVE, built and then aged well outside the 30-day floor.
+    insert_public(
+        &pool,
+        "adv",
+        "adv",
+        "Advisory: CVE-2026-9999 disclosed",
+        100,
+    )
+    .await;
+    build_all(&pool).await;
+    sqlx::query(
+        "UPDATE cluster SET updated_at = now() - interval '90 days' WHERE scope_kind = 'public'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // A *fresh* private incident referencing the same CVE.
+    insert_private(
+        &pool,
+        alice,
+        "inc",
+        "inc",
+        "Incident: CVE-2026-9999 exploited",
+        200,
+    )
+    .await;
+    assert_eq!(build_private(&pool, alice).await.unwrap(), 1);
+
+    // The aged-out public advisory is pulled back in via the strong-key seed, and fuses.
+    let clusters = candidate_clusters(&pool, alice, None, 30).await.unwrap();
+    assert_eq!(
+        clusters.len(),
+        2,
+        "the seed pulls the aged public advisory in alongside the fresh private incident"
+    );
+    let assignment = link(&clusters, &[], Uuid::now_v7);
+    assert_eq!(
+        assignment.stories.len(),
+        1,
+        "the fresh private incident fuses with the aged public advisory on the shared CVE"
+    );
+}
+
 // M3 headline: a private GitHub PR and a public advisory naming the same CVE fuse into ONE story in
 // the owner's digest, with a link_reason; the story's id is stable across recompute; and the rendered
 // digest carries the fused item with its cross-source connection. The exit criteria, end to end.
