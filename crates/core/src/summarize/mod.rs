@@ -426,23 +426,26 @@ pub fn faithful(
         }
     }
 
-    // Numbers/dates: every numeric token in the output must be grounded — i.e. appear in the facts'
-    // numbers/dates *or* verbatim in the source text. Substring (not exact) match, since the miner
-    // strips unit suffixes ("40m" → "40"), so an output "40m" tokenizes to "40" and must still match a
-    // grounded "40m"; over-permissive on tiny tokens is acceptable for a cheap gate (the §9 "exact vs
-    // normalized" open question). One lowercased haystack of grounded tokens + source.
-    let mut haystack = facts
+    // Numbers/dates: every numeric token in the output must be grounded — appear as the *same token*
+    // in the facts' numbers/dates or the source text. Token-equality, not substring, so an output "40"
+    // is never falsely grounded by a source "4000". Both sides go through `tokenize_numeric`, so they
+    // agree on token boundaries and on the unit-suffix stripping ("40m" → "40").
+    let mut grounding: String = facts
         .numbers
         .iter()
         .chain(facts.dates.iter())
-        .map(|s| s.to_lowercase())
+        .cloned()
         .collect::<Vec<_>>()
         .join(" ");
-    haystack.push(' ');
-    haystack.push_str(&source_text.to_lowercase());
+    grounding.push(' ');
+    grounding.push_str(source_text);
+    let grounded: std::collections::HashSet<String> = tokenize_numeric(&grounding)
+        .into_iter()
+        .map(|t| t.to_lowercase())
+        .collect();
     let output = format!("{} {}", summary.headline, summary.tldr_text);
     for tok in tokenize_numeric(&output) {
-        if !haystack.contains(&tok.to_lowercase()) {
+        if !grounded.contains(&tok.to_lowercase()) {
             return Err(GateViolation::UngroundedNumber(tok));
         }
     }
@@ -463,19 +466,27 @@ pub fn faithful(
 
 /// Whole-word, case-insensitive containment: `needle` (already lowercase) bounded by non-alphanumeric
 /// edges in `haystack` (already lowercase). So "your" matches "your" but not "yourself", and "we"
-/// doesn't fire inside "week". Multi-word needles (e.g. "game changing") match as a phrase.
+/// doesn't fire inside "week". Multi-word needles (e.g. "game changing") match as a phrase. Boundaries
+/// are tested on *chars* (Unicode `is_alphanumeric`), not raw bytes, so an adjacent multibyte
+/// character ("caféyou") is not mistaken for a word boundary.
 fn contains_word(haystack: &str, needle: &str) -> bool {
-    let bytes = haystack.as_bytes();
     let mut start = 0;
     while let Some(pos) = haystack[start..].find(needle) {
         let i = start + pos;
-        let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+        let before_ok = haystack[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric());
         let after = i + needle.len();
-        let after_ok = after >= bytes.len() || !bytes[after].is_ascii_alphanumeric();
+        let after_ok = haystack[after..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric());
         if before_ok && after_ok {
             return true;
         }
-        start = i + 1;
+        // Advance past this occurrence (needles are non-empty), keeping byte-boundary alignment.
+        start = after;
     }
     false
 }
@@ -620,23 +631,30 @@ pub fn source_corpus(events: &[Event], max_chars: usize) -> String {
     let mut order: Vec<&Event> = events.iter().collect();
     order.sort_by(|a, b| b.event_time.cmp(&a.event_time).then(b.id.cmp(&a.id)));
     let mut out = String::new();
+    // Track the char count as we append (each piece counted once) rather than re-scanning the whole
+    // buffer per event — the latter is O(n²) on a many-event cluster.
+    let mut len = 0usize;
     for e in order {
-        if out.chars().count() >= max_chars {
+        if len >= max_chars {
             break;
         }
         if !out.is_empty() {
             out.push_str("\n\n");
+            len += 2;
         }
-        out.push_str(e.title.trim());
+        let title = e.title.trim();
+        out.push_str(title);
+        len += title.chars().count();
         if let Some(b) = &e.body {
             let b = b.trim();
             if !b.is_empty() {
                 out.push('\n');
                 out.push_str(b);
+                len += 1 + b.chars().count();
             }
         }
     }
-    if out.chars().count() > max_chars {
+    if len > max_chars {
         out = out.chars().take(max_chars).collect();
     }
     out
@@ -651,6 +669,9 @@ pub struct SummarizeStats {
     pub summarized: usize,
     /// Clusters skipped because their content hash was unchanged (the cache hit).
     pub skipped: usize,
+    /// Clusters left unsummarized because the model was unavailable — *not* persisted, so a later
+    /// sweep retries once the sidecar recovers (rather than sticking at a baseline).
+    pub unavailable: usize,
 }
 
 /// Run a best-effort cluster-summarization sweep over **public** clusters, in the no-subscriber RLS
@@ -665,7 +686,7 @@ pub async fn sweep_public(
     pool: &sqlx::PgPool,
     cfg: &SummarizationConfig,
 ) -> anyhow::Result<SummarizeStats> {
-    sweep(pool, ScopeCtx::NoSubscriber, &Scope::Public, cfg).await
+    sweep(pool, &Scope::Public, cfg).await
 }
 
 /// Run a best-effort cluster-summarization sweep over one subscriber's **private** clusters, in their
@@ -677,13 +698,7 @@ pub async fn sweep_private(
     subscriber_id: uuid::Uuid,
     cfg: &SummarizationConfig,
 ) -> anyhow::Result<SummarizeStats> {
-    sweep(
-        pool,
-        ScopeCtx::Subscriber(subscriber_id),
-        &Scope::Private(subscriber_id),
-        cfg,
-    )
-    .await
+    sweep(pool, &Scope::Private(subscriber_id), cfg).await
 }
 
 #[cfg(feature = "llm-summarization")]
@@ -692,20 +707,27 @@ use crate::common::{db::ScopeCtx, scope::Scope};
 /// The shared sweep body for both scopes (mirrors the public/private build split): find the clusters
 /// whose content changed since (or were never) summarized, recompute each one's hash, and — only if it
 /// actually moved — generate + gate + store a fresh summary. The model/prompt provenance gates a
-/// corpus-wide re-summarize after an upgrade.
+/// corpus-wide re-summarize after an upgrade. The RLS context is derived from the scope by
+/// [`ScopeCtx::for_scope`] (public → no-subscriber, private → owner), the single source of that mapping.
 #[cfg(feature = "llm-summarization")]
 async fn sweep(
     pool: &sqlx::PgPool,
-    ctx: ScopeCtx,
     scope: &Scope,
     cfg: &SummarizationConfig,
 ) -> anyhow::Result<SummarizeStats> {
     use crate::common::db::with_scope;
     use anyhow::Context;
 
+    let ctx = ScopeCtx::for_scope(scope);
     let model = cfg.summary_model();
     let scope = scope.clone();
     let cfg = cfg.clone();
+    // One HTTP client (connection pool / TLS cache / resolver) for the whole sweep, not one per
+    // cluster. Cheap to clone-share into each call.
+    let http = reqwest::Client::builder()
+        .timeout(cfg.request_timeout)
+        .build()
+        .context("build summarization http client")?;
 
     with_scope(pool, ctx, move |conn| {
         Box::pin(async move {
@@ -734,11 +756,19 @@ async fn sweep(
                     stats.skipped += 1;
                     continue;
                 }
-                let summary = client::summarize_cluster(&cfg, &c.title, &events).await;
-                store::store_summary(&mut *conn, c.id, &summary, &hash, &model)
-                    .await
-                    .context("store cluster summary")?;
-                stats.summarized += 1;
+                // `None` ⇒ the model was unavailable: leave the cluster unsummarized (don't advance
+                // `summarized_at`) so a later sweep retries once the sidecar recovers, rather than
+                // freezing it at a baseline until its content next changes. A gate rejection still
+                // returns `Some(baseline)` — that is a stable, content-derived result worth caching.
+                match client::summarize_cluster(&cfg, &http, &c.title, &events).await {
+                    Some(summary) => {
+                        store::store_summary(&mut *conn, c.id, &summary, &hash, &model)
+                            .await
+                            .context("store cluster summary")?;
+                        stats.summarized += 1;
+                    }
+                    None => stats.unavailable += 1,
+                }
             }
             Ok(stats)
         })
@@ -885,6 +915,21 @@ mod tests {
         };
         assert!(faithful(&ok_num, &facts, "report: 99% of logins failed").is_ok());
 
+        // Token-equality, not substring: "40" must NOT be grounded by a source/fact "4000".
+        let substring_facts = Facts {
+            numbers: vec!["4000".to_string()],
+            ..Facts::default()
+        };
+        let sub = ClusterSummary {
+            headline: "40 were affected".to_string(),
+            tldr_text: "40 were affected".to_string(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            faithful(&sub, &substring_facts, "deployed 4000 servers"),
+            Err(GateViolation::UngroundedNumber(_))
+        ));
+
         // Banned hype word.
         let hype = ClusterSummary {
             headline: "A massive outage".to_string(),
@@ -903,6 +948,11 @@ mod tests {
         assert!(!contains_word("the week ahead", "we")); // not inside a word
         assert!(!contains_word("yourself did it", "your"));
         assert!(contains_word("is this your fault", "your"));
+        // A multibyte char adjacent to the needle is a real letter, not a word boundary.
+        assert!(!contains_word("caféyou", "you"));
+        assert!(contains_word("café you win", "you")); // standalone after the accented word
+                                                       // Multi-word needle still matches as a phrase.
+        assert!(contains_word("a game changing release", "game changing"));
     }
 
     #[test]

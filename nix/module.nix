@@ -130,7 +130,7 @@ in
       # binary with no summarization code. Override this to pin a specific build.
       default =
         self.packages.${pkgs.stdenv.hostPlatform.system}.${if cfg.llm.enable then "bulletin-llm" else "bulletin"};
-      defaultText = lib.literalExpression "bulletin.packages.\${system}.\${if llm.enable then \"bulletin-llm\" else \"bulletin\"}";
+      defaultText = lib.literalExpression "bulletin.packages.\${system}.\${if cfg.llm.enable then \"bulletin-llm\" else \"bulletin\"}";
       description = "The `bulletin` package to run. Defaults to the LLM-enabled build when `llm.enable`.";
     };
 

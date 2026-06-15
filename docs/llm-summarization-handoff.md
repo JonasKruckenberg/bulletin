@@ -109,10 +109,16 @@ is the only switch — without it `summarize_public` is an empty no-op and no su
 
 ## 3. Caveats / known rough edges
 
-- **Numeric gate is substring-based.** Because the miner strips unit suffixes (`"40m"` → `"40"`), the
-  gate matches numeric tokens by *substring* against a grounded+source haystack. This is intentionally
-  lenient on tiny tokens (the `local-ml-options`/`llm-summarization.md` §9 "exact vs normalized" open
-  question). Tighten once the comprehension pass supplies real `facts.numbers`.
+- **Numeric gate is token-equality** (both output and grounding go through `tokenize_numeric`, so they
+  agree on boundaries and on unit-suffix stripping `"40m"`→`"40"`). An output `"40"` is *not* grounded
+  by a source `"4000"`. The remaining looseness is the unit-suffix stripping itself (the
+  `llm-summarization.md` §9 "exact vs normalized" open question) — tighten once the Phase-2 comprehension
+  pass supplies real `facts.numbers`.
+- **Sidecar-down does not stick.** A model/transport error returns `None` from `summarize_cluster`, so
+  the cluster is left unsummarized (`summarized_at` not advanced) and a later sweep retries once the
+  sidecar recovers. A *gate rejection* still persists the deterministic baseline (stable, content-
+  derived). Cost: a persistently-down sidecar re-attempts every due cluster each sweep — bounded by
+  `max_per_sweep` and off the punctual path.
 - **`services.llama-cpp` option names** (`model`/`host`/`port`/`package`) are assumed against current
   nixpkgs — **verify against the pinned nixpkgs** before deploying (`local-ml-options.md` §9 flags this
   surface as fast-moving). The module was not `nix`-evaluated in CI (no nix in the build env).

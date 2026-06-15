@@ -16,25 +16,30 @@ use crate::summarize::{
 };
 
 /// Summarize one cluster: extract-then-summarize (§3.2) — hand the model the pre-extracted facts +
-/// budgeted source text and ask it to *rewrite* them, then run the §3.4 faithfulness gate. **Always
-/// returns a usable summary**: on any model/transport error, or a gate rejection, it degrades to the
-/// deterministic [`baseline`] banded `uncertain`. Never fails — the digest's punctuality does not
-/// depend on the model.
+/// budgeted source text and ask it to *rewrite* them, then run the §3.4 faithfulness gate.
+///
+/// Returns:
+/// - `Some(summary)` on success **and** on a gate rejection (a deterministic, content-derived
+///   [`baseline`] banded `uncertain`) — both are stable results worth caching;
+/// - `None` when the model itself was unavailable (transport/HTTP error) — so the caller leaves the
+///   cluster unsummarized and a later sweep retries once the sidecar recovers, rather than freezing it
+///   at a baseline. Never panics — the digest's punctuality does not depend on the model.
+///
+/// `http` is the sweep's shared client (one connection pool for the whole pass).
 pub async fn summarize_cluster(
     cfg: &SummarizationConfig,
+    http: &reqwest::Client,
     title: &str,
     events: &[Event],
-) -> ClusterSummary {
+) -> Option<ClusterSummary> {
     let facts = extract_facts(events);
     let source = source_corpus(events, cfg.max_source_chars);
-    let sources = distinct_sources(events);
-    let fallback = || baseline(title, events.len() as i32, &sources, facts.clone());
 
-    let candidate = match call_model(cfg, &facts, &source).await {
+    let candidate = match call_model(cfg, http, &facts, &source).await {
         Ok(c) => c,
         Err(e) => {
-            tracing::warn!(error = %e, "summarization model call failed; using baseline");
-            return fallback();
+            tracing::warn!(error = %e, "summarization model call failed; leaving cluster unsummarized for retry");
+            return None;
         }
     };
 
@@ -51,18 +56,21 @@ pub async fn summarize_cluster(
     if cfg.faithfulness_gate {
         if let Err(v) = faithful(&summary, &facts, &source) {
             tracing::debug!(violation = ?v, "faithfulness gate rejected summary; using baseline");
-            return fallback();
+            return Some(baseline(
+                title,
+                events.len() as i32,
+                &source_labels(events),
+                facts,
+            ));
         }
     }
-    summary
+    Some(summary)
 }
 
-/// The distinct source-kind labels a cluster's events came from (the labels the baseline tldr names).
-fn distinct_sources(events: &[Event]) -> Vec<&'static str> {
-    let mut s: Vec<&'static str> = events.iter().map(|e| e.source.as_str()).collect();
-    s.sort_unstable();
-    s.dedup();
-    s
+/// The source-kind labels a cluster's events came from, in event order (the baseline tldr sorts +
+/// dedups them, so no need to here).
+fn source_labels(events: &[Event]) -> Vec<&'static str> {
+    events.iter().map(|e| e.source.as_str()).collect()
 }
 
 /// The slice of the model's response we parse — the abstractive fields. The rest is reconstructed
@@ -80,6 +88,7 @@ struct ModelOutput {
 /// degrades to baseline.
 async fn call_model(
     cfg: &SummarizationConfig,
+    http: &reqwest::Client,
     facts: &Facts,
     source: &str,
 ) -> anyhow::Result<ModelOutput> {
@@ -98,10 +107,7 @@ async fn call_model(
         "response_format": { "type": "json_schema", "json_schema": response_schema(&facts.entities) }
     });
 
-    let client = reqwest::Client::builder()
-        .timeout(cfg.request_timeout)
-        .build()?;
-    let resp = client
+    let resp = http
         .post(format!("{}/chat/completions", cfg.base_url))
         .header("content-type", "application/json")
         .body(serde_json::to_string(&body)?)

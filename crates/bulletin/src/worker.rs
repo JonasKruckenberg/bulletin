@@ -205,6 +205,7 @@ async fn summarize_public(pool: &PgPool) {
         Ok(stats) => tracing::info!(
             summarized = stats.summarized,
             skipped = stats.skipped,
+            unavailable = stats.unavailable,
             "cluster summarization sweep complete"
         ),
         Err(e) => {
