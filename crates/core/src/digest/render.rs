@@ -33,28 +33,44 @@ fn reason_line(reason: &ItemReason) -> String {
 /// raw cluster `title` per item (carried on [`RenderItem::headline`]), so it reads sensibly with the
 /// summarization feature off too. Empty for an empty item list (the caller renders the empty digest).
 fn compose_lead(items: &[RenderItem]) -> String {
-    let headlines: Vec<&str> = items
-        .iter()
-        .map(|item| item.headline.trim())
-        .filter(|h| !h.is_empty())
-        .collect();
-    match headlines.as_slice() {
-        [] => String::new(),
-        [one] => format!("Leading this digest: {}.", trim_sentence_end(one)),
-        [first, rest @ ..] => {
-            let n = rest.len();
-            let unit = if n == 1 { "update" } else { "updates" };
-            format!(
-                "Leading this digest: {}, with {n} more {unit} below.",
-                trim_sentence_end(first)
-            )
-        }
+    // The dominant line is the top-ranked item's headline (selection is in priority order); fall to
+    // the next non-blank one only if it is somehow empty. `is_empty()`-guarded so an all-blank set
+    // yields no lead. The "N more" count is over **all** rendered items, so it can never disagree with
+    // the rows below (a blank headline still counts as a row).
+    let Some(lead) = items.iter().map(|i| i.headline.trim()).find(|h| !h.is_empty()) else {
+        return String::new();
+    };
+    let rest = items.len() - 1;
+    if rest == 0 {
+        // One item: the headline *is* the lead sentence — keep its own terminal punctuation.
+        format!("Leading this digest: {}", end_sentence(lead))
+    } else {
+        // Several: the headline is a mid-sentence clause before ", with …", so strip any terminator
+        // and let the template supply the single closing period.
+        let unit = if rest == 1 { "update" } else { "updates" };
+        format!(
+            "Leading this digest: {}, with {rest} more {unit} below.",
+            trim_sentence_end(lead)
+        )
     }
 }
 
-/// Strip a single trailing sentence terminator from a headline so the composed lead's own punctuation
-/// doesn't double it ("…deploy." → "…deploy"). Headlines are abstractive and usually unterminated, but
-/// the deterministic baseline reuses the raw cluster `title`, which may end in one.
+/// Finish a headline as a whole sentence: keep its own terminal punctuation (so an ellipsis or "!" is
+/// preserved intact), appending a period only when it ends without one. Used for the single-item lead,
+/// where the headline stands as the entire sentence.
+fn end_sentence(s: &str) -> String {
+    let s = s.trim_end();
+    if s.ends_with(['.', '!', '?']) {
+        s.to_string()
+    } else {
+        format!("{s}.")
+    }
+}
+
+/// Strip any trailing terminator run from a headline used **mid-sentence** (before ", with …"), so the
+/// clause reads cleanly and the lead template supplies the sentence's single closing period. Headlines
+/// are abstractive and usually unterminated, but the deterministic baseline reuses the raw cluster
+/// `title`, which may end in one (or several, e.g. an ellipsis).
 fn trim_sentence_end(s: &str) -> &str {
     s.trim_end_matches(['.', '!', '?']).trim_end()
 }
@@ -115,8 +131,11 @@ pub(crate) fn render(
     content: &DigestContent<'_>,
 ) -> Result<Message> {
     let tz = subscriber_tz(timezone);
-    let plain = render_plain(window_end, tz, greeting, items);
-    let html = render_html(window_end, tz, greeting, items, content);
+    // Compose the deterministic big-picture lead once (§2.4) and share it across both bodies, so the
+    // plaintext and HTML views can never carry a different lead for the same digest.
+    let lead = compose_lead(items);
+    let plain = render_plain(window_end, tz, greeting, &lead, items);
+    let html = render_html(window_end, tz, greeting, &lead, items, content);
     // The greeting doubles as the subject line, so the inbox preview opens in the same warm,
     // time-of-day voice as the digest's lead (and varies per window the same way).
     build_message(from, to, greeting, plain, html, "digest email")
@@ -177,11 +196,22 @@ fn build_message(
 /// Plaintext fallback: a numbered list of items (headline, grounded tldr, link, source, time). Kept
 /// deliberately plain — this is what HTML-averse clients and screen-reader-friendly setups fall back
 /// to. Opens with the same deterministic big-picture lead the HTML view carries (§2.4).
-fn render_plain(window_end: DateTime<Utc>, tz: Tz, greeting: &str, items: &[RenderItem]) -> String {
+fn render_plain(
+    window_end: DateTime<Utc>,
+    tz: Tz,
+    greeting: &str,
+    lead: &str,
+    items: &[RenderItem],
+) -> String {
+    // Join the lead onto the greeting only when there is one, so an empty lead leaves no dangling space.
+    let opening = if lead.is_empty() {
+        greeting.to_string()
+    } else {
+        format!("{greeting} {lead}")
+    };
     let mut body = format!(
-        "{greeting} {lead}\n\nYour digest for the window ending {}\n\n",
+        "{opening}\n\nYour digest for the window ending {}\n\n",
         window_end.with_timezone(&tz).format("%Y-%m-%d %H:%M %Z"),
-        lead = compose_lead(items),
     );
     for (i, item) in items.iter().enumerate() {
         body.push_str(&format!(
@@ -292,6 +322,7 @@ fn render_html(
     window_end: DateTime<Utc>,
     tz: Tz,
     greeting: &str,
+    lead: &str,
     items: &[RenderItem],
     content: &DigestContent<'_>,
 ) -> String {
@@ -303,9 +334,9 @@ fn render_html(
         .to_string();
     let preheader = format!("{count} new item{plural} in your digest");
     let greeting = escape(greeting);
-    // The big-picture lead is composed deterministically from the selected items' headlines (§2.4) —
-    // no model call, no lorem; null/empty only when there are no items (the empty digest path).
-    let summary = escape(&compose_lead(items));
+    // The big-picture lead is composed once by the caller (§2.4) — deterministic, no model, no lorem;
+    // empty only when there are no items (the empty digest path).
+    let summary = escape(lead);
 
     // The category placeholder is identical across items today, so escape it once and reuse.
     let category = escape(content.item_category);
@@ -718,6 +749,7 @@ mod tests {
             Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
             Tz::UTC,
             "Good morning. Here's your daily digest.",
+            &compose_lead(&items),
             &items,
             &DigestContent::default(),
         );
@@ -743,6 +775,7 @@ mod tests {
             Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
             Tz::UTC,
             "Good morning. Here's your daily digest.",
+            &compose_lead(&items),
             &items,
             &DigestContent::default(),
         );
@@ -773,6 +806,7 @@ mod tests {
             Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
             Tz::UTC,
             "GREETING_TEXT",
+            &compose_lead(&items),
             &items,
             &content,
         );
@@ -823,11 +857,13 @@ mod tests {
                 SourceKind::Github,
             )
         };
+        let items = vec![note];
         let html = render_html(
             Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
             Tz::UTC,
             "GREETING",
-            &[note],
+            &compose_lead(&items),
+            &items,
             &DigestContent::default(),
         );
         // The Note tag + headline (degraded to the raw title) + reason are present...
@@ -855,18 +891,41 @@ mod tests {
             "Leading this digest: Auth outage traced to the deploy."
         );
 
-        // Several → leads with the top-ranked headline + a count of the rest (pluralized).
+        // A single item's own terminal punctuation is preserved (no collapse, no doubled period):
+        // an ellipsis stays an ellipsis, a "!" stays a "!".
         let mk = |h: &str| RenderItem {
             headline: h.to_string(),
             ..item("raw", None, SourceKind::Rss)
         };
         assert_eq!(
-            compose_lead(&[mk("Top story"), mk("Second")]),
+            compose_lead(&[mk("Talks continue...")]),
+            "Leading this digest: Talks continue..."
+        );
+        assert_eq!(
+            compose_lead(&[mk("Servers are back!")]),
+            "Leading this digest: Servers are back!"
+        );
+
+        // Several → leads with the top-ranked headline + a count of the rest (pluralized). The top
+        // headline is mid-sentence here, so its own trailing terminator is stripped before ", with".
+        assert_eq!(
+            compose_lead(&[mk("Top story."), mk("Second")]),
             "Leading this digest: Top story, with 1 more update below."
         );
         assert_eq!(
             compose_lead(&[mk("Top story"), mk("Second"), mk("Third")]),
             "Leading this digest: Top story, with 2 more updates below."
+        );
+
+        // The "N more" count is over *all* rendered items, so a blank-headline row still counts (the
+        // lead text falls through to the first non-blank headline) — count never disagrees with rows.
+        let blank = RenderItem {
+            headline: "  ".to_string(),
+            ..item("raw", None, SourceKind::Rss)
+        };
+        assert_eq!(
+            compose_lead(&[mk("Top story"), blank]),
+            "Leading this digest: Top story, with 1 more update below."
         );
     }
 
@@ -882,6 +941,7 @@ mod tests {
             Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
             Tz::UTC,
             "Hi.",
+            &compose_lead(&items),
             &items,
             &DigestContent::default(),
         );
@@ -907,6 +967,7 @@ mod tests {
             Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
             Tz::UTC,
             "Good morning. Here's your daily digest.",
+            &compose_lead(&items),
             &items,
             &content,
         );
@@ -924,11 +985,14 @@ mod tests {
             Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
             Tz::UTC,
             "Good morning. Here's your daily digest.",
+            &compose_lead(&items),
             &items,
         );
 
-        // The greeting opens the plaintext fallback, ahead of the item list.
-        assert!(plain.starts_with("Good morning. Here's your daily digest."));
+        // The greeting opens the plaintext fallback, then the composed lead, ahead of the item list.
+        assert!(plain.starts_with(
+            "Good morning. Here's your daily digest. Leading this digest: Hello."
+        ));
         assert!(plain.contains("1. [STORY] Hello"));
         assert!(plain.contains("https://example.com"));
         assert!(plain.contains("rss ·"));

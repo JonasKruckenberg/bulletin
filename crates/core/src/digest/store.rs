@@ -195,10 +195,13 @@ pub(crate) async fn cluster_cards(
     )
     .bind(ids)
     .try_map(|row: PgRow| {
-        // `cluster.summary` is `NOT NULL DEFAULT '{}'`, so the value is always present; the empty
-        // object deserializes to the inert `ClusterSummary::default()`.
-        let summary: ClusterSummary = serde_json::from_value(row.try_get("summary")?)
-            .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+        // `cluster.summary` is `NOT NULL DEFAULT '{}'`, so the value is always present. Decode
+        // tolerantly: the summary is a best-effort, recomputable cache (§2.1 "lose it, rebuild it"),
+        // so a malformed/legacy value degrades to the inert `ClusterSummary::default()` → the `title`
+        // fallback, never failing the whole digest. (Contrast the structural `story.clusters` decode,
+        // which must hard-error — there's no story without its members.)
+        let summary: ClusterSummary =
+            serde_json::from_value(row.try_get("summary")?).unwrap_or_default();
         Ok((
             row.get::<Uuid, _>("id"),
             ClusterCard {
