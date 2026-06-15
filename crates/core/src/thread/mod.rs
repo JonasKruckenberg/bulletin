@@ -48,6 +48,15 @@ impl ThreadOrigin {
             ThreadOrigin::Emergent => "emergent",
         }
     }
+
+    /// Inverse of [`as_str`]; anything but the explicit `declared` reads back as `Emergent` (the
+    /// store column is constrained to the two values).
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "declared" => ThreadOrigin::Declared,
+            _ => ThreadOrigin::Emergent,
+        }
+    }
 }
 
 /// A thread's lifecycle state. `Dormant` threads are retained and reactivatable (a story landing on
@@ -443,6 +452,15 @@ mod tests {
 
     fn at(day: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(day * 86_400, 0).single().unwrap()
+    }
+
+    #[test]
+    fn thread_origin_round_trips() {
+        for o in [ThreadOrigin::Declared, ThreadOrigin::Emergent] {
+            assert_eq!(ThreadOrigin::parse(o.as_str()), o);
+        }
+        // Unknown reads back as Emergent (the store column is constrained to the two values).
+        assert_eq!(ThreadOrigin::parse("nonsense"), ThreadOrigin::Emergent);
     }
 
     #[test]

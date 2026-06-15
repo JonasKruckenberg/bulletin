@@ -17,4 +17,16 @@ impl Scope {
             Scope::Private(subscriber_id) => ("private", Some(*subscriber_id)),
         }
     }
+
+    /// Reconstructs a scope from the `(scope_kind, scope_subscriber_id)` column pair — the inverse of
+    /// [`to_columns`], so the on-disk convention is read and written in one place. Anything but the
+    /// explicit `private` (which must carry its owner) reads back as `Public`.
+    pub fn from_columns(kind: &str, subscriber_id: Option<Uuid>) -> Result<Self, &'static str> {
+        match kind {
+            "private" => Ok(Scope::Private(
+                subscriber_id.ok_or("private scope missing scope_subscriber_id")?,
+            )),
+            _ => Ok(Scope::Public),
+        }
+    }
 }

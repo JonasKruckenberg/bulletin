@@ -20,7 +20,6 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use super::token::{Token, TokenFuture, TokenProvider};
-use super::DEFAULT_API_BASE;
 use crate::ingest::SourceError;
 
 /// Re-mint an installation token this long before it actually expires, so an in-flight poll never
@@ -45,7 +44,7 @@ pub struct GithubApp {
 impl GithubApp {
     /// Build from the App id + its **PEM-encoded** RSA private key (PKCS#1 or PKCS#8 — GitHub issues
     /// PKCS#1 `BEGIN RSA PRIVATE KEY`). Errors only if the key isn't a usable RSA PEM. `base_url` is
-    /// overridable for GitHub Enterprise / tests; pass [`DEFAULT_API_BASE`] for github.com.
+    /// overridable for GitHub Enterprise / tests; pass `DEFAULT_API_BASE` for github.com.
     pub fn new(
         base_url: impl Into<String>,
         app_id: i64,
@@ -166,9 +165,4 @@ struct AppClaims {
 struct TokenResponse {
     token: String,
     expires_at: DateTime<Utc>,
-}
-
-/// Convenience for the app wiring: github.com unless overridden.
-pub fn default_base_url() -> String {
-    DEFAULT_API_BASE.to_string()
 }

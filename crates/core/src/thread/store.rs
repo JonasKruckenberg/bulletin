@@ -95,10 +95,7 @@ pub async fn load_threads(
     )
     .bind(subscriber_id)
     .try_map(|row: PgRow| {
-        let origin = match row.get::<String, _>("origin").as_str() {
-            "declared" => ThreadOrigin::Declared,
-            _ => ThreadOrigin::Emergent,
-        };
+        let origin = ThreadOrigin::parse(&row.get::<String, _>("origin"));
         let entities: serde_json::Value = row.get("entities");
         Ok(ThreadRow {
             id: row.get("id"),

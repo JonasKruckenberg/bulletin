@@ -73,12 +73,18 @@ fn obj_id(ev: &GithubEvent, path: &str) -> Option<String> {
     })
 }
 
-fn payload_str(ev: &GithubEvent, path: &[&str]) -> Option<String> {
-    let mut cur = &ev.payload;
+/// Walk a JSON object path, returning the leaf value when every segment exists. The one traversal
+/// behind `payload_str`/`num` and the webhook-timestamp lookup.
+fn dig<'a>(v: &'a serde_json::Value, path: &[&str]) -> Option<&'a serde_json::Value> {
+    let mut cur = v;
     for key in path {
         cur = cur.get(key)?;
     }
-    cur.as_str().map(str::to_owned)
+    Some(cur)
+}
+
+fn payload_str(ev: &GithubEvent, path: &[&str]) -> Option<String> {
+    dig(&ev.payload, path)?.as_str().map(str::to_owned)
 }
 
 fn action(ev: &GithubEvent) -> Option<String> {
@@ -156,11 +162,7 @@ fn group_key(ev: &GithubEvent) -> String {
 }
 
 fn num(ev: &GithubEvent, path: &[&str]) -> Option<String> {
-    let mut cur = &ev.payload;
-    for key in path {
-        cur = cur.get(key)?;
-    }
-    cur.as_i64().map(|n| n.to_string())
+    dig(&ev.payload, path)?.as_i64().map(|n| n.to_string())
 }
 
 /// Depth signal per activity (§5.1). Releases announce; issues/PRs are longform; chatter is a
@@ -250,11 +252,8 @@ fn webhook_time(rest_kind: &str, body: &serde_json::Value) -> Option<DateTime<Ut
         "PushEvent" => &["head_commit", "timestamp"],
         _ => return None,
     };
-    let mut cur = body;
-    for key in path {
-        cur = cur.get(key)?;
-    }
-    cur.as_str()
+    dig(body, path)?
+        .as_str()
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&Utc))
 }
