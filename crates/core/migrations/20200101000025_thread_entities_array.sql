@@ -7,12 +7,13 @@
 -- array (de)coding for free and lets `assign_thread` use the GIN-served array-overlap operator
 -- (`t.entities && $keys`), exactly like the cluster blocking lookup. The data shape is unchanged.
 
--- The GIN op class differs between jsonb (jsonb_ops) and text[] (array_ops), so drop and recreate.
-DROP INDEX thread_entities;
-
-ALTER TABLE thread
-    ALTER COLUMN entities DROP DEFAULT,
-    ALTER COLUMN entities TYPE text[] USING ARRAY(SELECT jsonb_array_elements_text(entities)),
-    ALTER COLUMN entities SET DEFAULT '{}';
+-- `ALTER COLUMN ... TYPE ... USING` forbids a subquery in the transform expression, and there's no
+-- scalar jsonb→text[] cast — so convert via a temp column whose UPDATE *can* unnest the jsonb array,
+-- then swap. Dropping the old column also drops its (jsonb_ops) GIN index; recreate it for text[].
+ALTER TABLE thread ADD COLUMN entities_arr text[] NOT NULL DEFAULT '{}';
+UPDATE thread
+   SET entities_arr = ARRAY(SELECT value FROM jsonb_array_elements_text(entities) AS value);
+ALTER TABLE thread DROP COLUMN entities;
+ALTER TABLE thread RENAME COLUMN entities_arr TO entities;
 
 CREATE INDEX thread_entities ON thread USING gin (entities);   -- fire-time story→thread match
