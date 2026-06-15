@@ -19,7 +19,9 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::common::db::{with_scope, ScopeCtx};
-use crate::digest::select::{select, Candidate, Decision, DecisionRecord, ItemReason, Verdict};
+use crate::digest::select::{
+    select, Candidate, Decision, DecisionRecord, ItemReason, ReplaySnapshot, ScoringConfig, Verdict,
+};
 use crate::digest::store::{
     build_render_item, cluster_cards, create_with_items, last_shown, load_config, mark_delivered,
     record_decisions, render_items, render_items_for_stories, story_owner, story_timeline,
@@ -74,7 +76,12 @@ async fn link_and_select(
     horizon_days: i32,
     shown_before: DateTime<Utc>,
     persist: bool,
-) -> Result<(Vec<LinkedStory>, Vec<Decision>, HashMap<Uuid, Vec<String>>)> {
+) -> Result<(
+    Vec<LinkedStory>,
+    Vec<Decision>,
+    HashMap<Uuid, Vec<String>>,
+    ReplaySnapshot,
+)> {
     let sub_id = sub.id;
     // Read the candidate clusters, the prior story assignment, and the per-story "last shown"
     // snapshots in the subscriber's RLS context: the candidate set is `public ∪ own-private` (and the
@@ -134,8 +141,16 @@ async fn link_and_select(
     // `.max(0)` guards the `i32 → usize` cast: a stray non-positive max_items yields an empty digest
     // (the safe direction), never a sign-wrapped, effectively-unbounded ceiling.
     let max_items = sub.max_items.max(0) as usize;
-    let decisions = select(candidates, &cfg, max_items, Utc::now());
-    Ok((assignment.stories, decisions, story_entities))
+    // Capture the read-time clock once, and snapshot the candidate set *before* `select` consumes it,
+    // so a delivered digest can be re-scored under a trial config later (the eval sweep, §0.1).
+    let now = Utc::now();
+    let snapshot = ReplaySnapshot {
+        now,
+        max_items,
+        candidates: candidates.clone(),
+    };
+    let decisions = select(candidates, &cfg, max_items, now);
+    Ok((assignment.stories, decisions, story_entities, snapshot))
 }
 
 /// The deduplicated, sorted union of a story's member-cluster entities.
@@ -287,6 +302,27 @@ async fn record_decision_log(
     }
 }
 
+/// Persist the digest's replay snapshot (best-effort; never blocks the send) onto the `digest` row,
+/// so it can be re-scored under a trial config (the eval sweep). Subscriber-scoped (own candidates).
+async fn record_candidate_snapshot(
+    pool: &PgPool,
+    digest_id: Uuid,
+    subscriber_id: Uuid,
+    snapshot: ReplaySnapshot,
+) {
+    let result = with_scope(pool, ScopeCtx::Subscriber(subscriber_id), move |conn| {
+        Box::pin(async move {
+            store::record_candidates(&mut *conn, digest_id, &snapshot)
+                .await
+                .map_err(Into::into)
+        })
+    })
+    .await;
+    if let Err(e) = result {
+        tracing::warn!(error = %e, "recording candidate snapshot failed (non-fatal)");
+    }
+}
+
 /// The story ids that made the cut, in render order.
 fn selected_ids(decisions: &[Decision]) -> Vec<Uuid> {
     decisions
@@ -347,7 +383,7 @@ pub async fn generate(
     // rank the stories by recency. The story is the unit the digest freezes and renders (§8.2).
     // `window_end` is the re-surface cutoff: a story is "stale" only against digests *before* this
     // one, so an idempotent re-run of the same window doesn't shadow-suppress its own selection.
-    let (_, decisions, story_entities) = link_and_select(
+    let (_, decisions, story_entities, snapshot) = link_and_select(
         pool,
         &sub,
         sub.last_run_at,
@@ -377,6 +413,9 @@ pub async fn generate(
         decision_log(&decisions, &story_entities),
     )
     .await;
+    // Persist the frozen `select` input alongside the decision log, so this digest is replayable under
+    // a trial config later (the eval sweep). Best-effort — never fails the send.
+    record_candidate_snapshot(pool, digest.id, sub.id, snapshot).await;
     assign_threads(pool, digest.id, sub.id, &selected, &story_entities).await;
 
     let digest_id = digest.id;
@@ -456,7 +495,7 @@ pub async fn dispatch_now(
     // Explicit lookback floor = now − lookback_days (last_run_at is ignored — this is off-schedule).
     // A preview links in-memory but persists nothing (`false`): it must not disturb the real story
     // cache, schedule, or de-dup history.
-    let (stories, decisions, story_entities) =
+    let (stories, decisions, story_entities, _) =
         link_and_select(pool, &sub, None, lookback_days, Utc::now(), false).await?;
     log_selection(sub.id, &decisions);
     let selected = selected_ids(&decisions);
@@ -552,7 +591,7 @@ pub async fn explain(pool: &PgPool, subscriber_id: Uuid) -> Result<Vec<ExplainRo
         .await
         .context("build private clusters")?;
 
-    let (stories, decisions, story_entities) = link_and_select(
+    let (stories, decisions, story_entities, _) = link_and_select(
         pool,
         &sub,
         sub.last_run_at,
@@ -647,12 +686,67 @@ pub async fn eval_report(pool: &PgPool, subscriber_id: Uuid, limit: i64) -> Resu
     })
     .await?;
 
-    // Latest grade per story (the rows arrive newest-first, so the first occurrence wins).
+    Ok(eval::evaluate(&logs, &grades_from(feedback)))
+}
+
+/// Config sweep: re-score a subscriber's recent digests under both the **current** config and a
+/// **trial** config, over the identical frozen candidate snapshots, and return `(baseline, trial)`
+/// metrics — a true A/B that isolates the config change (vs `eval_report`, which scores the *frozen*
+/// historical outcome). Only digests fired since the snapshot column landed are replayable; the rest
+/// are silently skipped. Subscriber-scoped, like `eval_report`.
+pub async fn eval_sweep(
+    pool: &PgPool,
+    subscriber_id: Uuid,
+    limit: i64,
+    trial: ScoringConfig,
+) -> Result<(eval::Metrics, eval::Metrics)> {
+    load_required(pool, subscriber_id).await?;
+    let live = store::load_config(pool).await.context("load live config")?;
+    let (snapshots, feedback) =
+        with_scope(pool, ScopeCtx::Subscriber(subscriber_id), move |conn| {
+            Box::pin(async move {
+                let snapshots = store::load_candidate_snapshots(&mut *conn, subscriber_id, limit)
+                    .await
+                    .context("load candidate snapshots")?;
+                let feedback = store::story_feedback(&mut *conn, subscriber_id)
+                    .await
+                    .context("load story feedback")?;
+                Ok((snapshots, feedback))
+            })
+        })
+        .await?;
+
+    let grades = grades_from(feedback);
+    let score = |cfg: &ScoringConfig| {
+        let logs: Vec<Vec<DecisionRecord>> =
+            snapshots.iter().map(|s| eval::replay(s, cfg)).collect();
+        eval::evaluate(&logs, &grades)
+    };
+    Ok((score(&live), score(&trial)))
+}
+
+/// The latest grade per story from the story-feedback rows (newest-first, first occurrence wins).
+fn grades_from(feedback: Vec<(Uuid, String)>) -> HashMap<Uuid, eval::Grade> {
     let mut grades: HashMap<Uuid, eval::Grade> = HashMap::new();
     for (story_id, signal) in feedback {
         if let Some(g) = eval::Grade::from_signal(&signal) {
             grades.entry(story_id).or_insert(g);
         }
     }
-    Ok(eval::evaluate(&logs, &grades))
+    grades
+}
+
+/// Read the singleton scoring config (`debug config`). The table is global, so no scope is needed.
+pub async fn get_config(pool: &PgPool) -> Result<ScoringConfig> {
+    store::load_config(pool)
+        .await
+        .context("load scoring config")
+}
+
+/// Overwrite the singleton scoring config (`debug config-set`). The CLI loads the current config,
+/// applies the operator's provided overrides, and passes the merged value here.
+pub async fn set_config(pool: &PgPool, cfg: ScoringConfig) -> Result<()> {
+    store::update_config(pool, &cfg)
+        .await
+        .context("update scoring config")
 }

@@ -28,6 +28,7 @@ built. The single source of truth for what's shipped is [`roadmap.md`](roadmap.m
 | [`local-ml-options.md`](local-ml-options.md) | Locally-hostable ML (mid-2026) for the deferred ML layer that runs inside `thread_maintenance` — no data egress. Research snapshot. |
 | [`web-frontend.md`](web-frontend.md) | The web surface as a backend/product concern — the read API, auth/IDOR/RLS on the read path, delivery-tech recommendation. Scoping (lands around M5). |
 | [`github-events.md`](github-events.md) | Reference map of GitHub's webhook/event surface and what M2 ingests. |
+| [`operating-eval.md`](operating-eval.md) | Operator guide: using the **eval harness** (`debug eval` / `config` / the config sweep) to measure and tune selection quality. |
 
 ## Conventions
 

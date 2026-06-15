@@ -15,7 +15,36 @@ use std::collections::{HashMap, HashSet};
 
 use uuid::Uuid;
 
-use crate::digest::select::{DecisionRecord, DropCause, Format, Verdict};
+use crate::digest::select::{
+    select, DecisionRecord, DropCause, Format, ItemReason, ReplaySnapshot, ScoringConfig, Verdict,
+};
+
+/// Re-score a persisted [`ReplaySnapshot`] under a trial config — the offline config-sweep primitive.
+/// Pure: runs the *same* [`select`] the live path runs, over the frozen candidate input, returning a
+/// fresh decision log to feed [`evaluate`]. This is what lets an operator A/B a `digest_config` change
+/// over real history without a deploy (and how a later ML signal proves its marginal lift). Entities
+/// are dropped from the replayed reason (metrics don't read them); the rest of the reason is faithful.
+pub fn replay(snapshot: &ReplaySnapshot, cfg: &ScoringConfig) -> Vec<DecisionRecord> {
+    select(
+        snapshot.candidates.clone(),
+        cfg,
+        snapshot.max_items,
+        snapshot.now,
+    )
+    .into_iter()
+    .map(|d| DecisionRecord {
+        story_id: d.id,
+        verdict: d.verdict,
+        reason: ItemReason {
+            relevance: d.relevance,
+            format: d.format,
+            richness: d.richness,
+            priority: d.priority,
+            entities: Vec::new(),
+        },
+    })
+    .collect()
+}
 
 /// A user's verdict on a *shown* story, derived from the `feedback` log. Entity-level
 /// `must_link`/`cannot_link` are not story grades (they act on the identity graph) and map to `None`.
@@ -311,6 +340,37 @@ mod tests {
         assert!((m.story_share - 0.5).abs() < 1e-9);
         assert_eq!(m.precision, None, "no feedback → no precision");
         assert_eq!(m.ndcg, None);
+    }
+
+    #[test]
+    fn replay_rescoring_responds_to_a_trial_cap() {
+        use crate::digest::select::{Candidate, ReplaySnapshot, ScoringConfig};
+        use chrono::TimeZone;
+        let at = |s: i64| chrono::Utc.timestamp_opt(s, 0).single().unwrap();
+        // Three longform single-event stories → all classify Story; only the cap differs.
+        let candidates = vec![
+            Candidate::new(Uuid::from_u128(1), at(300), vec![]),
+            Candidate::new(Uuid::from_u128(2), at(200), vec![]),
+            Candidate::new(Uuid::from_u128(3), at(100), vec![]),
+        ];
+        let snap = ReplaySnapshot {
+            now: at(300),
+            max_items: 1000,
+            candidates,
+        };
+        let tight = ScoringConfig {
+            story_cap: 1,
+            ..Default::default()
+        };
+        let loose = ScoringConfig {
+            story_cap: 5,
+            ..Default::default()
+        };
+        let m_tight = evaluate(&[replay(&snap, &tight)], &HashMap::new());
+        let m_loose = evaluate(&[replay(&snap, &loose)], &HashMap::new());
+        assert_eq!(m_tight.selected, 1, "tight cap selects one");
+        assert_eq!(m_loose.selected, 3, "loose cap selects all three");
+        assert_eq!(m_tight.over_cap, 2);
     }
 
     #[test]
