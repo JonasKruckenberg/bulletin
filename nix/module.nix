@@ -389,6 +389,30 @@ in
       "e /var/lib/bulletin/backups - - - 14d"
     ];
 
+    # Grant the owner role CREATE on `public` before it migrates. NixOS provisions the owner via
+    # `ensureDBOwnership`, but on PG15+ owning the database no longer implies CREATE on `public`
+    # unless `public` is owned by `pg_database_owner` — and on a stock cluster `public` is owned by
+    # `postgres`, so the owner has only USAGE there. The domain migrations happen to skip this gap
+    # (a pre-existing DB has them already recorded in `_sqlx_migrations`), but apalis's
+    # `setup_storage` (worker::setup_storage → PostgresStorage::migrations) is the first run to issue
+    # unqualified `CREATE`s into `public` — `CREATE EXTENSION pgcrypto`, `generate_ulid()`, and its
+    # own `_sqlx_migrations` table — which fail with "permission denied for schema public". This
+    # oneshot (run as the postgres superuser, ordered before migrate) closes that gap idempotently
+    # for both fresh and existing databases.
+    systemd.services.bulletin-grant-public = lib.mkIf cfg.database.createLocally {
+      description = "Grant the Bulletin owner role CREATE on schema public";
+      after = [ "postgresql.target" ];
+      requires = [ "postgresql.target" ];
+      before = [ "bulletin-migrate.service" ];
+      requiredBy = [ "bulletin-migrate.service" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        User = "postgres";
+      };
+      script = "${pgPackage}/bin/psql -d ${dbName} -c 'GRANT USAGE, CREATE ON SCHEMA public TO ${ownerRole};'";
+    };
+
     systemd.services.bulletin-migrate = {
       description = "Bulletin database migrations";
       after = pgDeps;
@@ -408,13 +432,23 @@ in
         # Snapshot the DB immediately before migrating (only on deploy). A failed dump fails the
         # oneshot, which — via the main unit's Requires= — blocks the new binary and leaves the
         # already-running old one up.
+        #
+        # The dump runs as the `postgres` superuser, not the owner role: the scope-bearing tables
+        # carry FORCE ROW LEVEL SECURITY (migrations 0019/0020), and a non-superuser without
+        # BYPASSRLS — which the owner deliberately is — makes pg_dump abort with "query would be
+        # affected by row-level security policy" (it sets `row_security = off` and refuses a partial
+        # dump). `--enable-row-security` would "succeed" but silently drop every private/PII row, so
+        # that is not an option. Running backups as the superuser is the standard posture (it is what
+        # physical-backup tools do) and keeps the owner free of a standing RLS bypass. The `+` prefix
+        # runs ExecStartPre with full privileges so it can `runuser` into postgres (which peer-auths
+        # as the DB superuser); the redirect/mkdir run as root into the unit's StateDirectory.
         // lib.optionalAttrs cfg.database.createLocally {
-          ExecStartPre = pkgs.writeShellScript "bulletin-pre-migrate-backup" ''
+          ExecStartPre = "+${pkgs.writeShellScript "bulletin-pre-migrate-backup" ''
             set -euo pipefail
             mkdir -p "$STATE_DIRECTORY/backups"
-            ${pgPackage}/bin/pg_dump -Fc ${dbName} \
+            ${pkgs.util-linux}/bin/runuser -u postgres -- ${pgPackage}/bin/pg_dump -Fc ${dbName} \
               > "$STATE_DIRECTORY/backups/pre-migrate-$(date +%Y%m%dT%H%M%S).dump"
-          '';
+          ''}";
         };
     };
 

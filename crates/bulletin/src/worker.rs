@@ -26,6 +26,9 @@ use bulletin_core::kind::SourceKind;
 use crate::metric;
 use crate::transport::EmailConfig;
 
+/// Provisions the apalis queue schema. Call only from `bulletin migrate` (the owner role) — never
+/// from a serve/worker path, which logs in as the least-privilege runtime role without the CREATE
+/// privilege apalis's migrator requires.
 pub async fn setup_storage(pool: &PgPool) -> Result<()> {
     let mut m = PostgresStorage::<(), (), ()>::migrations();
     m.ignore_missing = true;
@@ -416,7 +419,12 @@ async fn run_tick(pool: Data<PgPool>) -> Result<(), BoxDynError> {
 // ── Monitor wiring ─────────────────────────────────────────────────────
 
 pub async fn start(pool: PgPool, email: EmailConfig, connectors: ConnectorCtx) -> Result<()> {
-    setup_storage(&pool).await?;
+    // The apalis queue schema is provisioned by `setup_storage` during `bulletin migrate` (run as
+    // the owner role), never here: the worker logs in as the least-privilege runtime role, which
+    // has no CREATE on `public`/`apalis`, and apalis's migrator issues `CREATE TABLE IF NOT EXISTS
+    // _sqlx_migrations` on every run (which needs CREATE even when the table already exists). Running
+    // it here would fail on a deployed two-role setup the moment the worker starts. Migrations are a
+    // `bulletin migrate` concern; the worker assumes the schema is already in place.
 
     // One local-clock cron drives all three sweeps; duplicate ticks across replicas are
     // harmless because each sweep is watermark-gated (and the digest sweep also idempotency-keyed).
