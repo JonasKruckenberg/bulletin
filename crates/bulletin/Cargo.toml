@@ -38,3 +38,16 @@ chrono          = { workspace = true }
 lettre          = { workspace = true }
 ulid            = { workspace = true }
 secrecy         = { workspace = true }  # expose unsealed secret bytes at the startup wiring seam
+# gRPC service API (`bulletin api` role). The proto contract lives in proto/, compiled by build.rs.
+tonic            = { workspace = true }
+tonic-prost      = { workspace = true }
+tonic-reflection = { workspace = true }
+tonic-health     = { workspace = true }
+prost            = { workspace = true }
+prost-types      = { workspace = true }
+sha2             = { workspace = true }  # hash API bearer tokens (subscriber plane, A2)
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }
+protox            = { workspace = true }
+prost             = { workspace = true }

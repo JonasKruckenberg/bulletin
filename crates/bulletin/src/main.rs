@@ -1,3 +1,4 @@
+mod api;
 mod debug;
 mod metric;
 mod secrets;
@@ -34,6 +35,15 @@ struct Cli {
     /// Bind address for the Prometheus metrics exporter (`worker` / `all`).
     #[arg(long, env = "BULLETIN_METRICS_ADDR", default_value = "127.0.0.1:9464")]
     metrics_addr: SocketAddr,
+    /// Bind address for the gRPC service API (`api` / `all`). Loopback by default — front it with TLS
+    /// before exposing it off-box.
+    #[arg(long, env = "BULLETIN_API_ADDR", default_value = "127.0.0.1:50051")]
+    api_addr: SocketAddr,
+    /// Bearer key authorizing the gRPC **admin plane** (`api` / `all`). Absent ⇒ every admin RPC is
+    /// rejected (fail-closed). Sealing it under the master key is future work; a plain env value is
+    /// accepted now, like the dev webhook-secret fallback.
+    #[arg(long, env = "BULLETIN_API_ADMIN_KEY")]
+    api_admin_key: Option<String>,
     /// Log output format: `text` (human) or `json` (one structured line per event, for Loki).
     #[arg(long, env = "BULLETIN_LOG_FORMAT", default_value = "text")]
     log_format: LogFormat,
@@ -68,6 +78,8 @@ enum Command {
     Worker,
     Migrate,
     All,
+    /// Run the gRPC service API server (admin plane).
+    Api,
     Debug {
         #[command(subcommand)]
         command: debug::DebugCommand,
@@ -127,15 +139,21 @@ async fn main() -> Result<()> {
             tracing::info!("starting worker");
             worker::start(pool, cli.email.clone(), connectors).await?;
         }
+        Command::Api => {
+            let pool = connect_pool(cli.database_url()?).await?;
+            tracing::info!(addr = %cli.api_addr, "starting gRPC API server");
+            api::serve(cli.api_addr, pool, cli.api_admin_key.clone()).await?;
+        }
         Command::All => {
             metric::init(cli.metrics_addr)?;
             let pool = connect_pool(cli.database_url()?).await?;
             let webhook_secret = cli.secrets.webhook_secret()?;
             let connectors = cli.secrets.connector_ctx()?;
-            tracing::info!(addr = %cli.http_addr, "starting server + worker");
+            tracing::info!(addr = %cli.http_addr, "starting server + worker + api");
             tokio::try_join!(
                 serve(cli.http_addr, pool.clone(), webhook_secret),
-                worker::start(pool, cli.email.clone(), connectors)
+                worker::start(pool.clone(), cli.email.clone(), connectors),
+                api::serve(cli.api_addr, pool, cli.api_admin_key.clone())
             )?;
         }
         Command::Debug { command } => {

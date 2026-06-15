@@ -35,8 +35,10 @@ impl Recurrence {
         }
     }
 
-    /// The stored `(freq, on_weekday)` shape.
-    fn columns(self) -> (&'static str, Option<i32>) {
+    /// The stored `(freq, on_weekday)` shape — also the encoding the API serializes over the wire, so
+    /// it's `pub`: the one place the `(freq, weekday)` mapping lives, rather than a hand-written match
+    /// per caller that a new variant could silently desync.
+    pub fn columns(self) -> (&'static str, Option<i32>) {
         match self {
             Recurrence::Daily => ("daily", None),
             Recurrence::Weekly { weekday } => ("weekly", Some(weekday)),
@@ -54,6 +56,64 @@ impl Recurrence {
             Recurrence::Weekly { weekday } => format!("weekly d{weekday}"),
         }
     }
+}
+
+/// Defaults a caller takes for a subscriber's schedule when it leaves a field blank. Shared by the CLI
+/// (`debug subscriber-add` clap defaults) and the gRPC admin API so the two can't seed different values.
+pub const DEFAULT_FREQ: &str = "daily";
+pub const DEFAULT_TIMEZONE: &str = "UTC";
+pub const DEFAULT_DIGEST_TIME: &str = "09:00";
+
+/// Validated schedule inputs for [`insert_subscriber`], produced by [`validate_schedule`].
+#[derive(Debug)]
+pub struct Schedule {
+    pub recurrence: Recurrence,
+    /// The canonical IANA name — validated here, so an unknown zone is a clean up-front error rather
+    /// than a deferred database failure inside `next_run()`.
+    pub timezone: String,
+    pub digest_time: NaiveTime,
+}
+
+/// Validate + default the schedule fields — the single parsing path the CLI and the gRPC admin API
+/// share. An empty `freq`/`timezone`/`digest_time` takes the default; an empty `freq` *with* a weekday
+/// is read as weekly (rather than rejected for "daily takes no weekday"). The timezone is validated up
+/// front against the IANA database, closing the gap where a bogus zone surfaced as an opaque 500.
+/// Returns a human-readable message on invalid input.
+pub fn validate_schedule(
+    freq: &str,
+    weekday: Option<i32>,
+    timezone: &str,
+    digest_time: &str,
+) -> Result<Schedule, String> {
+    let freq = match (freq.is_empty(), weekday.is_some()) {
+        (true, true) => "weekly",
+        (true, false) => DEFAULT_FREQ,
+        (false, _) => freq,
+    };
+    let recurrence = Recurrence::new(freq, weekday)?;
+
+    let timezone = if timezone.is_empty() {
+        DEFAULT_TIMEZONE
+    } else {
+        timezone
+    };
+    let timezone: chrono_tz::Tz = timezone
+        .parse()
+        .map_err(|_| format!("unknown timezone '{timezone}'"))?;
+
+    let digest_time = if digest_time.is_empty() {
+        DEFAULT_DIGEST_TIME
+    } else {
+        digest_time
+    };
+    let digest_time = NaiveTime::parse_from_str(digest_time, "%H:%M")
+        .map_err(|_| "digest_time must be HH:MM (24-hour)".to_string())?;
+
+    Ok(Schedule {
+        recurrence,
+        timezone: timezone.name().to_string(),
+        digest_time,
+    })
 }
 
 /// The subscriber's selectable columns. Scheduling is a [`Recurrence`] at a local `digest_time` in
@@ -257,4 +317,45 @@ pub async fn advance_after_delivery(
     .execute(executor)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_schedule_applies_defaults() {
+        let s = validate_schedule("", None, "", "").unwrap();
+        assert_eq!(s.recurrence, Recurrence::Daily);
+        assert_eq!(s.timezone, "UTC");
+        assert_eq!(s.digest_time, NaiveTime::from_hms_opt(9, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn empty_freq_with_weekday_is_weekly() {
+        // The proto "empty ⇒ daily" default must not reject a caller that set only the weekday.
+        let s = validate_schedule("", Some(3), "UTC", "08:30").unwrap();
+        assert_eq!(s.recurrence, Recurrence::Weekly { weekday: 3 });
+        assert_eq!(s.digest_time, NaiveTime::from_hms_opt(8, 30, 0).unwrap());
+    }
+
+    #[test]
+    fn unknown_timezone_is_rejected_up_front() {
+        let err = validate_schedule("daily", None, "Mars/Phobos", "09:00").unwrap_err();
+        assert!(err.contains("timezone"), "{err}");
+    }
+
+    #[test]
+    fn timezone_is_canonicalized() {
+        let s = validate_schedule("daily", None, "America/New_York", "09:00").unwrap();
+        assert_eq!(s.timezone, "America/New_York");
+    }
+
+    #[test]
+    fn bad_digest_time_and_bad_freq_are_rejected() {
+        assert!(validate_schedule("daily", None, "UTC", "9am").is_err());
+        assert!(validate_schedule("monthly", None, "UTC", "09:00").is_err());
+        // weekday out of range is rejected by Recurrence::new
+        assert!(validate_schedule("weekly", Some(9), "UTC", "09:00").is_err());
+    }
 }

@@ -1,10 +1,9 @@
 //! The `bulletin debug …` inspection commands: seed/list connections and subscribers, run the
 //! pipeline stages inline, and dump state. Kept out of `main.rs` so it stays a thin dispatcher.
 
-use anyhow::{Context, Result};
-use bulletin_core::digest::subscriber::Recurrence;
+use anyhow::Result;
 use bulletin_core::status::StatusReport;
-use bulletin_core::{cluster, digest, ingest, kind::SourceKind, status};
+use bulletin_core::{cluster, digest, ingest, status};
 use clap::Subcommand;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -20,7 +19,7 @@ pub enum DebugCommand {
         /// JSON config blob, e.g. '{"url":"https://..."}'
         #[arg(long)]
         config: String,
-        #[arg(long, default_value = "900")]
+        #[arg(long, default_value_t = bulletin_core::ingest::DEFAULT_POLL_INTERVAL_SECS)]
         poll_interval: i64,
         /// Owning subscriber id — required for a source that can see private repos (its private
         /// events bind to this owner's scope). Omit for a global/public source like RSS.
@@ -44,16 +43,16 @@ pub enum DebugCommand {
         #[arg(long)]
         name: Option<String>,
         /// Recurrence frequency: daily | weekly
-        #[arg(long, default_value = "daily")]
+        #[arg(long, default_value = bulletin_core::digest::subscriber::DEFAULT_FREQ)]
         freq: String,
         /// Day of week for weekly digests: 0=Sun .. 6=Sat (required iff --freq weekly)
         #[arg(long)]
         weekday: Option<i32>,
         /// IANA timezone the digest time is interpreted in, e.g. America/New_York
-        #[arg(long, default_value = "UTC")]
+        #[arg(long, default_value = bulletin_core::digest::subscriber::DEFAULT_TIMEZONE)]
         timezone: String,
         /// Local time-of-day to deliver, HH:MM (24-hour)
-        #[arg(long, default_value = "09:00")]
+        #[arg(long, default_value = bulletin_core::digest::subscriber::DEFAULT_DIGEST_TIME)]
         digest_time: String,
     },
     /// List subscribers
@@ -93,40 +92,18 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> R
             poll_interval,
             owner,
         } => {
-            let source = SourceKind::try_from(source.as_str()).map_err(|_| {
-                anyhow::anyhow!("unknown source '{}'; valid: rss, github, slack", source)
-            })?;
-            // A private-capable source must be owned, or its private events would have no scope to
-            // bind to (the DB CHECK enforces this too; this is the friendly up-front error).
-            if source.can_emit_private() && owner.is_none() {
-                anyhow::bail!(
-                    "a {} connection can see private content and must be owned — pass --owner <subscriber-id>",
-                    source.as_str()
-                );
-            }
-            let config: serde_json::Value =
-                serde_json::from_str(&config).context("--config is not valid JSON")?;
-            // Webhook routing key. For GitHub the installation_id (already in --config, not a secret)
-            // doubles as `provider_account_id`, so lifecycle/content webhooks resolve to THIS row —
-            // derived from our own seed config, never a delivery payload (the IDOR boundary). Without
-            // it a seeded GitHub connection would poll but silently drop every webhook as unrouted.
-            let provider_account_id = match source {
-                SourceKind::Github => Some(
-                    config
-                        .get("installation_id")
-                        .and_then(|v| v.as_i64())
-                        .context("a github --config needs an integer \"installation_id\"")?
-                        .to_string(),
-                ),
-                _ => None,
-            };
+            // Shared validation (source vocabulary, the private-source-must-be-owned guard, and the
+            // GitHub installation_id → provider_account_id routing key) lives in `core` so the CLI and
+            // the gRPC admin API can't drift on what a valid connection is.
+            let conn = ingest::prepare_connection(&source, &config, poll_interval, owner)
+                .map_err(|e| anyhow::anyhow!(e))?;
             let id = ingest::store::insert_connection(
                 pool,
-                source,
-                config,
-                poll_interval,
-                owner,
-                provider_account_id.as_deref(),
+                conn.source,
+                conn.config,
+                conn.poll_interval_secs,
+                conn.owner,
+                conn.provider_account_id.as_deref(),
             )
             .await?;
             println!("{id}");
@@ -180,16 +157,18 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> R
             timezone,
             digest_time,
         } => {
-            let recurrence = Recurrence::new(&freq, weekday).map_err(|e| anyhow::anyhow!("{e}"))?;
-            let digest_time = chrono::NaiveTime::parse_from_str(&digest_time, "%H:%M")
-                .context("--digest-time must be HH:MM (24-hour)")?;
+            // Shared cadence/timezone/time validation lives in `core` (with up-front IANA tz checking),
+            // so the CLI and the gRPC admin API parse a schedule identically.
+            let schedule =
+                digest::subscriber::validate_schedule(&freq, weekday, &timezone, &digest_time)
+                    .map_err(|e| anyhow::anyhow!(e))?;
             let id = digest::subscriber::insert_subscriber(
                 pool,
                 &email,
                 name.as_deref(),
-                recurrence,
-                &timezone,
-                digest_time,
+                schedule.recurrence,
+                &schedule.timezone,
+                schedule.digest_time,
             )
             .await?;
             println!("{id}");

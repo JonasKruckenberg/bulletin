@@ -1,0 +1,141 @@
+syntax = "proto3";
+
+// Bulletin service API, v1. The admin plane: control-plane management + read access that mirrors the
+// `bulletin debug …` operator commands over gRPC. Every RPC authenticates an admin bearer and runs its
+// DB work in the engine's `ScopeCtx::Admin` control-plane context (the core store fns self-scope).
+// Breaking changes go to a new `v2` package — never edit a shipped v1 message's wire layout.
+package bulletin.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Admin plane → ScopeCtx::Admin (control-plane + public content only; no backdoor to a tenant's
+// private content — that is served only by the subscriber plane under that subscriber's own token).
+service AdminService {
+  // Connections (mirrors `debug connection-add / connection-list / connection-rm`).
+  rpc ListConnections(ListConnectionsRequest) returns (ListConnectionsResponse);
+  rpc CreateConnection(CreateConnectionRequest) returns (Connection);
+  rpc DeleteConnection(DeleteConnectionRequest) returns (DeleteConnectionResponse);
+
+  // Subscribers (mirrors `debug subscriber-add / subscriber-list / subscriber-rm`).
+  rpc ListSubscribers(ListSubscribersRequest) returns (ListSubscribersResponse);
+  rpc CreateSubscriber(CreateSubscriberRequest) returns (Subscriber);
+  rpc DeleteSubscriber(DeleteSubscriberRequest) returns (DeleteSubscriberResponse);
+
+  // Ops / read (mirrors `debug status / event-list / digest-list`). Digest content is metadata only —
+  // the private items live behind the subscriber plane.
+  rpc GetStatus(GetStatusRequest) returns (StatusReport);
+  rpc ListEvents(ListEventsRequest) returns (ListEventsResponse);
+  rpc ListDigests(ListDigestsRequest) returns (ListDigestsResponse);
+}
+
+// ── Connections ────────────────────────────────────────────────────────────
+message Connection {
+  string id = 1;                                   // uuid
+  string source = 2;                               // rss | github | …
+  string status = 3;                               // active | paused | errored | …
+  string config_json = 4;                          // the connection's JSON config blob
+  int64 poll_interval_secs = 5;
+  google.protobuf.Timestamp next_poll_at = 6;
+  optional google.protobuf.Timestamp last_polled_at = 7;
+  int32 consecutive_failures = 8;
+  optional string subscriber_id = 9;               // owning subscriber (absent = global/public source)
+}
+
+message ListConnectionsRequest {}
+message ListConnectionsResponse { repeated Connection connections = 1; }
+
+message CreateConnectionRequest {
+  string source = 1;                               // rss | github | …
+  string config_json = 2;                          // e.g. {"url":"https://…/feed.xml"}
+  int64 poll_interval_secs = 3;                    // 0 ⇒ server default (900s)
+  optional string owner = 4;                       // subscriber uuid; required for a private-capable source
+}
+
+message DeleteConnectionRequest { string id = 1; }
+message DeleteConnectionResponse { bool deleted = 1; }
+
+// ── Subscribers ──────────────────────────────────────────────────────────────
+message Subscriber {
+  string id = 1;
+  string email = 2;
+  optional string name = 3;
+  string freq = 4;                                 // daily | weekly
+  optional int32 weekday = 5;                      // 0=Sun..6=Sat, present iff weekly
+  int32 max_items = 6;
+  string timezone = 7;                             // IANA name
+  string digest_time = 8;                          // local HH:MM
+  google.protobuf.Timestamp next_run_at = 9;
+  optional google.protobuf.Timestamp last_run_at = 10;
+}
+
+message ListSubscribersRequest {}
+message ListSubscribersResponse { repeated Subscriber subscribers = 1; }
+
+message CreateSubscriberRequest {
+  string email = 1;
+  optional string name = 2;
+  string freq = 3;                                 // empty ⇒ "daily"
+  optional int32 weekday = 4;                      // required iff freq = weekly
+  string timezone = 5;                             // empty ⇒ "UTC"
+  string digest_time = 6;                          // empty ⇒ "09:00" (HH:MM)
+}
+
+message DeleteSubscriberRequest { string id = 1; }
+message DeleteSubscriberResponse { bool deleted = 1; }
+
+// ── Ops / read ───────────────────────────────────────────────────────────────
+message GetStatusRequest {}
+
+message StatusReport {
+  ConnectionStats connections = 1;
+  EventStats events = 2;
+  BuildStatus build = 3;
+  ClusterStats clusters = 4;
+  SubscriberStats subscribers = 5;
+  DigestStats digests = 6;
+  // Apalis queue counts by job type. `queue_initialized` is false when the apalis schema isn't set up
+  // yet (run `migrate`), in which case `queue` is empty.
+  bool queue_initialized = 7;
+  repeated QueueStats queue = 8;
+}
+
+message ConnectionStats { int64 total = 1; int64 active = 2; int64 paused = 3; int64 errored = 4; int64 due_now = 5; }
+message EventStats {
+  int64 total = 1;
+  int64 unbuilt = 2;
+  optional google.protobuf.Timestamp latest_ingest = 3;
+  repeated SourceCount by_source = 4;
+}
+message SourceCount { string source = 1; int64 count = 2; }
+message BuildStatus { google.protobuf.Timestamp built_through = 1; int64 lag_secs = 2; }
+message ClusterStats { int64 total = 1; optional google.protobuf.Timestamp latest_updated = 2; }
+message SubscriberStats { int64 total = 1; int64 daily = 2; int64 weekly = 3; int64 due_now = 4; optional google.protobuf.Timestamp next_run = 5; }
+message DigestStats { int64 total = 1; int64 pending = 2; int64 delivered = 3; optional google.protobuf.Timestamp last_delivered = 4; }
+message QueueStats {
+  string job_type = 1;
+  int64 pending = 2;
+  int64 running = 3;
+  int64 done = 4;
+  int64 failed = 5;
+  int64 killed = 6;
+  optional int64 oldest_pending_secs = 7;
+}
+
+message ListEventsRequest { int64 limit = 1; }                 // 0 ⇒ default (20)
+message ListEventsResponse { repeated EventSummary events = 1; }
+message EventSummary {
+  google.protobuf.Timestamp ingest_time = 1;
+  string source = 2;
+  string title = 3;
+  repeated string links = 4;
+}
+
+message ListDigestsRequest { int64 limit = 1; }                // 0 ⇒ default (20)
+message ListDigestsResponse { repeated DigestSummary digests = 1; }
+message DigestSummary {
+  string id = 1;
+  string subscriber_email = 2;
+  google.protobuf.Timestamp window_end = 3;
+  optional google.protobuf.Timestamp delivered_at = 4;
+  int64 item_count = 5;
+}
