@@ -432,13 +432,23 @@ in
         # Snapshot the DB immediately before migrating (only on deploy). A failed dump fails the
         # oneshot, which — via the main unit's Requires= — blocks the new binary and leaves the
         # already-running old one up.
+        #
+        # The dump runs as the `postgres` superuser, not the owner role: the scope-bearing tables
+        # carry FORCE ROW LEVEL SECURITY (migrations 0019/0020), and a non-superuser without
+        # BYPASSRLS — which the owner deliberately is — makes pg_dump abort with "query would be
+        # affected by row-level security policy" (it sets `row_security = off` and refuses a partial
+        # dump). `--enable-row-security` would "succeed" but silently drop every private/PII row, so
+        # that is not an option. Running backups as the superuser is the standard posture (it is what
+        # physical-backup tools do) and keeps the owner free of a standing RLS bypass. The `+` prefix
+        # runs ExecStartPre with full privileges so it can `runuser` into postgres (which peer-auths
+        # as the DB superuser); the redirect/mkdir run as root into the unit's StateDirectory.
         // lib.optionalAttrs cfg.database.createLocally {
-          ExecStartPre = pkgs.writeShellScript "bulletin-pre-migrate-backup" ''
+          ExecStartPre = "+${pkgs.writeShellScript "bulletin-pre-migrate-backup" ''
             set -euo pipefail
             mkdir -p "$STATE_DIRECTORY/backups"
-            ${pgPackage}/bin/pg_dump -Fc ${dbName} \
+            ${pkgs.util-linux}/bin/runuser -u postgres -- ${pgPackage}/bin/pg_dump -Fc ${dbName} \
               > "$STATE_DIRECTORY/backups/pre-migrate-$(date +%Y%m%dT%H%M%S).dump"
-          '';
+          ''}";
         };
     };
 
