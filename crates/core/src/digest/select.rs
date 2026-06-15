@@ -46,6 +46,9 @@ const RELEVANCE_FLOOR: f32 = 0.0;
 const SCOPE_BONUS: f32 = 0.5;
 /// Priority boost per point of a story's `max_severity`.
 const SEVERITY_WEIGHT: f32 = 0.1;
+/// Priority boost weight for cross-source corroboration. At the default a 2-source story gets ×1.25
+/// priority, a 3-source ×1.33 — bounded (see [`corroboration`]).
+const CORROBORATION_WEIGHT: f32 = 0.5;
 /// Recency decay half-life (days): the recency-bound priority halves every this many days of age.
 const RECENCY_HALF_LIFE_DAYS: f64 = 3.0;
 /// Thread-term decay half-life (days): deliberately ≫ recency, so an invested thread stays promoted
@@ -100,6 +103,9 @@ pub struct ScoringConfig {
     pub scope_bonus: f32,
     /// Priority boost per point of a story's `max_severity`.
     pub severity_weight: f32,
+    /// Priority multiplier weight for **cross-source corroboration**: independent sources corroborating
+    /// one story lift its priority, not just its Story/Note format (design §8.3). `0.0` disables it.
+    pub corroboration_weight: f32,
     /// Priority halves every this-many days of age (recency decay at read time).
     pub recency_half_life_days: f64,
     /// The **thread** relevance term ages on a slower cadence than recency — it halves every
@@ -122,6 +128,7 @@ impl Default for ScoringConfig {
             relevance_floor: RELEVANCE_FLOOR,
             scope_bonus: SCOPE_BONUS,
             severity_weight: SEVERITY_WEIGHT,
+            corroboration_weight: CORROBORATION_WEIGHT,
             recency_half_life_days: RECENCY_HALF_LIFE_DAYS,
             thread_half_life_days: THREAD_HALF_LIFE_DAYS,
             story_cap: STORY_CAP,
@@ -327,17 +334,35 @@ fn relevance(c: &Candidate, cfg: &ScoringConfig) -> f32 {
     base_relevance(c, cfg) + c.relevance
 }
 
-/// Priority — relevance-led, boosted by `max_severity`, aged by recency decay at read time
-/// (design §8.3). The recency-bound part (`base_relevance` + severity) decays on the recency
-/// half-life; the **thread** term (`c.relevance`) decays on the slower `thread_half_life_days`, so an
-/// invested thread stays promoted for weeks yet still eventually ages out (§9.4). The two components
-/// are kept explicit (no reconstructing one from the total), so adding a relevance term later can't
-/// silently mis-split the decay. With no thread term this is the single-decay form.
+/// Cross-source corroboration factor in `[0, 1)`: `0` for a single source, rising and **saturating**
+/// as independent sources corroborate one story (`1 − 1/source_diversity`: 2 → 0.5, 3 → 0.67, 4 →
+/// 0.75). Independent sources lighting up about the same thing is *importance*, not just a
+/// richness/format signal — the strongest "this matters" signal a multi-source aggregator has — so it
+/// feeds priority (design §8.3). Saturating so a flood of low-value sources can't run away with it.
+fn corroboration(source_diversity: i32) -> f32 {
+    if source_diversity > 1 {
+        1.0 - 1.0 / source_diversity as f32
+    } else {
+        0.0
+    }
+}
+
+/// Priority — relevance-led, boosted by `max_severity` and by **cross-source corroboration**, aged by
+/// recency decay at read time (design §8.3). The recency-bound part (`base_relevance` + severity)
+/// decays on the recency half-life; the **thread** term (`c.relevance`) decays on the slower
+/// `thread_half_life_days`, so an invested thread stays promoted for weeks yet still eventually ages
+/// out (§9.4). The two decay components are kept explicit (no reconstructing one from the total), so a
+/// later relevance term can't silently mis-split the decay. Corroboration then lifts the rank by
+/// breadth — but only a story's *positive* priority: it adds `corroboration_weight · factor · base⁺`,
+/// so it's `×1` for a single source (single-source stories unchanged), and never amplifies a (rarely)
+/// negative base into a *worse* rank — an importance signal must not push a story down.
 fn priority(c: &Candidate, cfg: &ScoringConfig, now: DateTime<Utc>) -> f32 {
     let sev = c.max_severity.unwrap_or(0) as f32;
     let recency = recency_decay(now, c.last_event_time, cfg.recency_half_life_days) as f32;
     let thread_decay = recency_decay(now, c.last_event_time, cfg.thread_half_life_days) as f32;
-    (base_relevance(c, cfg) + cfg.severity_weight * sev) * recency + c.relevance * thread_decay
+    let base =
+        (base_relevance(c, cfg) + cfg.severity_weight * sev) * recency + c.relevance * thread_decay;
+    base + cfg.corroboration_weight * corroboration(c.source_diversity) * base.max(0.0)
 }
 
 /// Richness → render format + a human phrase (design §8.4). Story when multi-source, multi-event, or a
@@ -754,6 +779,69 @@ mod tests {
             selected_ids(&out),
             vec![Uuid::from_u128(2)],
             "eventually it ages out"
+        );
+    }
+
+    #[test]
+    fn corroboration_factor_saturates() {
+        assert_eq!(corroboration(1), 0.0); // single source → no boost
+        assert!((corroboration(2) - 0.5).abs() < 1e-6);
+        assert!((corroboration(3) - 2.0 / 3.0).abs() < 1e-6);
+        assert!((corroboration(4) - 0.75).abs() < 1e-6);
+        assert!(corroboration(100) < 1.0, "bounded below 1");
+    }
+
+    #[test]
+    fn corroboration_promotes_a_multi_source_story_in_priority() {
+        // Two equally-fresh stories; one is corroborated across 3 sources. Decay off, cap 1 → the
+        // corroborated one wins purely on the corroboration boost — breadth feeds *priority*, not just
+        // the Story/Note format (design §8.3).
+        let cfg = ScoringConfig {
+            story_cap: 1,
+            recency_half_life_days: 0.0, // pure relevance × corroboration
+            ..Default::default()
+        };
+        let single = story(1, 100);
+        let mut corroborated = story(2, 100);
+        corroborated.source_diversity = 3;
+        let out = select(vec![single, corroborated], &cfg, 1000, at(100));
+        assert_eq!(selected_ids(&out), vec![Uuid::from_u128(2)]);
+    }
+
+    #[test]
+    fn zero_corroboration_weight_is_a_no_op() {
+        // With the weight off, a multi-source story has no priority edge over a single-source peer of
+        // equal recency — back to the pre-corroboration behavior (the tiebreak falls to id).
+        let cfg = ScoringConfig {
+            corroboration_weight: 0.0,
+            recency_half_life_days: 0.0,
+            ..Default::default()
+        };
+        let single = story(1, 100);
+        let mut corroborated = story(2, 100);
+        corroborated.source_diversity = 5;
+        let out = select(vec![single, corroborated], &cfg, 1000, at(100));
+        // Equal priority → ordered by the id tiebreak, not by corroboration.
+        assert_eq!(out[0].id, Uuid::from_u128(1));
+    }
+
+    #[test]
+    fn corroboration_never_worsens_a_negative_base_priority() {
+        // An aged, multi-source story whose negative thread term drives its *base* priority below 0 (but
+        // still clears the floor): corroboration must leave it untouched, never push it further down —
+        // source_diversity can't change a negative-base priority (so it equals its single-source self).
+        let cfg = ScoringConfig::default();
+        let now = at(60 * 86_400);
+        let mut single = story(1, 0); // 60 days old
+        single.relevance = -0.9; // passes the gate (1.0 − 0.9 = 0.1 ≥ 0) but drives base < 0
+        let mut multi = single.clone();
+        multi.source_diversity = 5;
+        let p_single = priority(&single, &cfg, now);
+        let p_multi = priority(&multi, &cfg, now);
+        assert!(p_single < 0.0, "precondition: base priority is negative");
+        assert_eq!(
+            p_single, p_multi,
+            "corroboration must not change a negative-base priority"
         );
     }
 
