@@ -106,6 +106,11 @@ async fn traced(
     .await
 }
 
+/// Flattens an `anyhow` error chain into the `BoxDynError` apalis wants from a failed job.
+fn boxed(e: anyhow::Error) -> BoxDynError {
+    format!("{e:#}").into()
+}
+
 // ── Job handlers: each is just `flow → metrics` ────────────────────────
 
 async fn poll_connection(
@@ -124,7 +129,7 @@ async fn poll_connection(
             }) => metric::ingest_result(source.as_str(), "poll", inserted, deduplicated),
             Ok(PollOutcome::Failed { source }) => metric::poll_failed(source.as_str()),
             Ok(PollOutcome::Skipped) => {}
-            Err(e) => return Err(format!("{e:#}").into()),
+            Err(e) => return Err(boxed(e)),
         }
         Ok(())
     })
@@ -159,7 +164,7 @@ async fn process_webhook(
             Ok(WebhookOutcome::Lifecycle { .. })
             | Ok(WebhookOutcome::Unrouted { .. })
             | Ok(WebhookOutcome::Skipped) => {}
-            Err(e) => return Err(format!("{e:#}").into()),
+            Err(e) => return Err(boxed(e)),
         }
         Ok(())
     })
@@ -180,7 +185,7 @@ async fn public_build(
             Ok(None) => tracing::debug!("public build skipped (lock held by a concurrent build)"),
             Err(e) => {
                 tracing::error!(error = %format!("{e:#}"), "public build failed");
-                return Err(format!("{e:#}").into());
+                return Err(boxed(e));
             }
         }
         Ok(())
@@ -196,7 +201,7 @@ async fn generate_digest(
     email: Data<EmailConfig>,
 ) -> Result<(), BoxDynError> {
     traced("generate_digest", task_id, attempt, async move {
-        let sender = email.build_sender().map_err(|e| format!("{e:#}"))?;
+        let sender = email.build_sender().map_err(boxed)?;
         let content = email.content();
         match bulletin_core::digest::generate(&pool, &sender, job.subscriber_id, &content).await {
             Ok(outcome) => {
@@ -215,7 +220,7 @@ async fn generate_digest(
             }
             Err(e) => {
                 tracing::error!(subscriber_id = %job.subscriber_id, error = %format!("{e:#}"), "digest failed");
-                return Err(format!("{e:#}").into());
+                return Err(boxed(e));
             }
         }
         Ok(())
@@ -244,7 +249,7 @@ async fn thread_maintenance(
                 weighted_entities = stats.weighted_entities,
                 "thread maintenance complete"
             ),
-            Err(e) => return Err(format!("{e:#}").into()),
+            Err(e) => return Err(boxed(e)),
         }
         Ok(())
     })
@@ -388,64 +393,64 @@ pub async fn start(pool: PgPool, email: EmailConfig, connectors: ConnectorCtx) -
     // harmless because each sweep is watermark-gated (and the digest sweep also idempotency-keyed).
     let schedule = Schedule::from_str("0 * * * * *").context("invalid cron expression")?;
 
-    let pool_tick = pool.clone();
-    let pool_poll = pool.clone();
-    let pool_build = pool.clone();
-    let pool_digest = pool.clone();
-    let pool_webhook = pool.clone();
-    let pool_maint = pool.clone();
-
+    // Each `register` factory owns its own `PgPool` handle (a cheap Arc clone); cloning in the
+    // capture block keeps the clone next to its use instead of a ladder of pre-named bindings.
     Monitor::new()
-        .register(move |_| {
-            let pool = pool_tick.clone();
-            WorkerBuilder::new("bulletin-tick")
-                .backend(CronStream::new(schedule.clone()))
-                .data(pool)
-                .build(handle_tick)
+        .register({
+            let pool = pool.clone();
+            move |_| {
+                WorkerBuilder::new("bulletin-tick")
+                    .backend(CronStream::new(schedule.clone()))
+                    .data(pool.clone())
+                    .build(handle_tick)
+            }
         })
-        .register(move |_| {
-            let pool = pool_poll.clone();
-            let connectors = connectors.clone();
-            let storage: PostgresStorage<PollConnectionJob> = PostgresStorage::new(&pool);
-            WorkerBuilder::new("bulletin-poll-connection")
-                .backend(storage)
-                .data(pool)
-                .data(connectors)
-                .build(poll_connection)
+        .register({
+            let pool = pool.clone();
+            move |_| {
+                WorkerBuilder::new("bulletin-poll-connection")
+                    .backend(PostgresStorage::<PollConnectionJob>::new(&pool))
+                    .data(pool.clone())
+                    .data(connectors.clone())
+                    .build(poll_connection)
+            }
         })
-        .register(move |_| {
-            let pool = pool_build.clone();
-            let storage: PostgresStorage<PublicBuildJob> = PostgresStorage::new(&pool);
-            WorkerBuilder::new("bulletin-public-build")
-                .backend(storage)
-                .data(pool)
-                .build(public_build)
+        .register({
+            let pool = pool.clone();
+            move |_| {
+                WorkerBuilder::new("bulletin-public-build")
+                    .backend(PostgresStorage::<PublicBuildJob>::new(&pool))
+                    .data(pool.clone())
+                    .build(public_build)
+            }
         })
-        .register(move |_| {
-            let pool = pool_digest.clone();
-            let email = email.clone();
-            let storage: PostgresStorage<GenerateDigestJob> = PostgresStorage::new(&pool);
-            WorkerBuilder::new("bulletin-generate-digest")
-                .backend(storage)
-                .data(pool)
-                .data(email)
-                .build(generate_digest)
+        .register({
+            let pool = pool.clone();
+            move |_| {
+                WorkerBuilder::new("bulletin-generate-digest")
+                    .backend(PostgresStorage::<GenerateDigestJob>::new(&pool))
+                    .data(pool.clone())
+                    .data(email.clone())
+                    .build(generate_digest)
+            }
         })
-        .register(move |_| {
-            let pool = pool_webhook.clone();
-            let storage: PostgresStorage<ProcessWebhookJob> = PostgresStorage::new(&pool);
-            WorkerBuilder::new("bulletin-process-webhook")
-                .backend(storage)
-                .data(pool)
-                .build(process_webhook)
+        .register({
+            let pool = pool.clone();
+            move |_| {
+                WorkerBuilder::new("bulletin-process-webhook")
+                    .backend(PostgresStorage::<ProcessWebhookJob>::new(&pool))
+                    .data(pool.clone())
+                    .build(process_webhook)
+            }
         })
-        .register(move |_| {
-            let pool = pool_maint.clone();
-            let storage: PostgresStorage<ThreadMaintenanceJob> = PostgresStorage::new(&pool);
-            WorkerBuilder::new("bulletin-thread-maintenance")
-                .backend(storage)
-                .data(pool)
-                .build(thread_maintenance)
+        .register({
+            let pool = pool.clone();
+            move |_| {
+                WorkerBuilder::new("bulletin-thread-maintenance")
+                    .backend(PostgresStorage::<ThreadMaintenanceJob>::new(&pool))
+                    .data(pool.clone())
+                    .build(thread_maintenance)
+            }
         })
         .run()
         .await
