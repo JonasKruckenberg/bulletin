@@ -8,6 +8,17 @@ use chrono::{DateTime, Utc};
 use sqlx::{postgres::PgRow, PgExecutor, PgPool, Row};
 use uuid::Uuid;
 
+/// The `connection` column list, in `ConnectionRow` / `row_to_connection` order — shared by every
+/// read so the projection can't drift from the mapper.
+const CONNECTION_COLUMNS: &str = "id, source, status, config, cursor, poll_interval_secs, \
+     next_poll_at, last_polled_at, consecutive_failures, subscriber_id";
+
+/// The full `event` column list (DB-filled `id`/`ingest_time` included), in `from_row` order —
+/// shared by the append `RETURNING` and the debug list `SELECT`.
+const EVENT_COLUMNS: &str = "id, fingerprint, source, scope_kind, scope_subscriber_id, \
+     event_time, title, body, links, group_key, entities, \
+     content_kind, severity_hint, ingest_time, raw";
+
 // ── Connections ────────────────────────────────────────────────────────
 //
 // `connection` is under RLS (fail-closed): the runtime role reaches every owner's connections only
@@ -48,12 +59,10 @@ fn row_to_connection(row: PgRow) -> Result<ConnectionRow, sqlx::Error> {
 /// Returns all active connections whose `next_poll_at` is in the past.
 pub async fn due_connections(pool: &PgPool) -> Result<Vec<ConnectionRow>, sqlx::Error> {
     let mut tx = begin_scope(pool, ScopeCtx::Admin).await?;
-    let rows = sqlx::query(
-        "SELECT id, source, status, config, cursor, poll_interval_secs,
-                next_poll_at, last_polled_at, consecutive_failures, subscriber_id
-         FROM connection
-         WHERE status = 'active' AND next_poll_at <= now()",
-    )
+    let rows = sqlx::query(&format!(
+        "SELECT {CONNECTION_COLUMNS} FROM connection
+         WHERE status = 'active' AND next_poll_at <= now()"
+    ))
     .try_map(row_to_connection)
     .fetch_all(&mut *tx)
     .await?;
@@ -98,11 +107,9 @@ pub async fn insert_connection(
 /// Returns all connections regardless of status.
 pub async fn list_connections(pool: &PgPool) -> Result<Vec<ConnectionRow>, sqlx::Error> {
     let mut tx = begin_scope(pool, ScopeCtx::Admin).await?;
-    let rows = sqlx::query(
-        "SELECT id, source, status, config, cursor, poll_interval_secs,
-                next_poll_at, last_polled_at, consecutive_failures, subscriber_id
-         FROM connection ORDER BY next_poll_at",
-    )
+    let rows = sqlx::query(&format!(
+        "SELECT {CONNECTION_COLUMNS} FROM connection ORDER BY next_poll_at"
+    ))
     .try_map(row_to_connection)
     .fetch_all(&mut *tx)
     .await?;
@@ -127,11 +134,9 @@ pub async fn load_connection(
     id: Uuid,
 ) -> Result<Option<ConnectionRow>, sqlx::Error> {
     let mut tx = begin_scope(pool, ScopeCtx::Admin).await?;
-    let row = sqlx::query(
-        "SELECT id, source, status, config, cursor, poll_interval_secs,
-                next_poll_at, last_polled_at, consecutive_failures, subscriber_id
-         FROM connection WHERE id = $1",
-    )
+    let row = sqlx::query(&format!(
+        "SELECT {CONNECTION_COLUMNS} FROM connection WHERE id = $1"
+    ))
     .bind(id)
     .try_map(row_to_connection)
     .fetch_optional(&mut *tx)
@@ -149,12 +154,10 @@ pub async fn resolve_connection_by_provider(
     provider_account_id: &str,
 ) -> Result<Option<ConnectionRow>, sqlx::Error> {
     let mut tx = begin_scope(pool, ScopeCtx::Admin).await?;
-    let row = sqlx::query(
-        "SELECT id, source, status, config, cursor, poll_interval_secs,
-                next_poll_at, last_polled_at, consecutive_failures, subscriber_id
-         FROM connection
-         WHERE source = $1 AND provider_account_id = $2",
-    )
+    let row = sqlx::query(&format!(
+        "SELECT {CONNECTION_COLUMNS} FROM connection
+         WHERE source = $1 AND provider_account_id = $2"
+    ))
     .bind(source)
     .bind(provider_account_id)
     .try_map(row_to_connection)
@@ -242,20 +245,15 @@ pub async fn insert_event(
 ) -> Result<Option<Event>, sqlx::Error> {
     let (scope_kind, scope_subscriber_id) = ev.scope.to_columns();
 
-    sqlx::query(
-        r#"
-        INSERT INTO event (
+    sqlx::query(&format!(
+        "INSERT INTO event (
             fingerprint, source, scope_kind, scope_subscriber_id,
             event_time, title, body, links, group_key, entities,
             content_kind, severity_hint, raw
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
         ON CONFLICT ON CONSTRAINT event_fingerprint_unique DO NOTHING
-        RETURNING
-            id, fingerprint, source, scope_kind, scope_subscriber_id,
-            event_time, title, body, links, group_key, entities,
-            content_kind, severity_hint, ingest_time, raw
-        "#,
-    )
+        RETURNING {EVENT_COLUMNS}"
+    ))
     .bind(&ev.fingerprint.0[..])
     .bind(ev.source)
     .bind(scope_kind)
@@ -276,14 +274,11 @@ pub async fn insert_event(
 
 /// Returns the most recent `limit` events ordered by ingest_time descending (debug dump).
 pub async fn list_events(pool: &PgPool, limit: i64) -> Result<Vec<Event>, sqlx::Error> {
-    sqlx::query(
-        "SELECT id, fingerprint, source, scope_kind, scope_subscriber_id,
-                event_time, title, body, links, group_key, entities,
-                content_kind, severity_hint, ingest_time, raw
-         FROM event
+    sqlx::query(&format!(
+        "SELECT {EVENT_COLUMNS} FROM event
          ORDER BY ingest_time DESC
-         LIMIT $1",
-    )
+         LIMIT $1"
+    ))
     .bind(limit)
     .try_map(from_row)
     .fetch_all(pool)
