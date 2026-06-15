@@ -20,8 +20,9 @@ use uuid::Uuid;
 use crate::common::db::{with_scope, ScopeCtx};
 use crate::digest::select::{select, Candidate, Decision, DecisionRecord, ItemReason, Verdict};
 use crate::digest::store::{
-    build_render_item, cluster_cards, create_with_items, mark_delivered, record_decisions,
-    render_items, render_items_for_stories, RenderItem,
+    build_render_item, cluster_cards, create_with_items, last_shown, load_config, mark_delivered,
+    record_decisions, render_items, render_items_for_stories, story_owner, story_timeline,
+    FrozenItem, RenderItem, TimelineEntry,
 };
 use crate::digest::subscriber::{load_subscriber, SubscriberRow};
 use crate::link::{self, LinkedStory};
@@ -70,13 +71,15 @@ async fn link_and_select(
     sub: &SubscriberRow,
     last_run: Option<DateTime<Utc>>,
     horizon_days: i32,
+    shown_before: DateTime<Utc>,
     persist: bool,
 ) -> Result<(Vec<LinkedStory>, Vec<Decision>, HashMap<Uuid, Vec<String>>)> {
     let sub_id = sub.id;
-    // Read the candidate clusters + the prior story assignment in the subscriber's RLS context: the
-    // candidate set is `public ∪ own-private` (and the prior assignment is the subscriber's own
-    // stories), never another tenant's — the query says so, and now the DB enforces it (design §12).
-    let (clusters, prior) = with_scope(pool, ScopeCtx::Subscriber(sub_id), move |conn| {
+    // Read the candidate clusters, the prior story assignment, and the per-story "last shown"
+    // snapshots in the subscriber's RLS context: the candidate set is `public ∪ own-private` (and the
+    // prior assignment + snapshots are the subscriber's own), never another tenant's — the query says
+    // so, and now the DB enforces it (design §12).
+    let (clusters, prior, shown) = with_scope(pool, ScopeCtx::Subscriber(sub_id), move |conn| {
         Box::pin(async move {
             let clusters =
                 link::store::candidate_clusters(&mut *conn, sub_id, last_run, horizon_days)
@@ -85,7 +88,10 @@ async fn link_and_select(
             let prior = link::store::load_prior_members(&mut *conn, sub_id)
                 .await
                 .context("load prior story assignment")?;
-            Ok((clusters, prior))
+            let shown = last_shown(&mut *conn, sub_id, shown_before, CONTEXT_HORIZON_DAYS)
+                .await
+                .context("load last-shown snapshots")?;
+            Ok((clusters, prior, shown))
         })
     })
     .await?;
@@ -114,12 +120,20 @@ async fn link_and_select(
     let mut candidates: Vec<Candidate> = assignment
         .stories
         .iter()
-        .map(|s| Candidate::new(s.id, s.last_event_time, story_entities[&s.id].clone()))
+        .map(|s| Candidate::from_story(s, story_entities[&s.id].clone(), shown.get(&s.id).copied()))
         .collect();
     // Add the Thread relevance term before ranking (compiled out when the feature is off; a no-op
-    // until thread_maintenance has projected weights).
+    // until thread_maintenance has projected weights) — it folds into the M4 relevance score.
     apply_weighting(pool, sub.id, &mut candidates).await?;
-    let decisions = select(candidates, sub.max_items as usize);
+    // M4 scoring + selection (design §8.4): relevance gates, richness classifies Story/Note, priority
+    // (relevance + severity, recency-decayed) orders + per-format caps, bounded by the subscriber's
+    // overall `max_items`. `now` is read-time so the decay reflects when the digest fires; config is
+    // the global `digest_config` row.
+    let cfg = load_config(pool).await.context("load scoring config")?;
+    // `.max(0)` guards the `i32 → usize` cast: a stray non-positive max_items yields an empty digest
+    // (the safe direction), never a sign-wrapped, effectively-unbounded ceiling.
+    let max_items = sub.max_items.max(0) as usize;
+    let decisions = select(candidates, &cfg, max_items, Utc::now());
     Ok((assignment.stories, decisions, story_entities))
 }
 
@@ -209,11 +223,15 @@ async fn assign_threads(
 #[cfg(not(feature = "thread-weighting"))]
 async fn assign_threads(_: &PgPool, _: Uuid, _: Uuid, _: &[Uuid], _: &HashMap<Uuid, Vec<String>>) {}
 
-/// One candidate's `ItemReason` — the Thread relevance term + the entity spine it scored on.
+/// One candidate's `ItemReason` — the M4 scoring outcome (relevance, format + the richness phrase that
+/// chose it, priority) plus the entity spine it scored on (design §10.2).
 fn reason_of(d: &Decision, story_entities: &HashMap<Uuid, Vec<String>>) -> ItemReason {
     ItemReason {
         relevance: d.relevance,
         entities: story_entities.get(&d.id).cloned().unwrap_or_default(),
+        format: d.format,
+        richness: d.richness.clone(),
+        priority: d.priority,
     }
 }
 
@@ -277,6 +295,22 @@ fn selected_ids(decisions: &[Decision]) -> Vec<Uuid> {
         .collect()
 }
 
+/// The selected stories as `FrozenItem`s — story id + the recency anchor + format to freeze on each
+/// `digest_item` (the re-surface snapshot, design §9.4), in render order.
+fn frozen_items(decisions: &[Decision]) -> Vec<FrozenItem> {
+    decisions
+        .iter()
+        .filter(|d| matches!(d.verdict, Verdict::Selected { .. }))
+        .map(|d| FrozenItem {
+            story_id: d.id,
+            last_event_time: d.last_event_time,
+            // Snapshot the *natural* richness format (not a re-surface demotion), so the next fire's
+            // graduation check compares like with like and a damped story doesn't oscillate.
+            format: d.natural_format,
+        })
+        .collect()
+}
+
 /// GenerateDigest for one subscriber: select the window's candidate clusters, freeze them into a
 /// digest, render, and deliver via `mailer` — advancing the subscriber's watermark on delivery.
 /// Idempotent and resumable: the `(subscriber, window_end)` row is created with its items in one
@@ -310,12 +344,21 @@ pub async fn generate(
 
     // Link the candidate clusters into stories (persisting the assignment so ids stay stable), then
     // rank the stories by recency. The story is the unit the digest freezes and renders (§8.2).
-    let (_, decisions, story_entities) =
-        link_and_select(pool, &sub, sub.last_run_at, CONTEXT_HORIZON_DAYS, true).await?;
-    log_selection(sub.id, sub.max_items as usize, &decisions);
+    // `window_end` is the re-surface cutoff: a story is "stale" only against digests *before* this
+    // one, so an idempotent re-run of the same window doesn't shadow-suppress its own selection.
+    let (_, decisions, story_entities) = link_and_select(
+        pool,
+        &sub,
+        sub.last_run_at,
+        CONTEXT_HORIZON_DAYS,
+        window_end,
+        true,
+    )
+    .await?;
+    log_selection(sub.id, &decisions);
     let selected = selected_ids(&decisions);
 
-    let digest = create_with_items(pool, sub.id, window_end, &selected)
+    let digest = create_with_items(pool, sub.id, window_end, &frozen_items(&decisions))
         .await
         .context("create digest")?;
 
@@ -413,8 +456,8 @@ pub async fn dispatch_now(
     // A preview links in-memory but persists nothing (`false`): it must not disturb the real story
     // cache, schedule, or de-dup history.
     let (stories, decisions, story_entities) =
-        link_and_select(pool, &sub, None, lookback_days, false).await?;
-    log_selection(sub.id, sub.max_items as usize, &decisions);
+        link_and_select(pool, &sub, None, lookback_days, Utc::now(), false).await?;
+    log_selection(sub.id, &decisions);
     let selected = selected_ids(&decisions);
 
     // Reassemble the selected stories (in render order) from the in-memory assignment, rendering
@@ -463,20 +506,23 @@ pub async fn dispatch_now(
 /// Emits the selection audit trail: a one-line summary at INFO, then a per-candidate line at
 /// DEBUG (`RUST_LOG=bulletin=debug`) so "why is this cluster in/out of the digest?" is answerable
 /// from the worker logs. Mirrors `debug digest-explain` (which dry-runs it).
-fn log_selection(subscriber_id: Uuid, cap: usize, decisions: &[Decision]) {
+fn log_selection(subscriber_id: Uuid, decisions: &[Decision]) {
     let count = |f: fn(&Verdict) -> bool| decisions.iter().filter(|d| f(&d.verdict)).count();
     tracing::info!(
         %subscriber_id,
         candidates = decisions.len(),
         selected = count(|v| matches!(v, Verdict::Selected { .. })),
         over_cap = count(|v| matches!(v, Verdict::OverCap { .. })),
-        cap,
+        dropped = count(|v| matches!(v, Verdict::Dropped { .. })),
         "selection complete"
     );
     for d in decisions {
         tracing::debug!(
             story_id = %d.id,
             last_event_time = %d.last_event_time,
+            format = d.format.as_str(),
+            relevance = d.relevance,
+            priority = d.priority,
             verdict = ?d.verdict,
             "selection decision"
         );
@@ -490,6 +536,8 @@ pub struct ExplainRow {
     pub verdict: Verdict,
     pub story_id: Uuid,
     pub last_event_time: DateTime<Utc>,
+    /// The structured scoring rationale (design §10.2) — present even for a dropped/empty story.
+    pub reason: ItemReason,
     pub item: Option<RenderItem>,
 }
 
@@ -503,8 +551,15 @@ pub async fn explain(pool: &PgPool, subscriber_id: Uuid) -> Result<Vec<ExplainRo
         .await
         .context("build private clusters")?;
 
-    let (stories, decisions, story_entities) =
-        link_and_select(pool, &sub, sub.last_run_at, CONTEXT_HORIZON_DAYS, false).await?;
+    let (stories, decisions, story_entities) = link_and_select(
+        pool,
+        &sub,
+        sub.last_run_at,
+        CONTEXT_HORIZON_DAYS,
+        sub.next_run_at,
+        false,
+    )
+    .await?;
 
     let by_id: HashMap<Uuid, &LinkedStory> = stories.iter().map(|s| (s.id, s)).collect();
     let ids: Vec<Uuid> = stories
@@ -525,13 +580,10 @@ pub async fn explain(pool: &PgPool, subscriber_id: Uuid) -> Result<Vec<ExplainRo
     Ok(decisions
         .into_iter()
         .map(|d| {
-            let reason = ItemReason {
-                relevance: d.relevance,
-                entities: story_entities.get(&d.id).cloned().unwrap_or_default(),
-            };
+            let reason = reason_of(&d, &story_entities);
             let item = by_id.get(&d.id).and_then(|s| {
                 build_render_item(&s.clusters, &cards).map(|mut item| {
-                    item.reason = reason;
+                    item.reason = reason.clone();
                     item
                 })
             });
@@ -539,8 +591,36 @@ pub async fn explain(pool: &PgPool, subscriber_id: Uuid) -> Result<Vec<ExplainRo
                 verdict: d.verdict,
                 story_id: d.id,
                 last_event_time: d.last_event_time,
+                reason,
                 item,
             }
         })
         .collect())
+}
+
+/// "Show the data behind this story" (design §10.1): the event timeline of one story, oldest-first
+/// (source + link + time per event). Resolves the story's owning subscriber via the admin
+/// control-plane context, then walks `story.clusters → events` in *that subscriber's* RLS scope, so
+/// the story's private events are visible to exactly their owner. Empty for an unknown story. The
+/// `digest-provenance` debug command renders it.
+pub async fn provenance(pool: &PgPool, story_id: Uuid) -> Result<Vec<TimelineEntry>> {
+    let owner = with_scope(pool, ScopeCtx::Admin, move |conn| {
+        Box::pin(async move {
+            story_owner(&mut *conn, story_id)
+                .await
+                .context("resolve story owner")
+        })
+    })
+    .await?;
+    let Some(owner) = owner else {
+        return Ok(Vec::new());
+    };
+    with_scope(pool, ScopeCtx::Subscriber(owner), move |conn| {
+        Box::pin(async move {
+            story_timeline(&mut *conn, story_id)
+                .await
+                .context("load story timeline")
+        })
+    })
+    .await
 }

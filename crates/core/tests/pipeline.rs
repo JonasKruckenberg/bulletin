@@ -6,8 +6,10 @@
 use bulletin_core::cluster::store::{
     advance_build_watermark, build_bounds, dirty_groups, list_group_events, upsert_cluster,
 };
-use bulletin_core::digest::select::{select, Candidate, Verdict};
-use bulletin_core::digest::store::{create_with_items, mark_delivered, render_items};
+use bulletin_core::digest::select::{select, Candidate, Format, ScoringConfig, Verdict};
+use bulletin_core::digest::store::{
+    create_with_items, last_shown, mark_delivered, render_items, FrozenItem,
+};
 use bulletin_core::digest::subscriber::{
     advance_after_delivery, due_subscribers, insert_subscriber, load_subscriber,
     update_preferences, Recurrence,
@@ -23,7 +25,7 @@ use bulletin_core::{
     connect,
     event::EventBuilder,
     grant_runtime_role,
-    kind::SourceKind,
+    kind::{ContentKind, SourceKind},
     migrate,
     scope::Scope,
     ScopeCtx, RUNTIME_ROLE,
@@ -88,6 +90,28 @@ async fn insert_public(pool: &PgPool, stable_id: &str, group_key: &str, title: &
     insert_event(pool, &ev).await.unwrap();
 }
 
+/// Inserts a public event with an explicit `content_kind` (the depth signal richness reads).
+async fn insert_public_kind(
+    pool: &PgPool,
+    stable_id: &str,
+    group_key: &str,
+    title: &str,
+    secs: i64,
+    kind: ContentKind,
+) {
+    let ev = EventBuilder::new(
+        SourceKind::Rss,
+        stable_id,
+        Utc.timestamp_opt(secs, 0).single().unwrap(),
+        title,
+        group_key,
+    )
+    .links(vec![format!("https://example.com/{stable_id}")])
+    .content_kind(kind)
+    .finalize(None);
+    insert_event(pool, &ev).await.unwrap();
+}
+
 /// Inserts a private event owned by `subscriber` (a private-repo-shaped item).
 async fn insert_private(
     pool: &PgPool,
@@ -136,13 +160,13 @@ async fn cluster_count(pool: &PgPool) -> i64 {
 }
 
 /// Link a subscriber's candidate clusters into stories, persist the assignment, and return the
-/// selected story ids in render order — the store-level mirror of `digest::generate`'s middle.
+/// selected stories (as `FrozenItem`s, render order) — the store-level mirror of `generate`'s middle.
 async fn select_stories(
     pool: &PgPool,
     sub_id: Uuid,
     last_run: Option<chrono::DateTime<Utc>>,
     max_items: usize,
-) -> Vec<Uuid> {
+) -> Vec<FrozenItem> {
     let clusters = candidate_clusters(pool, sub_id, last_run, 30)
         .await
         .unwrap();
@@ -153,10 +177,14 @@ async fn select_stories(
         .iter()
         .map(|s| Candidate::new(s.id, s.last_event_time, Vec::new()))
         .collect();
-    select(candidates, max_items)
+    select(candidates, &ScoringConfig::default(), max_items, Utc::now())
         .into_iter()
         .filter(|d| matches!(d.verdict, Verdict::Selected { .. }))
-        .map(|d| d.id)
+        .map(|d| FrozenItem {
+            story_id: d.id,
+            last_event_time: d.last_event_time,
+            format: d.format,
+        })
         .collect()
 }
 
@@ -196,7 +224,12 @@ async fn build_groups_events_into_clusters() {
         .iter()
         .map(|s| Candidate::new(s.id, s.last_event_time, Vec::new()))
         .collect();
-    let selected = select(cands, 2)
+    // Three longform singletons → all Story format; a story_cap of 2 selects the freshest two.
+    let cfg = ScoringConfig {
+        story_cap: 2,
+        ..Default::default()
+    };
+    let selected = select(cands, &cfg, 1000, Utc::now())
         .into_iter()
         .filter(|d| matches!(d.verdict, Verdict::Selected { .. }))
         .count();
@@ -550,7 +583,12 @@ async fn cross_source_story_fuses_private_and_public_via_cve() {
 
     // Freeze + render: one digest item (the fused story) carrying one cross-source connection.
     let sub = load_subscriber(&pool, alice).await.unwrap().unwrap();
-    let digest = create_with_items(&pool, alice, sub.next_run_at, &[story.id])
+    let frozen = vec![FrozenItem {
+        story_id: story.id,
+        last_event_time: story.last_event_time,
+        format: Format::Story,
+    }];
+    let digest = create_with_items(&pool, alice, sub.next_run_at, &frozen)
         .await
         .unwrap();
     let items = render_items(&mut pool.acquire().await.unwrap(), digest.id)
@@ -1063,4 +1101,130 @@ async fn advance_coalesces_missed_boundaries() {
     );
     assert!(sub.next_run_at <= Utc::now() + Duration::days(1));
     assert_eq!(local_run_time(&pool, id, "UTC").await, nine_am());
+}
+
+// M4 scoring & selection (design §8.3–§8.4): richness classifies a longform article as a Story and a
+// thin announcement as a Note; the relevance gate keeps both (default floor 0), priority orders them,
+// and the per-format caps apply. A pure store-level check over a real candidate set, mirroring the
+// digest flow's `select` call.
+#[tokio::test]
+async fn scoring_classifies_story_and_note() {
+    let (pool, _pg) = setup().await;
+    let sub = insert_subscriber(&pool, "s@x.com", None, Recurrence::Daily, "UTC", nine_am())
+        .await
+        .unwrap();
+
+    // A longform article (→ Story) and a thin announcement (→ Note): distinct groups + urls, so they
+    // stay two singleton stories (no linking).
+    insert_public_kind(
+        &pool,
+        "long",
+        "long",
+        "A deep dive",
+        200,
+        ContentKind::Longform,
+    )
+    .await;
+    insert_public_kind(
+        &pool,
+        "ann",
+        "ann",
+        "v2.0 released",
+        100,
+        ContentKind::Announcement,
+    )
+    .await;
+    build_all(&pool).await;
+
+    let clusters = candidate_clusters(&pool, sub, None, 30).await.unwrap();
+    let assignment = link(&clusters, &[], Uuid::now_v7);
+    // Mirror the digest flow's candidate construction (its rollups drive richness).
+    let cands: Vec<Candidate> = assignment
+        .stories
+        .iter()
+        .map(|s| Candidate::from_story(s, Vec::new(), None))
+        .collect();
+    let decisions = select(cands, &ScoringConfig::default(), 1000, Utc::now());
+
+    let sel_fmt = |f: Format| {
+        decisions
+            .iter()
+            .filter(|d| matches!(d.verdict, Verdict::Selected { .. }) && d.format == f)
+            .count()
+    };
+    assert_eq!(sel_fmt(Format::Story), 1, "the longform article is a Story");
+    assert_eq!(sel_fmt(Format::Note), 1, "the announcement is a Note");
+    // Every candidate carries a structured richness phrase (the reason record's "why this format").
+    assert!(decisions.iter().all(|d| !d.richness.is_empty()));
+}
+
+// M4 re-surface suppression (design §9.4): a story shown in one window with no new events since is a
+// stale re-surface in the next — it fades to a damped "still developing" Note. The frozen digest_item
+// snapshot (story_last_event_time + format) is what `last_shown` reads back to detect it.
+#[tokio::test]
+async fn resurface_without_new_events_fades_to_note() {
+    let (pool, _pg) = setup().await;
+    let sub = insert_subscriber(&pool, "s@x.com", None, Recurrence::Daily, "UTC", nine_am())
+        .await
+        .unwrap();
+    insert_public_kind(&pool, "x", "x", "Ongoing", 100, ContentKind::Longform).await;
+    build_all(&pool).await;
+
+    // First window: select + freeze the story as a Story.
+    let clusters = candidate_clusters(&pool, sub, None, 30).await.unwrap();
+    let assignment = link(&clusters, &[], Uuid::now_v7);
+    persist_assignment(&pool, sub, &assignment).await.unwrap();
+    let story = assignment.stories[0].clone();
+    let w1 = Utc.with_ymd_and_hms(2026, 1, 1, 9, 0, 0).unwrap();
+    let frozen = vec![FrozenItem {
+        story_id: story.id,
+        last_event_time: story.last_event_time,
+        format: Format::Story,
+    }];
+    create_with_items(&pool, sub, w1, &frozen).await.unwrap();
+
+    // Second window, a day later, with no new events: the snapshot is read back and the story is
+    // damped to a "still developing" Note.
+    let w2 = w1 + Duration::days(1);
+    let shown = last_shown(&mut pool.acquire().await.unwrap(), sub, w2, 30)
+        .await
+        .unwrap();
+    assert!(
+        shown.contains_key(&story.id),
+        "the prior digest is the snapshot"
+    );
+    // last_event_time unchanged → no new events since shown.
+    let cand = Candidate::from_story(&story, Vec::new(), shown.get(&story.id).copied());
+    let decisions = select(vec![cand], &ScoringConfig::default(), 1000, Utc::now());
+    assert_eq!(decisions[0].format, Format::Note);
+    assert_eq!(decisions[0].richness, "still developing");
+}
+
+// M4 provenance (design §10.1): "show the data behind this story" walks the story's clusters to their
+// events, oldest-first. Two events in one group → one cluster → a 2-entry timeline in event order.
+#[tokio::test]
+async fn provenance_walks_story_to_its_events() {
+    let (pool, _pg) = setup().await;
+    let sub = insert_subscriber(&pool, "s@x.com", None, Recurrence::Daily, "UTC", nine_am())
+        .await
+        .unwrap();
+    insert_public(&pool, "e1", "g", "First", 100).await;
+    insert_public(&pool, "e2", "g", "Second", 200).await; // same group → one cluster, two events
+    build_all(&pool).await;
+
+    let clusters = candidate_clusters(&pool, sub, None, 30).await.unwrap();
+    let assignment = link(&clusters, &[], Uuid::now_v7);
+    persist_assignment(&pool, sub, &assignment).await.unwrap();
+    let story = &assignment.stories[0];
+
+    let timeline = bulletin_core::digest::provenance(&pool, story.id)
+        .await
+        .unwrap();
+    assert_eq!(timeline.len(), 2, "both backing events surface");
+    assert_eq!(timeline[0].title, "First", "oldest first");
+    assert_eq!(timeline[1].title, "Second");
+    assert!(
+        timeline[0].link.is_some(),
+        "each event carries its backing link"
+    );
 }

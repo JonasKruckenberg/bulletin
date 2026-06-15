@@ -79,6 +79,8 @@ pub enum DebugCommand {
     },
     /// Explain a subscriber's selection: every candidate cluster + why it's in or out (dry-run)
     DigestExplain { subscriber: Uuid },
+    /// Show the data behind a story: its event timeline (source · link · time), oldest-first
+    DigestProvenance { story_id: Uuid },
     /// Print a single-glance snapshot of pipeline state (events, clusters, queue, …)
     Status,
 }
@@ -270,6 +272,9 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> R
         DebugCommand::DigestExplain { subscriber } => {
             print_explain(&digest::explain(pool, subscriber).await?);
         }
+        DebugCommand::DigestProvenance { story_id } => {
+            print_provenance(story_id, &digest::provenance(pool, story_id).await?);
+        }
         DebugCommand::Status => {
             print_status(&status::gather(pool).await?);
         }
@@ -289,7 +294,7 @@ fn print_explain(rows: &[digest::ExplainRow]) {
         return;
     }
 
-    let (mut selected, mut over_cap) = (0, 0);
+    let (mut selected, mut over_cap, mut dropped) = (0, 0, 0);
     for r in rows {
         let (verdict, slot) = match r.verdict {
             Verdict::Selected { position } => {
@@ -300,16 +305,26 @@ fn print_explain(rows: &[digest::ExplainRow]) {
                 over_cap += 1;
                 ("OVER_CAP", format!("rank={rank}"))
             }
+            Verdict::Dropped { cause } => {
+                dropped += 1;
+                ("DROPPED", format!("{cause:?}"))
+            }
         };
         let (source, title) = match &r.item {
             Some(item) => (item.source.as_str(), item.title.as_str()),
             None => ("?", "<empty story>"),
         };
+        // The M4 scoring outcome (design §10.2): format · richness · relevance · priority.
+        let reason = &r.reason;
         println!(
-            "{verdict}\t{slot}\t{}\t{}\t{}\t{}",
+            "{verdict}\t{slot}\t{}\t{}\t{}\t[{} {} rel={:.2} pri={:.3}]\t{}",
             r.last_event_time.format("%Y-%m-%dT%H:%M:%SZ"),
             source,
             r.story_id,
+            reason.format.as_str(),
+            reason.richness,
+            reason.relevance,
+            reason.priority,
             title,
         );
         for conn in r.item.iter().flat_map(|i| i.connections.iter()) {
@@ -321,7 +336,28 @@ fn print_explain(rows: &[digest::ExplainRow]) {
             );
         }
     }
-    println!("\n{selected} selected · {over_cap} over cap");
+    println!("\n{selected} selected · {over_cap} over cap · {dropped} dropped");
+}
+
+/// Renders a story's provenance timeline (design §10.1) — one event per line, oldest-first, each with
+/// its time, source, title, and backing link. The "show the data behind this story" drill-down.
+fn print_provenance(story_id: Uuid, entries: &[digest::store::TimelineEntry]) {
+    if entries.is_empty() {
+        println!("no events behind story {story_id} (unknown, tombstoned, or empty)");
+        return;
+    }
+    println!("timeline for story {story_id} ({} events):", entries.len());
+    for e in entries {
+        println!(
+            "{}\t{}\t{}",
+            e.event_time.format("%Y-%m-%dT%H:%M:%SZ"),
+            e.source.as_str(),
+            e.title,
+        );
+        if let Some(link) = &e.link {
+            println!("  {link}");
+        }
+    }
 }
 
 /// Renders the `status` dashboard: each subsystem on its own line(s). The watchpoints to scan are

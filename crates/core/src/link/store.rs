@@ -39,7 +39,8 @@ pub async fn candidate_clusters(
     sqlx::query(
         "WITH floor AS (SELECT LEAST($2, now() - make_interval(days => $3)) AS lo),
               in_floor AS (
-                  SELECT id, entities, first_event_time, last_event_time
+                  SELECT id, scope_kind, source, entities, first_event_time, last_event_time,
+                         event_count, content_depth, max_severity
                   FROM cluster
                   WHERE (scope_kind = 'public' OR scope_subscriber_id = $1)
                     AND updated_at >= (SELECT lo FROM floor)
@@ -58,7 +59,8 @@ pub async fn candidate_clusters(
               -- Public clusters sharing a strong key with those — *regardless of the floor*, so an
               -- aged-out advisory still links (a strong CVE/URL edge ignores temporal distance).
               cross_boundary AS (
-                  SELECT id, entities, first_event_time, last_event_time
+                  SELECT id, scope_kind, source, entities, first_event_time, last_event_time,
+                         event_count, content_depth, max_severity
                   FROM cluster
                   WHERE scope_kind = 'public'
                     AND entities && (SELECT keys FROM private_strong)
@@ -72,11 +74,17 @@ pub async fn candidate_clusters(
     .bind(last_run)
     .bind(horizon_days)
     .try_map(|row: PgRow| {
+        let scope_kind: String = row.get("scope_kind");
         Ok(LinkCluster {
             id: row.get("id"),
             entities: row.get("entities"),
             first_event_time: row.get("first_event_time"),
             last_event_time: row.get("last_event_time"),
+            source: row.try_get("source")?,
+            event_count: row.get("event_count"),
+            content_depth: row.try_get("content_depth")?,
+            max_severity: row.get("max_severity"),
+            is_own_private: scope_kind == "private",
         })
     })
     .fetch_all(executor)
@@ -132,12 +140,17 @@ pub async fn persist_assignment(
             serde_json::to_value(&story.clusters).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
         sqlx::query(
             "INSERT INTO story
-                (id, subscriber_id, clusters, first_event_time, last_event_time)
-             VALUES ($1, $2, $3, $4, $5)
+                (id, subscriber_id, clusters, first_event_time, last_event_time,
+                 event_count, source_diversity, content_depth, max_severity)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
              ON CONFLICT (id) DO UPDATE SET
                 clusters = EXCLUDED.clusters,
                 first_event_time = EXCLUDED.first_event_time,
                 last_event_time = EXCLUDED.last_event_time,
+                event_count = EXCLUDED.event_count,
+                source_diversity = EXCLUDED.source_diversity,
+                content_depth = EXCLUDED.content_depth,
+                max_severity = EXCLUDED.max_severity,
                 merged_into = NULL,
                 updated_at = now()",
         )
@@ -146,6 +159,10 @@ pub async fn persist_assignment(
         .bind(clusters)
         .bind(story.first_event_time)
         .bind(story.last_event_time)
+        .bind(story.event_count)
+        .bind(story.source_diversity)
+        .bind(story.content_depth)
+        .bind(story.max_severity)
         .execute(&mut *tx)
         .await?;
     }

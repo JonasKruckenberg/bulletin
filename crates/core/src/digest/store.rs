@@ -2,12 +2,88 @@ use std::collections::HashMap;
 
 use crate::common::db::{begin_scope, ScopeCtx};
 use crate::common::kind::SourceKind;
-use crate::digest::select::{DecisionRecord, ItemReason};
+use crate::digest::select::{DecisionRecord, Format, ItemReason, ScoringConfig, Shown};
 use crate::identity::ConfidenceBand;
 use crate::link::ClusterRef;
 use chrono::{DateTime, Utc};
 use sqlx::{postgres::PgRow, PgConnection, PgPool, Row};
 use uuid::Uuid;
+
+/// Loads the global scoring config (the singleton `digest_config` row). The table carries no
+/// per-subscriber data, so (like `build_watermark`) it is un-RLS'd and readable in any context.
+pub async fn load_config(pool: &PgPool) -> Result<ScoringConfig, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT relevance_floor, scope_bonus, severity_weight, recency_half_life_days,
+                thread_half_life_days, story_cap, note_cap, resurface_penalty
+         FROM digest_config WHERE id = true",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(ScoringConfig {
+        relevance_floor: row.get::<f64, _>("relevance_floor") as f32,
+        scope_bonus: row.get::<f64, _>("scope_bonus") as f32,
+        severity_weight: row.get::<f64, _>("severity_weight") as f32,
+        recency_half_life_days: row.get("recency_half_life_days"),
+        thread_half_life_days: row.get("thread_half_life_days"),
+        story_cap: row.get::<i32, _>("story_cap") as usize,
+        note_cap: row.get::<i32, _>("note_cap") as usize,
+        resurface_penalty: row.get::<f64, _>("resurface_penalty") as f32,
+    })
+}
+
+/// A story selected into a digest, with the recency anchor + format to freeze on its `digest_item`
+/// (design §9.4 re-surface snapshot). The flow builds these from the selected [`Decision`]s.
+pub struct FrozenItem {
+    pub story_id: Uuid,
+    pub last_event_time: DateTime<Utc>,
+    pub format: Format,
+}
+
+/// Per story, the snapshot of how it was last shown to this subscriber — the most recent prior
+/// `digest_item` in the half-open window `[window_end − horizon, window_end)` (strictly *before*
+/// `window_end` so an idempotent re-run doesn't shadow itself; bounded *below* by `horizon_days` so
+/// the scan stays small and matches the candidate lookback — a story unseen for longer than the
+/// horizon has aged out of the candidate set anyway). Feeds the re-surface suppression in selection
+/// (design §9.4). Runs in the subscriber's RLS context (digest/digest_item are fenced to their owner).
+///
+/// `story_last_event_time IS NOT NULL AND format IS NOT NULL` also skips pre-M4 `digest_item` rows
+/// (added before migration 024 had the snapshot columns): such a story isn't damped on its first
+/// post-migration re-fire, then self-heals once it's been frozen with a snapshot — a one-cycle grace.
+pub async fn last_shown(
+    conn: &mut PgConnection,
+    subscriber_id: Uuid,
+    window_end: DateTime<Utc>,
+    horizon_days: i32,
+) -> Result<HashMap<Uuid, Shown>, sqlx::Error> {
+    sqlx::query(
+        "SELECT DISTINCT ON (di.story_id)
+                di.story_id, di.story_last_event_time, di.format
+         FROM digest_item di
+         JOIN digest d ON d.id = di.digest_id
+         WHERE d.subscriber_id = $1
+           AND d.window_end < $2
+           AND d.window_end >= $2 - make_interval(days => $3)
+           AND di.story_last_event_time IS NOT NULL AND di.format IS NOT NULL
+         ORDER BY di.story_id, d.window_end DESC",
+    )
+    .bind(subscriber_id)
+    .bind(window_end)
+    .bind(horizon_days)
+    .try_map(|row: PgRow| {
+        let format = Format::try_from(row.get::<String, _>("format").as_str())
+            .map_err(|e| sqlx::Error::Decode(e.into()))?;
+        Ok((
+            row.get::<Uuid, _>("story_id"),
+            Shown {
+                last_event_time: row.get("story_last_event_time"),
+                format,
+            },
+        ))
+    })
+    .fetch_all(&mut *conn)
+    .await
+    .map(|rows| rows.into_iter().collect())
+}
 
 pub struct DigestRow {
     pub id: Uuid,
@@ -144,7 +220,7 @@ pub async fn create_with_items(
     pool: &PgPool,
     subscriber_id: Uuid,
     window_end: DateTime<Utc>,
-    story_ids: &[Uuid],
+    items: &[FrozenItem],
 ) -> Result<DigestRow, sqlx::Error> {
     let mut tx = begin_scope(pool, ScopeCtx::Subscriber(subscriber_id)).await?;
 
@@ -162,13 +238,19 @@ pub async fn create_with_items(
 
     let row = match created {
         Some(row) => {
-            for (position, story_id) in story_ids.iter().enumerate() {
+            for (position, item) in items.iter().enumerate() {
+                // Freeze the re-surface snapshot too (design §9.4): the recency anchor + format this
+                // story was shown at, so the next fire can damp it if no new events arrive.
                 sqlx::query(
-                    "INSERT INTO digest_item (digest_id, story_id, position) VALUES ($1, $2, $3)",
+                    "INSERT INTO digest_item
+                        (digest_id, story_id, position, story_last_event_time, format)
+                     VALUES ($1, $2, $3, $4, $5)",
                 )
                 .bind(row.id)
-                .bind(story_id)
+                .bind(item.story_id)
                 .bind(position as i32)
+                .bind(item.last_event_time)
+                .bind(item.format.as_str())
                 .execute(&mut *tx)
                 .await?;
             }
@@ -379,4 +461,81 @@ pub async fn list_digests(
     .await?;
     tx.commit().await?;
     Ok(rows)
+}
+
+/// The subscriber that owns a story, if it exists — the control-plane lookup provenance uses to pick
+/// the RLS scope to read the story's (possibly private) events in. Read as `admin`.
+pub async fn story_owner(
+    conn: &mut PgConnection,
+    story_id: Uuid,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    sqlx::query("SELECT subscriber_id FROM story WHERE id = $1")
+        .bind(story_id)
+        .try_map(|row: PgRow| row.try_get::<Uuid, _>("subscriber_id"))
+        .fetch_optional(conn)
+        .await
+}
+
+/// One event behind a story — a row of its provenance timeline (design §10.1).
+pub struct TimelineEntry {
+    pub event_time: DateTime<Utc>,
+    pub source: SourceKind,
+    pub title: String,
+    pub link: Option<String>,
+}
+
+/// "Show the data behind this story" (design §10.1): walk a story's member clusters → each cluster's
+/// `(scope, source, group_key)` → its events, returned oldest-first with source + link. Never
+/// collapses membership — the digest references the story, the trail stays in the durable log. Reads
+/// `story` / `cluster` / `event` (all RLS-protected) → runs in the owner's subscriber scope. A
+/// tombstoned story is followed one `merged_into` hop to its survivor.
+pub async fn story_timeline(
+    conn: &mut PgConnection,
+    story_id: Uuid,
+) -> Result<Vec<TimelineEntry>, sqlx::Error> {
+    // The member cluster ids: the live story's `clusters`, or — if this id was retro-merged — its
+    // survivor's (a single hop, mirroring the deep-link redirect in §8.2).
+    let member_ids: Vec<Uuid> = sqlx::query(
+        "SELECT (c->>'cluster_id')::uuid AS cluster_id
+         FROM story s
+         CROSS JOIN LATERAL jsonb_array_elements(
+             coalesce(
+                 (SELECT surv.clusters FROM story surv WHERE surv.id = s.merged_into),
+                 s.clusters
+             )
+         ) AS c
+         WHERE s.id = $1",
+    )
+    .bind(story_id)
+    .try_map(|row: PgRow| row.try_get::<Uuid, _>("cluster_id"))
+    .fetch_all(&mut *conn)
+    .await?;
+    if member_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Each cluster's events, by its scope-aware identity `(scope, source, group_key)`, oldest-first.
+    sqlx::query(
+        "SELECT e.event_time, e.source, e.title, e.links
+         FROM cluster c
+         JOIN event e
+           ON e.scope_kind = c.scope_kind
+          AND e.scope_subscriber_id IS NOT DISTINCT FROM c.scope_subscriber_id
+          AND e.source = c.source
+          AND e.group_key = c.group_key
+         WHERE c.id = ANY($1)
+         ORDER BY e.event_time, e.id",
+    )
+    .bind(&member_ids)
+    .try_map(|row: PgRow| {
+        let links: Vec<String> = row.get("links");
+        Ok(TimelineEntry {
+            event_time: row.get("event_time"),
+            source: row.try_get("source")?,
+            title: row.get("title"),
+            link: links.into_iter().next(),
+        })
+    })
+    .fetch_all(&mut *conn)
+    .await
 }

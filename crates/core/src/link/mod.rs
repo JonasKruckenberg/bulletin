@@ -31,15 +31,26 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::common::entity::{link_strength, LinkStrength};
+use crate::common::kind::{ContentKind, SourceKind};
 
-/// A candidate cluster for linking: its identity, the blocking substrate (`entities`), and the
-/// recency span the story rollup aggregates. The pure input — no DB types leak in.
+/// A candidate cluster for linking: its identity, the blocking substrate (`entities`), the recency
+/// span the story rollup aggregates, and the M4 scoring signals it folds onto the story (source for
+/// `source_diversity`, `event_count`/`content_depth` for richness, `max_severity` for priority, and
+/// whether it is the subscriber's own private content for the scope bonus). The pure input — no DB
+/// types leak in beyond the source/depth enums.
 #[derive(Debug, Clone)]
 pub struct LinkCluster {
     pub id: Uuid,
     pub entities: Vec<String>,
     pub first_event_time: DateTime<Utc>,
     pub last_event_time: DateTime<Utc>,
+    pub source: SourceKind,
+    pub event_count: i32,
+    pub content_depth: ContentKind,
+    pub max_severity: Option<i16>,
+    /// True when this cluster is the subscriber's own private content (vs a shared public one) — the
+    /// scope-bonus input (design §8.3). Always the caller's own, by the candidate-set scope.
+    pub is_own_private: bool,
 }
 
 /// One cluster's membership in the *prior* assignment, read back to forward stable ids. `delivered`
@@ -60,13 +71,27 @@ pub struct ClusterRef {
     pub link_reason: Option<String>,
 }
 
-/// A linked story: a connected component of clusters with a (stable, forwarded) id.
+/// A linked story: a connected component of clusters with a (stable, forwarded) id, plus the
+/// cross-source rollups M4 scoring reads (design §8.3–§8.4). The rollups are aggregated over the
+/// component's members in [`forward_ids`], so the story is the single home for its scoring features
+/// (M3-handoff seam #1). The story's *entity spine* (for the thread relevance term) is derived by the
+/// digest flow from the member clusters' entities — not duplicated here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkedStory {
     pub id: Uuid,
     pub clusters: Vec<ClusterRef>,
     pub first_event_time: DateTime<Utc>,
     pub last_event_time: DateTime<Utc>,
+    /// Σ of member `event_count` — breadth (richness).
+    pub event_count: i32,
+    /// Number of distinct member sources — the "across sources" breadth signal (richness).
+    pub source_diversity: i32,
+    /// Max member `content_depth` — depth (richness).
+    pub content_depth: ContentKind,
+    /// Max member `max_severity`, or `None` — a priority boost.
+    pub max_severity: Option<i16>,
+    /// Whether any member is the subscriber's own private content — the scope-bonus trigger.
+    pub has_private: bool,
 }
 
 /// A retro-merge: a prior story whose clusters now fall inside another component, so its id is
@@ -469,11 +494,36 @@ fn forward_ids(
             .max()
             .unwrap();
 
+        // Cross-source rollups, folded over the component's members (design §8.3): counts sum,
+        // depth/severity take the max, source_diversity is the distinct member sources, and the
+        // story is "own private" if any member is.
+        let event_count = members.iter().map(|&i| clusters[i].event_count).sum();
+        let source_diversity = members
+            .iter()
+            .map(|&i| clusters[i].source)
+            .collect::<BTreeSet<_>>()
+            .len() as i32;
+        let content_depth = members
+            .iter()
+            .map(|&i| clusters[i].content_depth)
+            .max()
+            .unwrap();
+        let max_severity = members
+            .iter()
+            .filter_map(|&i| clusters[i].max_severity)
+            .max();
+        let has_private = members.iter().any(|&i| clusters[i].is_own_private);
+
         stories.push(LinkedStory {
             id,
             clusters: clusters_out,
             first_event_time: first,
             last_event_time: last,
+            event_count,
+            source_diversity,
+            content_depth,
+            max_severity,
+            has_private,
         });
     }
 
@@ -504,6 +554,11 @@ mod tests {
             entities: entities.iter().map(|s| s.to_string()).collect(),
             first_event_time: t(day),
             last_event_time: t(day),
+            source: SourceKind::Rss,
+            event_count: 1,
+            content_depth: ContentKind::Longform,
+            max_severity: None,
+            is_own_private: false,
         }
     }
 
@@ -775,6 +830,11 @@ mod tests {
                         entities,
                         first_event_time: t(day),
                         last_event_time: t(day),
+                        source: SourceKind::Rss,
+                        event_count: 1,
+                        content_depth: ContentKind::Longform,
+                        max_severity: None,
+                        is_own_private: false,
                     }
                 })
                 .collect()

@@ -7,8 +7,25 @@ use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use lettre::{message::MultiPart, Message};
 
+use crate::digest::select::{Format, ItemReason};
 use crate::digest::store::RenderItem;
 use crate::identity::ConfidenceBand;
+
+/// The human-readable "why" for an item (design §10.2): its format, the richness phrase that chose
+/// that format, and its relevance. Rendered as a caption on every item and in the plaintext fallback,
+/// so "shown because…" is visible, not only in the debug trace.
+fn reason_line(reason: &ItemReason) -> String {
+    let format = match reason.format {
+        Format::Story => "Story",
+        Format::Note => "Note",
+    };
+    let richness = if reason.richness.is_empty() {
+        "—"
+    } else {
+        &reason.richness
+    };
+    format!("{format} · {richness} · relevance {:.2}", reason.relevance)
+}
 
 /// The delivery seam: something that can send a rendered digest, and knows the From address to
 /// render it as. The binary implements this over its file/SMTP transports.
@@ -142,7 +159,12 @@ fn render_plain(window_end: DateTime<Utc>, tz: Tz, greeting: &str, items: &[Rend
         window_end.with_timezone(&tz).format("%Y-%m-%d %H:%M %Z")
     );
     for (i, item) in items.iter().enumerate() {
-        body.push_str(&format!("{}. {}\n", i + 1, item.title));
+        body.push_str(&format!(
+            "{}. [{}] {}\n",
+            i + 1,
+            item.reason.format.as_str().to_uppercase(),
+            item.title
+        ));
         if let Some(link) = &item.link {
             body.push_str(&format!("   {link}\n"));
         }
@@ -153,6 +175,8 @@ fn render_plain(window_end: DateTime<Utc>, tz: Tz, greeting: &str, items: &[Rend
                 .with_timezone(&tz)
                 .format("%Y-%m-%d %H:%M %Z")
         ));
+        // The human-readable "why" (design §10.2): format, richness, relevance.
+        body.push_str(&format!("   why: {}\n", reason_line(&item.reason)));
         // The cross-source connections fused into this story, each with why it belongs (§8.2).
         for conn in &item.connections {
             body.push_str(&format!("   ↳ {} [{}]", conn.title, conn.source.as_str()));
@@ -261,7 +285,13 @@ fn render_html(
         if i > 0 {
             rows.push_str(&divider);
         }
-        rows.push_str(&render_item_row(i, item, tz, &category, &item_summary));
+        // Format ≠ importance: items are in global priority order; a Story renders as a rich card, a
+        // Note as a compact one-liner (design §8.4/§9.5). The format is purely a richness-driven
+        // rendering difference.
+        rows.push_str(&match item.reason.format {
+            Format::Story => render_story_row(i, item, tz, &category, &item_summary),
+            Format::Note => render_note_row(item, tz),
+        });
     }
 
     format!(
@@ -405,15 +435,15 @@ fn date_rule(date: &str) -> String {
     )
 }
 
-/// One item: the headline (a link when the cluster has one), then a placeholder category and
-/// summary, and the debug block. `category` and `item_summary` are pre-escaped placeholders; the
-/// debug block is debug-only — a monospace, dashed-amber callout (with a `debug` tag so it reads as
-/// scaffolding, not finished content) carrying the why-and-how of this row: its selection rank and
-/// the recency key it was chosen on, the source, the raw link, and how many related sub-items it
-/// fused. `position` is the 0-based render slot (== recency rank, since selection is recency-only).
-/// All of it is marked `<!-- DEBUG … -->` for later removal. Items are separated by
-/// [`soft_divider`], not a per-item rule.
-fn render_item_row(
+/// A **Story** row (design §8.4 richness → format): the rich editorial card — an optional thread
+/// chip, the headline (a link when the cluster has one), a placeholder category and summary, the
+/// fused cross-source connections, a human-readable reason caption, then the debug block. `category`
+/// and `item_summary` are pre-escaped placeholders; the reason caption is the "why" (design §10.2);
+/// the debug block is debug-only — a monospace, dashed-amber callout (a `debug` tag so it reads as
+/// scaffolding) carrying the machine trace: priority position, ranking basis, recency key, source,
+/// fused-item count, thread assignment, entity spine, and raw link. `position` is the 0-based render
+/// slot (global priority order). Items are separated by [`soft_divider`], not a per-item rule.
+fn render_story_row(
     position: usize,
     item: &RenderItem,
     tz: Tz,
@@ -432,8 +462,8 @@ fn render_item_row(
     };
 
     let source = escape(item.source.as_str());
-    // Debug fields: the recency key selection ranked on (full date), the 1-based rank, the raw link,
-    // and the count of fused sub-items — the answer to "why is this here, and what's inside it?".
+    // Debug fields: the recency key selection ranked on (full date), the 1-based position, the raw
+    // link, and the count of fused sub-items — the machine trace behind the human reason caption.
     let rank = position + 1;
     let recency_key = item
         .last_event_time
@@ -447,16 +477,14 @@ fn render_item_row(
     let related = item.connections.len();
     let connections = render_connections(&item.connections);
     let thread_chip = render_thread_chip(item.thread.as_ref());
+    let reason = escape(&reason_line(&item.reason));
 
-    // Decision-log fields (§10.2): the ranking basis is the Thread relevance term then recency — so a
-    // nonzero relevance promoted this item above pure recency; the entity spine is what it scored on;
-    // and the thread line records the assignment + its identity confidence band.
-    let relevance = item.reason.relevance;
-    let basis = if relevance > 0.0 {
-        format!("relevance {relevance:.2}, then recency")
-    } else {
-        "recency".to_string()
-    };
+    // Decision-log fields (§10.2): priority is the ranking key (relevance + severity, recency-decayed);
+    // the entity spine is what relevance scored on; the thread line records the assignment + its band.
+    let basis = format!(
+        "priority {:.3}, richness {}",
+        item.reason.priority, item.reason.richness
+    );
     let spine = if item.reason.entities.is_empty() {
         String::new()
     } else {
@@ -484,8 +512,9 @@ fn render_item_row(
 <!-- PLACEHOLDER: per-item summary — remove or replace once items carry a summary -->
 <div class="meta" style="margin-top:12px;font-family:{SERIF};font-size:16px;font-style:italic;line-height:1.65;color:{INK_MUTED};">{item_summary}</div>
 <!-- /PLACEHOLDER -->
-{connections}<!-- DEBUG: selection trace — debugging info, remove before launch -->
-<div style="margin-top:18px;padding:9px 12px;background-color:{DEBUG_BG};border:1px dashed {DEBUG_BORDER};border-radius:3px;font-family:{MONO};font-size:12px;line-height:1.6;color:{DEBUG_INK};">
+{connections}<div class="meta" style="margin-top:16px;font-family:{SANS};font-size:12px;line-height:1.6;color:{INK_MUTED};"><span style="font-weight:600;color:{ACCENT};">Why</span> &middot; {reason}</div>
+<!-- DEBUG: selection trace — debugging info, remove before launch -->
+<div style="margin-top:12px;padding:9px 12px;background-color:{DEBUG_BG};border:1px dashed {DEBUG_BORDER};border-radius:3px;font-family:{MONO};font-size:12px;line-height:1.6;color:{DEBUG_INK};">
 <span style="display:inline-block;padding:1px 6px;margin-right:8px;background-color:{DEBUG_BORDER};color:{DEBUG_BG};font-weight:700;text-transform:uppercase;letter-spacing:0.1em;border-radius:2px;">debug</span>
 <span style="font-weight:700;">selected #{rank}</span> <span>by {basis}</span>
 <div style="margin-top:4px;">key {recency_key} &middot; source <span style="font-weight:700;">{source}</span> &middot; related {related}</div>
@@ -493,6 +522,44 @@ fn render_item_row(
 </div>
 <!-- /DEBUG -->
 </td>
+</tr>
+"#
+    )
+}
+
+/// A **Note** row (design §8.4/§9.5): the compact one-liner for a thin, atomic item — an optional
+/// thread chip, a terracotta `Note` tag, the headline (linked when it has a URL), a source · time
+/// caption, the human reason, and any fused connections. No lorem placeholders or amber debug block;
+/// a Note is deliberately terse. Format is purely a richness-driven rendering difference — a Note can
+/// still out-rank a Story (it's interleaved in global priority order).
+fn render_note_row(item: &RenderItem, tz: Tz) -> String {
+    let title = escape(&item.title);
+    let headline = match &item.link {
+        Some(link) => format!(
+            r#"<a href="{}" style="font-family:{SERIF};font-size:17px;font-weight:700;line-height:1.4;color:{INK};text-decoration:none;">{title}</a>"#,
+            escape(link)
+        ),
+        None => format!(
+            r#"<span style="font-family:{SERIF};font-size:17px;font-weight:700;line-height:1.4;color:{INK};">{title}</span>"#
+        ),
+    };
+    let source = escape(item.source.as_str());
+    let when = item
+        .last_event_time
+        .with_timezone(&tz)
+        .format("%Y-%m-%d %H:%M %Z");
+    let reason = escape(&reason_line(&item.reason));
+    let connections = render_connections(&item.connections);
+    let thread_chip = render_thread_chip(item.thread.as_ref());
+
+    format!(
+        r#"<tr>
+<td class="bx" style="padding:18px 40px;">
+{thread_chip}<span style="display:inline-block;margin-bottom:6px;font-family:{SANS};font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:{ACCENT};">Note</span>
+<div>{headline}</div>
+<div class="meta" style="margin-top:6px;font-family:{SANS};font-size:12px;line-height:1.6;color:{INK_MUTED};">{source} &middot; {when}</div>
+<div class="meta" style="margin-top:4px;font-family:{SANS};font-size:12px;line-height:1.6;color:{INK_MUTED};"><span style="font-weight:600;color:{ACCENT};">Why</span> &middot; {reason}</div>
+{connections}</td>
 </tr>
 "#
     )
@@ -689,11 +756,44 @@ mod tests {
         assert!(html.contains(DEBUG_BG));
         assert!(html.contains(&format!("border:1px dashed {DEBUG_BORDER}")));
         assert!(html.contains(">debug</span>"));
-        // ...and it carries the selection trace: rank, recency key, source, related count, link.
+        // ...and it carries the selection trace: rank, ranking basis, related count, link.
         assert!(html.contains("selected #1"));
-        assert!(html.contains("by recency"));
+        assert!(html.contains("by priority"));
         assert!(html.contains("related 0"));
         assert!(html.contains("link https://example.com"));
+        // The human-readable reason caption (non-debug) names format + richness + relevance.
+        assert!(html.contains(">Why</span>"));
+    }
+
+    #[test]
+    fn note_renders_compact_without_placeholders_or_debug() {
+        let note = RenderItem {
+            reason: crate::digest::select::ItemReason {
+                format: Format::Note,
+                richness: "announcement".to_string(),
+                ..Default::default()
+            },
+            ..item(
+                "A small ping",
+                Some("https://example.com/n"),
+                SourceKind::Github,
+            )
+        };
+        let html = render_html(
+            Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
+            Tz::UTC,
+            "GREETING",
+            &[note],
+            &DigestContent::default(),
+        );
+        // The Note tag + headline + reason are present...
+        assert!(html.contains(">Note</span>"));
+        assert!(html.contains("A small ping"));
+        assert!(html.contains("Note · announcement"));
+        // ...but a Note row carries no per-item lorem placeholders (only the masthead lead's "big
+        // picture" one remains) and no amber debug block.
+        assert_eq!(html.matches("<!-- PLACEHOLDER:").count(), 1);
+        assert!(!html.contains("<!-- DEBUG:"));
     }
 
     #[test]
@@ -731,9 +831,11 @@ mod tests {
 
         // The greeting opens the plaintext fallback, ahead of the item list.
         assert!(plain.starts_with("Good morning. Here's your daily digest."));
-        assert!(plain.contains("1. Hello"));
+        assert!(plain.contains("1. [STORY] Hello"));
         assert!(plain.contains("https://example.com"));
         assert!(plain.contains("rss ·"));
+        // The human reason line is carried in plaintext too.
+        assert!(plain.contains("why: Story · "));
     }
 
     #[test]
