@@ -51,6 +51,7 @@ Run as the service user, which presets `DATABASE_URL`: `sudo -u bulletin bulleti
 | `recency_half_life_days` | 3 | **Main freshness dial.** Lower → fresher-biased, smaller digests; higher → backlog persists |
 | `story_cap` / `note_cap` | 5 / 20 | Per-format volume ceilings — the most direct overwhelm control |
 | `scope_bonus` | 0.5 | How much your own private content outranks public |
+| `corroboration_weight` | 0.5 | Priority boost when independent **sources corroborate** one story (2 src → ×1.25, 3 → ×1.33, saturating). `0` disables |
 | `relevance_floor` | 0.0 | Inclusion gate. **Mostly a post-feedback knob** (see caveats) |
 | `resurface_penalty` | 0.25 | How hard a no-news re-surface is damped (lower = more aggressive fade) |
 | `thread_half_life_days` | 21 | How long an invested thread lingers — **only with the `thread-weighting` build** |

@@ -15,8 +15,8 @@ use uuid::Uuid;
 /// per-subscriber data, so (like `build_watermark`) it is un-RLS'd and readable in any context.
 pub async fn load_config(pool: &PgPool) -> Result<ScoringConfig, sqlx::Error> {
     let row = sqlx::query(
-        "SELECT relevance_floor, scope_bonus, severity_weight, recency_half_life_days,
-                thread_half_life_days, story_cap, note_cap, resurface_penalty
+        "SELECT relevance_floor, scope_bonus, severity_weight, corroboration_weight,
+                recency_half_life_days, thread_half_life_days, story_cap, note_cap, resurface_penalty
          FROM digest_config WHERE id = true",
     )
     .fetch_one(pool)
@@ -25,6 +25,7 @@ pub async fn load_config(pool: &PgPool) -> Result<ScoringConfig, sqlx::Error> {
         relevance_floor: row.get::<f64, _>("relevance_floor") as f32,
         scope_bonus: row.get::<f64, _>("scope_bonus") as f32,
         severity_weight: row.get::<f64, _>("severity_weight") as f32,
+        corroboration_weight: row.get::<f64, _>("corroboration_weight") as f32,
         recency_half_life_days: row.get("recency_half_life_days"),
         thread_half_life_days: row.get("thread_half_life_days"),
         story_cap: row.get::<i32, _>("story_cap") as usize,
@@ -39,14 +40,15 @@ pub async fn load_config(pool: &PgPool) -> Result<ScoringConfig, sqlx::Error> {
 pub async fn update_config(pool: &PgPool, cfg: &ScoringConfig) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE digest_config SET
-            relevance_floor = $1, scope_bonus = $2, severity_weight = $3,
-            recency_half_life_days = $4, thread_half_life_days = $5,
-            story_cap = $6, note_cap = $7, resurface_penalty = $8
+            relevance_floor = $1, scope_bonus = $2, severity_weight = $3, corroboration_weight = $4,
+            recency_half_life_days = $5, thread_half_life_days = $6,
+            story_cap = $7, note_cap = $8, resurface_penalty = $9
          WHERE id = true",
     )
     .bind(cfg.relevance_floor as f64)
     .bind(cfg.scope_bonus as f64)
     .bind(cfg.severity_weight as f64)
+    .bind(cfg.corroboration_weight as f64)
     .bind(cfg.recency_half_life_days)
     .bind(cfg.thread_half_life_days)
     .bind(cfg.story_cap as i32)

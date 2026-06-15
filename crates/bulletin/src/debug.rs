@@ -104,6 +104,8 @@ pub enum DebugCommand {
         #[arg(long)]
         severity_weight: Option<f32>,
         #[arg(long)]
+        corroboration_weight: Option<f32>,
+        #[arg(long)]
         recency_half_life_days: Option<f64>,
         #[arg(long)]
         thread_half_life_days: Option<f64>,
@@ -313,6 +315,7 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> R
             relevance_floor,
             scope_bonus,
             severity_weight,
+            corroboration_weight,
             recency_half_life_days,
             thread_half_life_days,
             story_cap,
@@ -328,6 +331,9 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> R
             }
             if let Some(v) = severity_weight {
                 cfg.severity_weight = v;
+            }
+            if let Some(v) = corroboration_weight {
+                cfg.corroboration_weight = v;
             }
             if let Some(v) = recency_half_life_days {
                 cfg.recency_half_life_days = v;
