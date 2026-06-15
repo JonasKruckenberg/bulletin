@@ -146,6 +146,7 @@ impl GithubConnection {
         &self,
         token: &str,
         repo: &str,
+        private: bool,
         cursor: RepoCursor,
     ) -> Result<(Vec<GithubEvent>, RepoCursor), SourceError> {
         let url = format!("{}/repos/{repo}/events", self.base_url);
@@ -181,10 +182,19 @@ impl GithubConnection {
             .map_err(|e| SourceError::Parse(format!("repo events {repo}: {e}")))?;
 
         // Feed is newest-first; take until we reach the last id we already ingested.
-        let fresh: Vec<GithubEvent> = match &cursor.last_event_id {
+        let mut fresh: Vec<GithubEvent> = match &cursor.last_event_id {
             Some(seen) => all.into_iter().take_while(|e| &e.id != seen).collect(),
             None => all, // first poll: take the page
         };
+        // A known-private repo forces every one of its events private (never a downgrade), so the
+        // privacy fold lives here next to the parse. Discovery sets `private` from the authoritative
+        // per-repo flag; an allowlist can't, so its repos pass `false` and rely on the per-event
+        // `public` flag the feed itself carries.
+        if private {
+            for ev in &mut fresh {
+                ev.public = false;
+            }
+        }
         // Advance the high-water mark to the newest id observed (even if it was a 304-less empty
         // page); keep the prior one when this page had nothing.
         let newest = fresh.first().map(|e| e.id.clone()).or(cursor.last_event_id);
@@ -233,16 +243,9 @@ impl Connection for GithubConnection {
         let mut next = GithubCursor::default();
         for repo in repos {
             let repo_cursor = cursor.repos.get(&repo.name).cloned().unwrap_or_default();
-            let (mut events, new_cursor) = self
-                .poll_repo(&token.secret, &repo.name, repo_cursor)
+            let (events, new_cursor) = self
+                .poll_repo(&token.secret, &repo.name, repo.private, repo_cursor)
                 .await?;
-            // A private repo forces every one of its events private (never a downgrade), so an
-            // allowlist that can't report visibility still tags private-repo activity correctly.
-            if repo.private {
-                for ev in &mut events {
-                    ev.public = false;
-                }
-            }
             items.extend(events);
             next.repos.insert(repo.name, new_cursor);
         }
