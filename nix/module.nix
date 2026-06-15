@@ -64,6 +64,14 @@ let
 
   httpPort = lib.toInt (lib.last (lib.splitString ":" cfg.http.addr));
 
+  # The local summarization sidecar. Parse the `host:port` authority out of `llm.baseUrl`
+  # (e.g. http://127.0.0.1:8080/v1 → 8080) so `services.llama-cpp` and the worker agree on the port.
+  llmAuthority = lib.head (
+    lib.splitString "/" (lib.removePrefix "https://" (lib.removePrefix "http://" cfg.llm.baseUrl))
+  );
+  llmPort = lib.toInt (lib.last (lib.splitString ":" llmAuthority));
+  llmPackage = if cfg.llm.package != null then cfg.llm.package else pkgs.llama-cpp;
+
   # Root-readable secret env files loaded via systemd `EnvironmentFile` (SMTP creds + the sealed
   # GitHub App credentials), so neither enters the Nix store.
   envSecretFiles =
@@ -239,6 +247,63 @@ in
       };
     };
 
+    llm = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Turn on LLM cluster summarization (docs/llm-summarization.md, Phase A). Sets
+          `BULLETIN_LLM_ENABLED=1` for the worker, which runs a best-effort, off-the-punctual-path
+          summarization sweep after each public build, calling the local sidecar at `llm.baseUrl`.
+          Off ⇒ the deterministic digest baseline ships unchanged (the package already compiles the
+          feature in, so toggling this needs no rebuild). Pair with `llm.serveLocally` to also run the
+          sidecar on this host. No data egress: the sidecar is 100% local (design §12).
+        '';
+      };
+      baseUrl = lib.mkOption {
+        type = lib.types.str;
+        default = "http://127.0.0.1:8080/v1";
+        description = "OpenAI-compatible base URL of the local summarization sidecar (no trailing /).";
+      };
+      model = lib.mkOption {
+        type = lib.types.str;
+        default = "qwen3.5-4b-instruct";
+        example = "granite-4.0-h-micro";
+        description = ''
+          Served model name sent in each request (`local-ml-options.md` §7 — a small Apache instruct
+          model). Also stamped (with the prompt version) onto `cluster.summary_model`, so changing it
+          re-summarizes the corpus on the next sweep.
+        '';
+      };
+      promptVersion = lib.mkOption {
+        type = lib.types.int;
+        default = 1;
+        description = "Prompt/schema version; bump to invalidate + re-summarize the whole corpus.";
+      };
+      serveLocally = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Provision a local `llama-server` (llama.cpp) sidecar via `services.llama-cpp`, serving
+          `llm.modelPath` on the port parsed from `llm.baseUrl`. The bulletin worker is ordered after
+          it. Requires `llm.modelPath`. On Apple-silicon/Asahi, set `llm.package` to a Vulkan build and
+          mind the shader-cache env (`local-ml-options.md` §2/§4).
+        '';
+      };
+      package = lib.mkOption {
+        type = lib.types.nullOr lib.types.package;
+        default = null;
+        defaultText = lib.literalExpression "pkgs.llama-cpp";
+        description = "The llama.cpp package for the local sidecar (e.g. a Vulkan-enabled build). Defaults to pkgs.llama-cpp.";
+      };
+      modelPath = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = null;
+        example = "/var/lib/bulletin/models/qwen3.5-4b-instruct-q4_k_m.gguf";
+        description = "Path to the GGUF model file served by the local sidecar. Required when `llm.serveLocally = true`.";
+      };
+    };
+
     openFirewall = lib.mkOption {
       type = lib.types.bool;
       default = false;
@@ -255,6 +320,10 @@ in
       {
         assertion = cfg.email.transport != "smtp" || cfg.email.smtpSecretFile != null;
         message = ''services.bulletin: email.transport = "smtp" requires email.smtpSecretFile.'';
+      }
+      {
+        assertion = !cfg.llm.serveLocally || cfg.llm.modelPath != null;
+        message = "services.bulletin: llm.serveLocally = true requires llm.modelPath (a GGUF file).";
       }
     ];
 
@@ -298,6 +367,16 @@ in
     # CLI wrapper (DATABASE_URL preset) on PATH for seeding/ops + the digest-explain loop.
     environment.systemPackages = [ cliWrapper ];
 
+    # The optional local summarization sidecar (`llama-server` over llama.cpp, OpenAI-compatible). No
+    # egress — it binds loopback and the worker calls it over AF_INET (design §12, local-ml-options §4).
+    services.llama-cpp = lib.mkIf cfg.llm.serveLocally {
+      enable = true;
+      package = llmPackage;
+      model = cfg.llm.modelPath;
+      host = "127.0.0.1";
+      port = llmPort;
+    };
+
     networking.firewall.allowedTCPPorts = lib.mkIf cfg.openFirewall [ httpPort ];
 
     # Prune pre-migrate dumps older than 14 days.
@@ -338,9 +417,12 @@ in
       description = "Bulletin digest pipeline (server + worker)";
       wantedBy = [ "multi-user.target" ];
       # Requires= (not Wants=) on the migrate oneshot: a failed migration cancels the new binary's
-      # start but leaves an already-running instance up — no outage, no half-migrated binary.
-      after = pgDeps ++ [ "bulletin-migrate.service" ];
+      # start but leaves an already-running instance up — no outage, no half-migrated binary. The
+      # sidecar is only `wants`/`after` (not `requires`): summarization is best-effort, so a sidecar
+      # that's down or slow must never block the worker or a digest.
+      after = pgDeps ++ [ "bulletin-migrate.service" ] ++ lib.optional cfg.llm.serveLocally "llama-cpp.service";
       requires = pgDeps ++ [ "bulletin-migrate.service" ];
+      wants = lib.optional cfg.llm.serveLocally "llama-cpp.service";
       environment = {
         DATABASE_URL = databaseUrl;
         RUST_LOG = cfg.log.level;
@@ -350,6 +432,14 @@ in
         BULLETIN_EMAIL_TRANSPORT = cfg.email.transport;
         BULLETIN_EMAIL_FROM = cfg.email.from;
         BULLETIN_EMAIL_FILE_DIR = "%S/bulletin/outbox";
+      }
+      // lib.optionalAttrs cfg.llm.enable {
+        # Flip on the worker's summarization sweep + point it at the sidecar. The package already
+        # compiles the feature in, so this is a pure runtime toggle.
+        BULLETIN_LLM_ENABLED = "1";
+        BULLETIN_LLM_BASE_URL = cfg.llm.baseUrl;
+        BULLETIN_LLM_MODEL = cfg.llm.model;
+        BULLETIN_LLM_PROMPT_VERSION = toString cfg.llm.promptVersion;
       };
       serviceConfig =
         hardening

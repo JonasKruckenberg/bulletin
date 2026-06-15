@@ -86,13 +86,19 @@
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
           mkBin =
-            { pname, crate }:
+            {
+              pname,
+              crate,
+              features ? [ ],
+            }:
             craneLib.buildPackage (
               commonArgs
               // {
                 inherit pname cargoArtifacts;
                 version = "0.1.0";
-                cargoExtraArgs = "-p ${crate}";
+                cargoExtraArgs =
+                  "-p ${crate}"
+                  + lib.optionalString (features != [ ]) " --features ${lib.concatStringsSep "," features}";
                 meta.mainProgram = pname;
               }
             );
@@ -100,6 +106,10 @@
           bulletin = mkBin {
             pname = "bulletin";
             crate = "bulletin";
+            # Compile the LLM-summarization path in (no new deps; it rides the existing reqwest). It
+            # stays inert at runtime until the NixOS module's `services.bulletin.llm.enable` sets
+            # BULLETIN_LLM_ENABLED — so the feature can be toggled by config without a rebuild.
+            features = [ "llm-summarization" ];
           };
         in
         {

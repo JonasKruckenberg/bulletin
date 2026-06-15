@@ -175,7 +175,11 @@ async fn public_build(
     traced("public_build", task_id, attempt, async move {
         match bulletin_core::cluster::build(&pool).await {
             Ok(Some(stats)) => {
-                tracing::info!(dirty_groups = stats.dirty_groups, "public build complete")
+                tracing::info!(dirty_groups = stats.dirty_groups, "public build complete");
+                // Best-effort, off the punctual path: summarize the public clusters whose content
+                // changed (no-op without the feature/flag). A failure degrades to baseline summaries,
+                // never the build.
+                summarize_public(&pool).await;
             }
             Ok(None) => tracing::debug!("public build skipped (lock held by a concurrent build)"),
             Err(e) => {
@@ -187,6 +191,32 @@ async fn public_build(
     })
     .await
 }
+
+/// Best-effort public cluster-summarization sweep, hung off a completed PublicBuild (the natural
+/// `summary_hash`-invalidation point, docs/llm-summarization.md §5). Runs in the no-subscriber RLS
+/// context inside `core`; shared public summaries are generated once for everybody (the §5 multiplier
+/// saving). Compiled in only with `llm-summarization` and a no-op until `BULLETIN_LLM_ENABLED` + a
+/// reachable sidecar are configured. Never propagates an error — summarization is not the deliverable.
+#[cfg(feature = "llm-summarization")]
+async fn summarize_public(pool: &PgPool) {
+    let cfg = bulletin_core::summarize::SummarizationConfig::from_env();
+    if !cfg.enabled {
+        return;
+    }
+    match bulletin_core::summarize::sweep_public(pool, &cfg).await {
+        Ok(stats) => tracing::info!(
+            summarized = stats.summarized,
+            skipped = stats.skipped,
+            "cluster summarization sweep complete"
+        ),
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "cluster summarization sweep failed (non-fatal)")
+        }
+    }
+}
+
+#[cfg(not(feature = "llm-summarization"))]
+async fn summarize_public(_: &PgPool) {}
 
 async fn generate_digest(
     job: GenerateDigestJob,
