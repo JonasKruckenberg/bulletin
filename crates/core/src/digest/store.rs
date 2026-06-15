@@ -2,7 +2,9 @@ use std::collections::HashMap;
 
 use crate::common::db::{begin_scope, ScopeCtx};
 use crate::common::kind::SourceKind;
-use crate::digest::select::{DecisionRecord, Format, ItemReason, ScoringConfig, Shown};
+use crate::digest::select::{
+    DecisionRecord, Format, ItemReason, ReplaySnapshot, ScoringConfig, Shown,
+};
 use crate::identity::ConfidenceBand;
 use crate::link::ClusterRef;
 use chrono::{DateTime, Utc};
@@ -29,6 +31,30 @@ pub async fn load_config(pool: &PgPool) -> Result<ScoringConfig, sqlx::Error> {
         note_cap: row.get::<i32, _>("note_cap") as usize,
         resurface_penalty: row.get::<f64, _>("resurface_penalty") as f32,
     })
+}
+
+/// Overwrite the singleton `digest_config` row with `cfg` — the `debug config-set` writer. The table
+/// is global (no per-subscriber data, un-RLS'd like `load_config`), so it writes on the pool directly.
+/// Callers load the current config, apply their overrides, and pass the merged value here.
+pub async fn update_config(pool: &PgPool, cfg: &ScoringConfig) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE digest_config SET
+            relevance_floor = $1, scope_bonus = $2, severity_weight = $3,
+            recency_half_life_days = $4, thread_half_life_days = $5,
+            story_cap = $6, note_cap = $7, resurface_penalty = $8
+         WHERE id = true",
+    )
+    .bind(cfg.relevance_floor as f64)
+    .bind(cfg.scope_bonus as f64)
+    .bind(cfg.severity_weight as f64)
+    .bind(cfg.recency_half_life_days)
+    .bind(cfg.thread_half_life_days)
+    .bind(cfg.story_cap as i32)
+    .bind(cfg.note_cap as i32)
+    .bind(cfg.resurface_penalty as f64)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// A story selected into a digest, with the recency anchor + format to freeze on its `digest_item`
@@ -406,6 +432,99 @@ pub async fn load_decisions(
         .map(|row| row.get("decisions"))
         .unwrap_or_else(|| serde_json::json!([]));
     Ok(serde_json::from_value(json).unwrap_or_default())
+}
+
+/// The decision logs of a subscriber's most recent `limit` digests, newest-first — the eval harness
+/// input (design §10.3). Reads `digest` (RLS-protected) → runs in the subscriber's own scope. A
+/// pre-M4 digest's `'[]'` default decodes to an empty log.
+pub async fn load_decision_logs(
+    conn: &mut PgConnection,
+    subscriber_id: Uuid,
+    limit: i64,
+) -> Result<Vec<Vec<DecisionRecord>>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT decisions FROM digest
+         WHERE subscriber_id = $1
+         ORDER BY window_end DESC
+         LIMIT $2",
+    )
+    .bind(subscriber_id)
+    .bind(limit)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let json: serde_json::Value = row.get("decisions");
+            serde_json::from_value(json).unwrap_or_default()
+        })
+        .collect())
+}
+
+/// Persist the digest's replay snapshot (the frozen `select` input) as `digest.candidates` jsonb, so
+/// it can be re-scored under a trial config later (the eval sweep). Best-effort, like the decision log.
+/// Runs on the caller's subscriber-scoped connection (the candidates are the subscriber's own spine).
+pub async fn record_candidates(
+    conn: &mut PgConnection,
+    digest_id: Uuid,
+    snapshot: &ReplaySnapshot,
+) -> Result<(), sqlx::Error> {
+    let json = serde_json::to_value(snapshot).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+    sqlx::query("UPDATE digest SET candidates = $2 WHERE id = $1")
+        .bind(digest_id)
+        .bind(json)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+/// The replay snapshots of a subscriber's most recent `limit` digests that have one (newest-first) —
+/// the config-sweep input. Skips pre-snapshot digests (NULL `candidates`). Reads `digest`
+/// (RLS-protected) → the subscriber's own scope.
+pub async fn load_candidate_snapshots(
+    conn: &mut PgConnection,
+    subscriber_id: Uuid,
+    limit: i64,
+) -> Result<Vec<ReplaySnapshot>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT candidates FROM digest
+         WHERE subscriber_id = $1 AND candidates IS NOT NULL
+         ORDER BY window_end DESC
+         LIMIT $2",
+    )
+    .bind(subscriber_id)
+    .bind(limit)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| serde_json::from_value(row.get("candidates")).ok())
+        .collect())
+}
+
+/// This subscriber's story-level feedback signals (`target_type = 'story'`), newest-first — the
+/// grades the eval harness scores selection against. Reads `feedback` (RLS-protected) → the
+/// subscriber's own scope. A non-uuid `target_id` is skipped (defensive; the API binds story ids).
+pub async fn story_feedback(
+    conn: &mut PgConnection,
+    subscriber_id: Uuid,
+) -> Result<Vec<(Uuid, String)>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT target_id, signal FROM feedback
+         WHERE subscriber_id = $1 AND target_type = 'story'
+         ORDER BY created_at DESC",
+    )
+    .bind(subscriber_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            Uuid::parse_str(&row.get::<String, _>("target_id"))
+                .ok()
+                .map(|id| (id, row.get::<String, _>("signal")))
+        })
+        .collect())
 }
 
 /// Marks the digest delivered and advances the subscriber's schedule in one transaction, so the

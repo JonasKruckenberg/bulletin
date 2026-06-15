@@ -78,8 +78,42 @@ pub enum DebugCommand {
     },
     /// Explain a subscriber's selection: every candidate cluster + why it's in or out (dry-run)
     DigestExplain { subscriber: Uuid },
+    /// Eval selection quality from the decision log + feedback (read-only): volume/format balance now,
+    /// precision + nDCG once feedback flows. With --config, A/B the current vs a trial scoring config
+    /// by replaying the frozen candidate snapshots (a real config sweep over history)
+    DigestEval {
+        subscriber: Uuid,
+        /// How many recent digests to score
+        #[arg(long, default_value = "50")]
+        limit: i64,
+        /// Path to a trial scoring config (JSON, the shape `debug config` prints): replays history
+        /// under it and the current config, side by side
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
+    },
     /// Show the data behind a story: its event timeline (source · link · time), oldest-first
     DigestProvenance { story_id: Uuid },
+    /// Show the current scoring config as JSON (copy, edit, feed to `digest-eval --config`)
+    Config,
+    /// Update scoring knobs in digest_config — only the flags you pass change; prints the new config
+    ConfigSet {
+        #[arg(long)]
+        relevance_floor: Option<f32>,
+        #[arg(long)]
+        scope_bonus: Option<f32>,
+        #[arg(long)]
+        severity_weight: Option<f32>,
+        #[arg(long)]
+        recency_half_life_days: Option<f64>,
+        #[arg(long)]
+        thread_half_life_days: Option<f64>,
+        #[arg(long)]
+        story_cap: Option<usize>,
+        #[arg(long)]
+        note_cap: Option<usize>,
+        #[arg(long)]
+        resurface_penalty: Option<f32>,
+    },
     /// Print a single-glance snapshot of pipeline state (events, clusters, queue, …)
     Status,
 }
@@ -250,6 +284,68 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> R
         }
         DebugCommand::DigestExplain { subscriber } => {
             print_explain(&digest::explain(pool, subscriber).await?);
+        }
+        DebugCommand::DigestEval {
+            subscriber,
+            limit,
+            config,
+        } => match config {
+            None => print!("{}", digest::eval_report(pool, subscriber, limit).await?),
+            Some(path) => {
+                let trial: bulletin_core::digest::select::ScoringConfig =
+                    serde_json::from_str(&std::fs::read_to_string(&path)?).map_err(|e| {
+                        anyhow::anyhow!("parse trial config {}: {e}", path.display())
+                    })?;
+                let (base, trial_m) = digest::eval_sweep(pool, subscriber, limit, trial).await?;
+                println!("== current config ==");
+                print!("{base}");
+                println!("\n== trial config ({}) ==", path.display());
+                print!("{trial_m}");
+            }
+        },
+        DebugCommand::Config => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&digest::get_config(pool).await?)?
+            );
+        }
+        DebugCommand::ConfigSet {
+            relevance_floor,
+            scope_bonus,
+            severity_weight,
+            recency_half_life_days,
+            thread_half_life_days,
+            story_cap,
+            note_cap,
+            resurface_penalty,
+        } => {
+            let mut cfg = digest::get_config(pool).await?;
+            if let Some(v) = relevance_floor {
+                cfg.relevance_floor = v;
+            }
+            if let Some(v) = scope_bonus {
+                cfg.scope_bonus = v;
+            }
+            if let Some(v) = severity_weight {
+                cfg.severity_weight = v;
+            }
+            if let Some(v) = recency_half_life_days {
+                cfg.recency_half_life_days = v;
+            }
+            if let Some(v) = thread_half_life_days {
+                cfg.thread_half_life_days = v;
+            }
+            if let Some(v) = story_cap {
+                cfg.story_cap = v;
+            }
+            if let Some(v) = note_cap {
+                cfg.note_cap = v;
+            }
+            if let Some(v) = resurface_penalty {
+                cfg.resurface_penalty = v;
+            }
+            digest::set_config(pool, cfg).await?;
+            println!("{}", serde_json::to_string_pretty(&cfg)?);
         }
         DebugCommand::DigestProvenance { story_id } => {
             print_provenance(story_id, &digest::provenance(pool, story_id).await?);

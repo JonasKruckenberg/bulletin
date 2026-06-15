@@ -92,7 +92,7 @@ impl TryFrom<&str> for Format {
 /// The tunable scoring knobs — the `digest_config` row, lifted into a pure value so selection is
 /// testable against fixtures (design §8.4: "the relevance_floor, richness threshold, and caps live in
 /// a config table in v1"). [`Default`] mirrors the migration defaults so a fixture needn't hit the DB.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ScoringConfig {
     /// Inclusion gate: a story is kept iff `relevance ≥ relevance_floor`.
     pub relevance_floor: f32,
@@ -135,7 +135,7 @@ impl Default for ScoringConfig {
 /// `digest_item`) — the re-surface suppression key (design §9.4). A story whose `last_event_time`
 /// hasn't advanced past `last_event_time` here, and which hasn't graduated `Note → Story`, is a stale
 /// re-surface to be damped.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Shown {
     pub last_event_time: DateTime<Utc>,
     pub format: Format,
@@ -167,7 +167,7 @@ pub struct ItemReason {
 /// story's entity spine (for the thread relevance term), the computed thread `relevance`, and the M4
 /// scoring features (its cross-source rollups). `relevance` is `0` until [`apply_thread_weights`]
 /// fills it, so a digest with no thread weighting ranks by recency-decayed base relevance.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Candidate {
     pub id: Uuid,
     pub last_event_time: DateTime<Utc>,
@@ -227,6 +227,19 @@ impl Candidate {
             last_shown,
         }
     }
+}
+
+/// The exact input to one [`select`] call, persisted (as `digest.candidates` jsonb) so a delivered
+/// digest can be **re-scored under a trial `ScoringConfig`** offline — the eval config sweep
+/// (`local-ml-options.md` §0.1). `candidates` is the post-thread-weighting candidate set, `now` the
+/// read-time clock its recency decay used; with `max_items` they make `select` a deterministic replay,
+/// so an operator can A/B a `digest_config` change (or a later ML signal) over real history with no
+/// deploy. Pre-snapshot digests store nothing and are simply not replayable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplaySnapshot {
+    pub now: DateTime<Utc>,
+    pub max_items: usize,
+    pub candidates: Vec<Candidate>,
 }
 
 /// The Thread relevance term (design `docs/thread-layer.md` §5.2): set each candidate's `relevance`
