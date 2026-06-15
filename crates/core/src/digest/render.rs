@@ -1011,9 +1011,8 @@ mod tests {
         );
 
         // The greeting opens the plaintext fallback, then the composed lead, ahead of the item list.
-        assert!(plain.starts_with(
-            "Good morning. Here's your daily digest. Leading this digest: Hello."
-        ));
+        assert!(plain
+            .starts_with("Good morning. Here's your daily digest. Leading this digest: Hello."));
         assert!(plain.contains("1. [STORY] Hello"));
         assert!(plain.contains("https://example.com"));
         assert!(plain.contains("rss ·"));
