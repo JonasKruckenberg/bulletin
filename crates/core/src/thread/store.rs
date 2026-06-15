@@ -11,6 +11,7 @@ use sqlx::{postgres::PgRow, PgExecutor, PgPool, Row};
 use uuid::Uuid;
 
 use crate::common::db::{begin_scope, ScopeCtx};
+use crate::common::watermark;
 use crate::identity::{CanonicalId, ConfidenceBand};
 use crate::thread::{ExistingThread, ThreadOrigin, ThreadState};
 
@@ -241,15 +242,7 @@ pub async fn feedback_cursor(
     executor: impl PgExecutor<'_>,
     subscriber_id: Uuid,
 ) -> Result<DateTime<Utc>, sqlx::Error> {
-    let row = sqlx::query(
-        "SELECT coalesce(
-                  (SELECT built_through FROM thread_maintenance_watermark WHERE subscriber_id = $1),
-                  'epoch'::timestamptz) AS built_through",
-    )
-    .bind(subscriber_id)
-    .fetch_one(executor)
-    .await?;
-    Ok(row.get("built_through"))
+    watermark::read_through(executor, "thread_maintenance_watermark", subscriber_id).await
 }
 
 /// Advance the subscriber's maintenance watermark to `through` (monotonic), stamping `ran_at = now()`
@@ -259,18 +252,14 @@ pub async fn advance_watermark(
     subscriber_id: Uuid,
     through: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO thread_maintenance_watermark (subscriber_id, built_through, ran_at)
-         VALUES ($1, $2, now())
-         ON CONFLICT (subscriber_id) DO UPDATE SET
-            built_through = GREATEST(thread_maintenance_watermark.built_through, EXCLUDED.built_through),
-            ran_at = now()",
+    watermark::advance(
+        executor,
+        "thread_maintenance_watermark",
+        subscriber_id,
+        through,
+        true,
     )
-    .bind(subscriber_id)
-    .bind(through)
-    .execute(executor)
-    .await?;
-    Ok(())
+    .await
 }
 
 /// Subscribers due for a maintenance pass: those whose last run is older than `cadence` (or who have

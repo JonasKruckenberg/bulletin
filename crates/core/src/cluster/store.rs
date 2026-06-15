@@ -7,6 +7,7 @@ use crate::common::{
     event::{from_row, Event},
     kind::SourceKind,
     scope::Scope,
+    watermark,
 };
 use chrono::{DateTime, Utc};
 use sqlx::{postgres::PgRow, PgExecutor, Row};
@@ -220,15 +221,12 @@ pub async fn advance_private_build_watermark(
     subscriber_id: Uuid,
     hwm: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO private_build_watermark (subscriber_id, built_through)
-         VALUES ($1, $2)
-         ON CONFLICT (subscriber_id) DO UPDATE
-            SET built_through = GREATEST(private_build_watermark.built_through, EXCLUDED.built_through)",
+    watermark::advance(
+        executor,
+        "private_build_watermark",
+        subscriber_id,
+        hwm,
+        false,
     )
-    .bind(subscriber_id)
-    .bind(hwm)
-    .execute(executor)
-    .await?;
-    Ok(())
+    .await
 }

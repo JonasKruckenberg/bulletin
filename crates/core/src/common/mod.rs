@@ -10,3 +10,4 @@ pub mod kind;
 pub mod scope;
 pub mod secret;
 pub mod status;
+pub mod watermark;
