@@ -19,7 +19,7 @@ use crate::link::{Assignment, LinkCluster, PriorMember};
 ///  1. **In-floor** — public ∪ own-private clusters updated since the freshness floor `min(last_run,
 ///     now − horizon)`. The bulk of the candidate set, served by the `cluster_*_recency` indexes.
 ///  2. **Cross-boundary seed** — public clusters that share a **strong key** (a `cve:`/`url:`, mirrors
-///     `entity::is_strong`) with the subscriber's *active* (in-floor) private clusters, **regardless
+///     `entity::link_strength`) with the subscriber's *active* (in-floor) private clusters, **regardless
 ///     of the freshness floor on the public side**. This is the design's blocking seed (§8.2):
 ///     without it, a fresh private incident referencing `CVE-X` would never link to the public
 ///     advisory about `CVE-X` if that advisory has aged out of the floor — the exact cross-source
@@ -45,7 +45,7 @@ pub async fn candidate_clusters(
                   WHERE (scope_kind = 'public' OR scope_subscriber_id = $1)
                     AND updated_at >= (SELECT lo FROM floor)
               ),
-              -- The strong keys (cve:/url:, mirrors entity::is_strong) the subscriber's *active*
+              -- The strong keys (cve:/url:, mirrors entity::link_strength) the subscriber's *active*
               -- private clusters carry — floored like in_floor, so the seed scales with recent
               -- private activity (a fresh incident), not lifetime history. NULL when they have
               -- none, which makes the seed below a no-op.
