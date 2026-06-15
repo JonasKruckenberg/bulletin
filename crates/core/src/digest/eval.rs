@@ -189,8 +189,10 @@ pub fn evaluate(digests: &[Vec<DecisionRecord>], grades: &HashMap<Uuid, Grade>) 
             }
         }
 
-        // Per-digest nDCG over the render order, only where ≥1 selected story has a grade.
-        if sel.iter().any(|d| grades.contains_key(&d.story_id)) {
+        // Per-digest nDCG over the render order — only where ranking is meaningful (≥2 selected) and
+        // at least one is graded. A single-item digest is trivially nDCG 1.0 (actual == ideal), which
+        // would bias the mean upward without measuring any actual ordering.
+        if sel.len() >= 2 && sel.iter().any(|d| grades.contains_key(&d.story_id)) {
             let rels: Vec<f64> = sel
                 .iter()
                 .map(|d| grades.get(&d.story_id).map_or(UNGRADED_GAIN, |g| g.gain()))
@@ -424,6 +426,24 @@ mod tests {
         assert!((m_good - 1.0).abs() < 1e-9, "best order is ideal");
     }
 
+    #[test]
+    fn single_item_digest_contributes_no_ndcg() {
+        // One selected, graded — there is no ordering to score, and nDCG would be a trivial 1.0. It must
+        // not count (else single-item digests bias the mean up); precision still counts it.
+        let digest = vec![sel(1, 0, Format::Story)];
+        let grades = HashMap::from([(Uuid::from_u128(1), Grade::Up)]);
+        let m = evaluate(&[digest], &grades);
+        assert_eq!(
+            m.ndcg, None,
+            "a single-item digest scores no ranking quality"
+        );
+        assert_eq!(
+            m.precision,
+            Some(1.0),
+            "but it still counts toward precision"
+        );
+    }
+
     proptest! {
         // Rates stay in [0,1]; the verdict tallies never exceed the candidate count.
         #[test]
@@ -449,7 +469,8 @@ mod tests {
                 up_ids.into_iter().map(|id| (Uuid::from_u128(id), Grade::Up)).collect();
 
             let m = evaluate(&digests, &grades);
-            prop_assert!(m.selected + m.over_cap + m.dropped_below_floor <= m.candidates);
+            // Every candidate gets exactly one verdict, so the three buckets partition the total.
+            prop_assert_eq!(m.selected + m.over_cap + m.dropped_below_floor, m.candidates);
             prop_assert_eq!(m.selected_stories + m.selected_notes, m.selected);
             if let Some(p) = m.precision { prop_assert!((0.0..=1.0).contains(&p)); }
             if let Some(n) = m.ndcg { prop_assert!((0.0..=1.0 + 1e-9).contains(&n)); }
