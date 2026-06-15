@@ -389,6 +389,30 @@ in
       "e /var/lib/bulletin/backups - - - 14d"
     ];
 
+    # Grant the owner role CREATE on `public` before it migrates. NixOS provisions the owner via
+    # `ensureDBOwnership`, but on PG15+ owning the database no longer implies CREATE on `public`
+    # unless `public` is owned by `pg_database_owner` — and on a stock cluster `public` is owned by
+    # `postgres`, so the owner has only USAGE there. The domain migrations happen to skip this gap
+    # (a pre-existing DB has them already recorded in `_sqlx_migrations`), but apalis's
+    # `setup_storage` (worker::setup_storage → PostgresStorage::migrations) is the first run to issue
+    # unqualified `CREATE`s into `public` — `CREATE EXTENSION pgcrypto`, `generate_ulid()`, and its
+    # own `_sqlx_migrations` table — which fail with "permission denied for schema public". This
+    # oneshot (run as the postgres superuser, ordered before migrate) closes that gap idempotently
+    # for both fresh and existing databases.
+    systemd.services.bulletin-grant-public = lib.mkIf cfg.database.createLocally {
+      description = "Grant the Bulletin owner role CREATE on schema public";
+      after = [ "postgresql.target" ];
+      requires = [ "postgresql.target" ];
+      before = [ "bulletin-migrate.service" ];
+      requiredBy = [ "bulletin-migrate.service" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        User = "postgres";
+      };
+      script = "${pgPackage}/bin/psql -d ${dbName} -c 'GRANT USAGE, CREATE ON SCHEMA public TO ${ownerRole};'";
+    };
+
     systemd.services.bulletin-migrate = {
       description = "Bulletin database migrations";
       after = pgDeps;
