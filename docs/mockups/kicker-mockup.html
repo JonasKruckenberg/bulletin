@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bulletin — kicker mockup</title>
+</head>
+<!--
+  ROUGH MOCKUP (not wired to render.rs). Palette/type lifted from digest/render.rs consts.
+  Shows the proposed Thread-label *kicker* (§1.1 of docs/llm-summarization.md):
+   - item 1: threaded, Confirmed band  → kicker is the thread label, no qualifier, + delta line
+   - item 2: threaded, Probable band   → "possibly <thread>" + delta line
+   - item 3: un-threaded               → kicker omitted entirely (graceful)
+  The standalone chip is folded INTO this kicker (one thread reference per item, not two).
+-->
+<body style="margin:0;padding:0;background-color:#fefbf3;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#fefbf3;">
+<tr><td align="center" style="padding:36px 12px;">
+<table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="width:600px;max-width:100%;background-color:#fffdf8;border:1px solid #ddd4c2;border-radius:4px;">
+
+<!-- masthead + big-picture lead -->
+<tr><td style="padding:52px 40px 0 40px;">
+  <div style="font-family:'Helvetica Neue',Arial,sans-serif;font-size:12px;font-weight:600;letter-spacing:0.12em;text-transform:uppercase;color:#a0927b;text-align:center;">Bulletin</div>
+  <h1 style="margin:18px 0 30px 0;font-family:Georgia,serif;font-size:34px;font-weight:700;line-height:1.25;color:#2c1810;text-align:center;">Your Digest</h1>
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:0 0 8px 0;"><tr>
+    <td width="40%" style="border-bottom:1px solid #ddd4c2;font-size:0;line-height:0;">&nbsp;</td>
+    <td style="padding:0 14px;white-space:nowrap;font-family:'Helvetica Neue',Arial,sans-serif;font-size:12px;letter-spacing:0.1em;text-transform:uppercase;color:#a0927b;text-align:center;">Monday, June 15, 2026</td>
+    <td width="40%" style="border-bottom:1px solid #ddd4c2;font-size:0;line-height:0;">&nbsp;</td>
+  </tr></table>
+  <div style="font-family:Georgia,serif;font-size:15px;font-style:italic;font-weight:700;color:#d35327;margin:34px 0 12px 0;">The big picture</div>
+  <div style="font-family:Georgia,serif;font-size:17px;line-height:1.75;color:#3d2e22;margin:0;"><strong style="color:#2c1810;font-weight:700;">Good morning.</strong> The Acme auth migration dominated the night — a token-rotation rollout broke logins before a clean rollback — while a new CVE landed on the billing service. Three quieter threads moved too.</div>
+  <div style="font-family:Georgia,serif;font-size:15px;font-style:italic;font-weight:700;color:#d35327;margin:40px 0 0 0;">In this digest &middot; 3 items</div>
+</td></tr>
+
+<!-- ITEM 1 — threaded, Confirmed -->
+<tr><td style="padding:30px 40px;">
+  <!-- KICKER: thread label (Confirmed → no qualifier) + delta line -->
+  <div style="font-family:'Helvetica Neue',Arial,sans-serif;font-size:11px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#d35327;">&#9656;&nbsp;Acme auth migration</div>
+  <div style="margin-top:3px;font-family:'Helvetica Neue',Arial,sans-serif;font-size:12px;font-style:italic;color:#a0927b;">staging cutover landed; 2 follow-ups assigned to you</div>
+
+  <a href="#" style="display:block;margin-top:9px;font-family:Georgia,serif;font-size:21px;font-weight:700;line-height:1.3;color:#2c1810;text-decoration:none;">Auth service returns 500s after the token-rotation deploy</a>
+  <div style="margin-top:12px;font-family:Georgia,serif;font-size:16px;font-style:italic;line-height:1.65;color:#3d2e22;">A bad config in the 14:02 rollout broke token validation; ~12% of logins failed for 40m until a rollback restored service.</div>
+
+  <div style="margin-top:16px;padding-top:4px;">
+    <div style="font-family:'Helvetica Neue',Arial,sans-serif;font-size:12px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:#a0927b;">Related</div>
+    <div style="margin-top:8px;font-family:Georgia,serif;font-size:16px;line-height:1.5;color:#3d2e22;"><span style="color:#d35327;">&#8627;</span> <a href="#" style="color:#3d2e22;text-decoration:none;font-weight:700;">CVE-2026-1234 advisory</a> <span style="font-family:sans-serif;font-size:12px;text-transform:uppercase;letter-spacing:0.06em;color:#d35327;">rss</span> <span style="color:#a0927b;">— shared entity: acme/auth</span></div>
+    <div style="margin-top:8px;font-family:Georgia,serif;font-size:16px;line-height:1.5;color:#3d2e22;"><span style="color:#d35327;">&#8627;</span> <a href="#" style="color:#3d2e22;text-decoration:none;font-weight:700;">#incident-auth (14 msgs)</a> <span style="font-family:sans-serif;font-size:12px;text-transform:uppercase;letter-spacing:0.06em;color:#d35327;">slack</span> <span style="color:#a0927b;">— same CVE referenced</span></div>
+  </div>
+  <div style="margin-top:16px;font-family:'Helvetica Neue',Arial,sans-serif;font-size:12px;line-height:1.6;color:#a0927b;"><span style="font-weight:600;color:#d35327;">Why</span> &middot; Story &middot; multi-source &middot; relevance 0.94</div>
+</td></tr>
+
+<tr><td align="center" style="padding:6px 40px;"><table role="presentation" cellpadding="0" cellspacing="0" border="0" align="center"><tr><td width="44" height="1" style="width:44px;height:1px;line-height:1px;font-size:0;background-color:#ddd4c2;">&nbsp;</td></tr></table></td></tr>
+
+<!-- ITEM 2 — threaded, Probable -->
+<tr><td style="padding:30px 40px;">
+  <!-- KICKER: Probable band → "possibly" qualifier -->
+  <div style="font-family:'Helvetica Neue',Arial,sans-serif;font-size:11px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#d35327;">&#9656;&nbsp;possibly Billing rewrite</div>
+  <div style="margin-top:3px;font-family:'Helvetica Neue',Arial,sans-serif;font-size:12px;font-style:italic;color:#a0927b;">first activity in 3 weeks — thread reactivated</div>
+
+  <a href="#" style="display:block;margin-top:9px;font-family:Georgia,serif;font-size:21px;font-weight:700;line-height:1.3;color:#2c1810;text-decoration:none;">CVE-2026-2200: SSRF in the invoice PDF renderer</a>
+  <div style="margin-top:12px;font-family:Georgia,serif;font-size:16px;font-style:italic;line-height:1.65;color:#3d2e22;">A high-severity SSRF advisory lands on billing's PDF path; no patch yet, mitigation is to disable remote asset fetching.</div>
+
+  <div style="margin-top:16px;font-family:'Helvetica Neue',Arial,sans-serif;font-size:12px;line-height:1.6;color:#a0927b;"><span style="font-weight:600;color:#d35327;">Why</span> &middot; Story &middot; security &middot; relevance 0.81</div>
+</td></tr>
+
+<tr><td align="center" style="padding:6px 40px;"><table role="presentation" cellpadding="0" cellspacing="0" border="0" align="center"><tr><td width="44" height="1" style="width:44px;height:1px;line-height:1px;font-size:0;background-color:#ddd4c2;">&nbsp;</td></tr></table></td></tr>
+
+<!-- ITEM 3 — un-threaded → NO kicker at all (graceful omit) -->
+<tr><td style="padding:30px 40px;">
+  <a href="#" style="display:block;font-family:Georgia,serif;font-size:21px;font-weight:700;line-height:1.3;color:#2c1810;text-decoration:none;">Postgres 18.2 released with logical-replication fixes</a>
+  <div style="margin-top:12px;font-family:Georgia,serif;font-size:16px;font-style:italic;line-height:1.65;color:#3d2e22;">A patch release closing three logical-replication bugs and a planner regression; no breaking changes.</div>
+  <div style="margin-top:16px;font-family:'Helvetica Neue',Arial,sans-serif;font-size:12px;line-height:1.6;color:#a0927b;"><span style="font-weight:600;color:#d35327;">Why</span> &middot; Story &middot; release &middot; relevance 0.62</div>
+</td></tr>
+
+<tr><td align="center" style="padding:6px 40px;"><table role="presentation" cellpadding="0" cellspacing="0" border="0" align="center"><tr><td width="44" height="1" style="width:44px;height:1px;line-height:1px;font-size:0;background-color:#ddd4c2;">&nbsp;</td></tr></table></td></tr>
+
+<tr><td style="padding:30px 40px 52px 40px;">
+  <div style="font-family:'Helvetica Neue',Arial,sans-serif;font-size:13px;line-height:1.7;color:#a0927b;text-align:center;">You're receiving this digest from Bulletin, gathered from the sources you subscribed to.</div>
+</td></tr>
+
+</table>
+</td></tr>
+</table>
+</body>
+</html>
