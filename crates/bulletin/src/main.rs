@@ -60,11 +60,13 @@ impl Cli {
     /// The runtime DB URL, required for every DB-touching role. (The offline `secrets` tooling never
     /// calls this, so it can run without a database configured.)
     fn database_url(&self) -> Result<&str> {
-        self.database_url
-            .as_deref()
-            .context("DATABASE_URL is required (set --database-url or the env var)")
+        self.database_url.as_deref().context(DATABASE_URL_REQUIRED)
     }
 }
+
+/// Shared error text for the two places that resolve the runtime DB URL (the `database_url` accessor
+/// and the `Debug` arm, which can't use it because `cli.command` is already partially moved).
+const DATABASE_URL_REQUIRED: &str = "DATABASE_URL is required (set --database-url or the env var)";
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum LogFormat {
@@ -157,12 +159,9 @@ async fn main() -> Result<()> {
             )?;
         }
         Command::Debug { command } => {
-            // `command` is moved out here, so reach the URL by field (a `self` method would borrow
-            // the partially-moved `cli`).
-            let url = cli
-                .database_url
-                .as_deref()
-                .context("DATABASE_URL is required (set --database-url or the env var)")?;
+            // `command` is moved out here, so reach the URL by field (the `&self` method would
+            // borrow the partially-moved `cli`).
+            let url = cli.database_url.as_deref().context(DATABASE_URL_REQUIRED)?;
             let pool = connect_pool(url).await?;
             debug::run(&pool, &cli.email, command).await?;
         }

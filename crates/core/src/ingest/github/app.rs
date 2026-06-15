@@ -20,7 +20,6 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use super::token::{Token, TokenFuture, TokenProvider};
-use super::DEFAULT_API_BASE;
 use crate::ingest::SourceError;
 
 /// Re-mint an installation token this long before it actually expires, so an in-flight poll never
@@ -45,7 +44,7 @@ pub struct GithubApp {
 impl GithubApp {
     /// Build from the App id + its **PEM-encoded** RSA private key (PKCS#1 or PKCS#8 — GitHub issues
     /// PKCS#1 `BEGIN RSA PRIVATE KEY`). Errors only if the key isn't a usable RSA PEM. `base_url` is
-    /// overridable for GitHub Enterprise / tests; pass [`DEFAULT_API_BASE`] for github.com.
+    /// overridable for GitHub Enterprise / tests; pass `DEFAULT_API_BASE` for github.com.
     pub fn new(
         base_url: impl Into<String>,
         app_id: i64,
@@ -104,30 +103,8 @@ impl GithubAppTokens {
             "{}/app/installations/{}/access_tokens",
             self.app.base_url, self.installation_id
         );
-        let resp = self
-            .app
-            .client
-            .post(&url)
-            .bearer_auth(jwt)
-            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .header(reqwest::header::USER_AGENT, "bulletin")
-            .send()
-            .await
-            .map_err(|e| SourceError::Request(e.to_string()))?;
-        if !resp.status().is_success() {
-            // Don't echo the body — an error response can carry sensitive context; the status is enough.
-            return Err(SourceError::Request(format!(
-                "installation token exchange: HTTP {}",
-                resp.status()
-            )));
-        }
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| SourceError::Request(e.to_string()))?;
-        let parsed: TokenResponse = serde_json::from_slice(&bytes)
-            .map_err(|e| SourceError::Parse(format!("installation token response: {e}")))?;
+        let req = super::github_headers(self.app.client.post(&url).bearer_auth(jwt));
+        let parsed: TokenResponse = super::fetch_json(req, "installation token exchange").await?;
         Ok(Token {
             secret: parsed.token,
             expires_at: parsed.expires_at,
@@ -166,9 +143,4 @@ struct AppClaims {
 struct TokenResponse {
     token: String,
     expires_at: DateTime<Utc>,
-}
-
-/// Convenience for the app wiring: github.com unless overridden.
-pub fn default_base_url() -> String {
-    DEFAULT_API_BASE.to_string()
 }

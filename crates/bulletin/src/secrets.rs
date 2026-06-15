@@ -20,7 +20,8 @@ use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use secrecy::ExposeSecret;
 
-use bulletin_core::ingest::github::app::{default_base_url, GithubApp};
+use bulletin_core::ingest::github::app::GithubApp;
+use bulletin_core::ingest::github::DEFAULT_API_BASE;
 use bulletin_core::ingest::{ConnectorCtx, GithubCtx};
 use bulletin_core::secret::{seal, MasterKey, SealedSecret};
 
@@ -112,7 +113,7 @@ impl SecretConfig {
         let base_url = self
             .github_api_base
             .clone()
-            .unwrap_or_else(default_base_url);
+            .unwrap_or_else(|| DEFAULT_API_BASE.to_string());
         let app = GithubApp::new(base_url.clone(), app_id, pem.expose_secret())
             .map_err(|e| anyhow::anyhow!("{e}"))
             .context("loading the GitHub App credentials")?;

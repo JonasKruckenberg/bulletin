@@ -12,7 +12,7 @@
 //! 1. **Blocking** — an inverted index over `entities` yields only the candidate pairs that share a
 //!    key, the O(n²) guard. We never compare two clusters with nothing in common.
 //! 2. **Scoring** — each candidate pair gets a weighted score (entity Jaccard + temporal closeness),
-//!    promoted to a **strong** edge when it shares a *strong* key (a CVE/URL — `entity::is_strong`).
+//!    promoted to a **strong** edge when it shares a *strong* key (a CVE/URL — `entity::link_strength`).
 //! 3. **Components** — connected components (union-find) over the edges; each is a story. Computed
 //!    fresh every run from the full candidate set, so it is order-independent (no arrival-order bias)
 //!    and late retro-connections form automatically. **Strong edges merge anything; a weak edge may

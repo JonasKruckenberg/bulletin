@@ -278,6 +278,13 @@ pub struct Decision {
     pub verdict: Verdict,
 }
 
+impl Decision {
+    /// Whether this candidate made the cut — as opposed to falling to over-cap or being dropped.
+    pub fn is_selected(&self) -> bool {
+        matches!(self.verdict, Verdict::Selected { .. })
+    }
+}
+
 /// One entry of a digest's persisted **decision log** (design §10.2): a candidate story, its verdict
 /// (selected, over-cap, or dropped — so the log records *every* outcome, answering "why was X *not*
 /// in my digest?"), and the reasoning behind its rank. The full `Vec<DecisionRecord>` is stored on
@@ -335,12 +342,11 @@ fn richness(c: &Candidate) -> (Format, &'static str) {
         (Format::Story, "multi-source")
     } else if c.event_count > 1 {
         (Format::Story, "multi-event")
-    } else if c.content_depth == ContentKind::Longform {
-        (Format::Story, "longform")
     } else {
         match c.content_depth {
+            ContentKind::Longform => (Format::Story, "longform"),
             ContentKind::Announcement => (Format::Note, "announcement"),
-            _ => (Format::Note, "message"),
+            ContentKind::Message => (Format::Note, "message"),
         }
     }
 }
@@ -357,6 +363,23 @@ struct Gated {
     /// The format actually rendered — `natural_format`, or `Note` when re-surface-demoted.
     format: Format,
     richness: &'static str,
+}
+
+impl Gated {
+    /// Seals a ranked candidate into its terminal [`Decision`] once the cap pass has settled its
+    /// verdict — the single place the `Gated` → `Decision` field move lives.
+    fn into_decision(self, verdict: Verdict) -> Decision {
+        Decision {
+            id: self.id,
+            last_event_time: self.last_event_time,
+            relevance: self.relevance,
+            priority: self.priority,
+            natural_format: self.natural_format,
+            format: self.format,
+            richness: self.richness.to_string(),
+            verdict,
+        }
+    }
 }
 
 /// Pure scoring + selection (design §8.4): gate by relevance, rank by priority, classify richness into
@@ -453,16 +476,7 @@ pub fn select(
         } else {
             Verdict::OverCap { rank }
         };
-        let decision = Decision {
-            id: g.id,
-            last_event_time: g.last_event_time,
-            relevance: g.relevance,
-            priority: g.priority,
-            natural_format: g.natural_format,
-            format: g.format,
-            richness: g.richness.to_string(),
-            verdict,
-        };
+        let decision = g.into_decision(verdict);
         match verdict {
             Verdict::Selected { .. } => selected.push(decision),
             _ => over_cap.push(decision),
@@ -494,7 +508,7 @@ mod tests {
     fn selected_ids(decisions: &[Decision]) -> Vec<Uuid> {
         decisions
             .iter()
-            .filter_map(|d| matches!(d.verdict, Verdict::Selected { .. }).then_some(d.id))
+            .filter_map(|d| d.is_selected().then_some(d.id))
             .collect()
     }
 

@@ -3,7 +3,7 @@
 //! An entity is a namespaced token (`kind:value`) that two events might share: a CVE id, a URL, a
 //! repo, a user. The namespace prefix is load-bearing — it both keeps unrelated values from
 //! colliding (`user:rust` ≠ `repo:rust`) and classifies an entity as **strong** or **weak** for
-//! linking ([`is_strong`]): a shared *strong* key (a CVE or an exact URL) is a near-certain
+//! linking ([`link_strength`]): a shared *strong* key (a CVE or an exact URL) is a near-certain
 //! connection that may merge anything; a shared *weak* key (a domain, repo, or person) only links
 //! when corroborated by other signals (design §8.2's asymmetric-merge guard against single-linkage
 //! blobs).
@@ -40,11 +40,6 @@ pub fn link_strength(entity: &str) -> Option<LinkStrength> {
     } else {
         None
     }
-}
-
-/// `cve:` / `url:` are **strong** keys (a shared one is a near-certain cross-source link, design §8.2).
-pub fn is_strong(entity: &str) -> bool {
-    matches!(link_strength(entity), Some(LinkStrength::Strong))
 }
 
 /// Derive the shared, cross-source entities (CVE ids + URLs/domains) from an event's text and links.
@@ -161,11 +156,12 @@ mod tests {
 
     #[test]
     fn strong_vs_weak_classification() {
-        assert!(is_strong("cve:CVE-2026-1234"));
-        assert!(is_strong("url:https://example.com/a"));
-        assert!(!is_strong("domain:example.com"));
-        assert!(!is_strong("repo:acme/widget"));
-        assert!(!is_strong("user:alice"));
+        use LinkStrength::*;
+        assert_eq!(link_strength("cve:CVE-2026-1234"), Some(Strong));
+        assert_eq!(link_strength("url:https://example.com/a"), Some(Strong));
+        assert_eq!(link_strength("repo:acme/widget"), Some(Weak));
+        assert_eq!(link_strength("user:alice"), Some(Weak));
+        assert_eq!(link_strength("domain:example.com"), None);
     }
 
     #[test]

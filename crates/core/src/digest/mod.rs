@@ -260,7 +260,7 @@ fn selected_reasons(
 ) -> HashMap<Uuid, ItemReason> {
     decisions
         .iter()
-        .filter(|d| matches!(d.verdict, Verdict::Selected { .. }))
+        .filter(|d| d.is_selected())
         .map(|d| (d.id, reason_of(d, story_entities)))
         .collect()
 }
@@ -290,7 +290,7 @@ async fn record_decision_log(
 fn selected_ids(decisions: &[Decision]) -> Vec<Uuid> {
     decisions
         .iter()
-        .filter(|d| matches!(d.verdict, Verdict::Selected { .. }))
+        .filter(|d| d.is_selected())
         .map(|d| d.id)
         .collect()
 }
@@ -300,7 +300,7 @@ fn selected_ids(decisions: &[Decision]) -> Vec<Uuid> {
 fn frozen_items(decisions: &[Decision]) -> Vec<FrozenItem> {
     decisions
         .iter()
-        .filter(|d| matches!(d.verdict, Verdict::Selected { .. }))
+        .filter(|d| d.is_selected())
         .map(|d| FrozenItem {
             story_id: d.id,
             last_event_time: d.last_event_time,

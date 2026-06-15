@@ -31,6 +31,38 @@ use token::TokenProvider;
 /// Default REST API root; overridable so tests can point at a local mock server.
 pub const DEFAULT_API_BASE: &str = "https://api.github.com";
 
+/// The header set every GitHub REST call carries: the JSON media type, the pinned API version, and
+/// the UA GitHub requires. Auth (`bearer_auth`) is applied by the caller, which holds the token.
+pub(super) fn github_headers(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    req.header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header(reqwest::header::USER_AGENT, "bulletin")
+}
+
+/// Send a prepared request, error on a non-success status (status only — an error body can carry
+/// sensitive context), and deserialize the JSON body. The shared send/check/parse path for the
+/// GitHub REST calls that don't need conditional-GET (ETag/304) handling.
+pub(super) async fn fetch_json<T: serde::de::DeserializeOwned>(
+    req: reqwest::RequestBuilder,
+    what: &str,
+) -> Result<T, SourceError> {
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| SourceError::Request(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(SourceError::Request(format!(
+            "{what}: HTTP {}",
+            resp.status()
+        )));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| SourceError::Request(e.to_string()))?;
+    serde_json::from_slice(&bytes).map_err(|e| SourceError::Parse(format!("{what}: {e}")))
+}
+
 /// Per-connection config persisted in `connection.config`. The `installation_id` is the App
 /// installation this connection ingests + the webhook routing key (Phase 2) — **not a secret**
 /// (design §3A). An explicit `repos` allowlist is optional; absent, we reconcile every repo the
@@ -91,10 +123,7 @@ impl GithubConnection {
     /// Common header set: bearer auth, the JSON media type, the pinned API version, and the UA
     /// GitHub requires. The installation token is short-lived and never logged.
     fn authed(&self, req: reqwest::RequestBuilder, token: &str) -> reqwest::RequestBuilder {
-        req.bearer_auth(token)
-            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .header(reqwest::header::USER_AGENT, "bulletin")
+        github_headers(req.bearer_auth(token))
     }
 
     /// The repos to reconcile, each tagged with its visibility. Discovery via
@@ -113,23 +142,11 @@ impl GithubConnection {
                 .collect());
         }
         let url = format!("{}/installation/repositories", self.base_url);
-        let resp = self
-            .authed(self.client.get(&url), token)
-            .send()
-            .await
-            .map_err(|e| SourceError::Request(e.to_string()))?;
-        if !resp.status().is_success() {
-            return Err(SourceError::Request(format!(
-                "list repositories: HTTP {}",
-                resp.status()
-            )));
-        }
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| SourceError::Request(e.to_string()))?;
-        let parsed: InstallationRepos = serde_json::from_slice(&bytes)
-            .map_err(|e| SourceError::Parse(format!("installation repositories: {e}")))?;
+        let parsed: InstallationRepos = fetch_json(
+            self.authed(self.client.get(&url), token),
+            "installation repositories",
+        )
+        .await?;
         Ok(parsed
             .repositories
             .into_iter()
@@ -146,6 +163,7 @@ impl GithubConnection {
         &self,
         token: &str,
         repo: &str,
+        private: bool,
         cursor: RepoCursor,
     ) -> Result<(Vec<GithubEvent>, RepoCursor), SourceError> {
         let url = format!("{}/repos/{repo}/events", self.base_url);
@@ -181,10 +199,19 @@ impl GithubConnection {
             .map_err(|e| SourceError::Parse(format!("repo events {repo}: {e}")))?;
 
         // Feed is newest-first; take until we reach the last id we already ingested.
-        let fresh: Vec<GithubEvent> = match &cursor.last_event_id {
+        let mut fresh: Vec<GithubEvent> = match &cursor.last_event_id {
             Some(seen) => all.into_iter().take_while(|e| &e.id != seen).collect(),
             None => all, // first poll: take the page
         };
+        // A known-private repo forces every one of its events private (never a downgrade), so the
+        // privacy fold lives here next to the parse. Discovery sets `private` from the authoritative
+        // per-repo flag; an allowlist can't, so its repos pass `false` and rely on the per-event
+        // `public` flag the feed itself carries.
+        if private {
+            for ev in &mut fresh {
+                ev.public = false;
+            }
+        }
         // Advance the high-water mark to the newest id observed (even if it was a 304-less empty
         // page); keep the prior one when this page had nothing.
         let newest = fresh.first().map(|e| e.id.clone()).or(cursor.last_event_id);
@@ -233,16 +260,9 @@ impl Connection for GithubConnection {
         let mut next = GithubCursor::default();
         for repo in repos {
             let repo_cursor = cursor.repos.get(&repo.name).cloned().unwrap_or_default();
-            let (mut events, new_cursor) = self
-                .poll_repo(&token.secret, &repo.name, repo_cursor)
+            let (events, new_cursor) = self
+                .poll_repo(&token.secret, &repo.name, repo.private, repo_cursor)
                 .await?;
-            // A private repo forces every one of its events private (never a downgrade), so an
-            // allowlist that can't report visibility still tags private-repo activity correctly.
-            if repo.private {
-                for ev in &mut events {
-                    ev.public = false;
-                }
-            }
             items.extend(events);
             next.repos.insert(repo.name, new_cursor);
         }

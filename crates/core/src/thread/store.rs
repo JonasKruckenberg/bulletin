@@ -11,6 +11,7 @@ use sqlx::{postgres::PgRow, PgExecutor, PgPool, Row};
 use uuid::Uuid;
 
 use crate::common::db::{begin_scope, ScopeCtx};
+use crate::common::watermark;
 use crate::identity::{CanonicalId, ConfidenceBand};
 use crate::thread::{ExistingThread, ThreadOrigin, ThreadState};
 
@@ -95,18 +96,12 @@ pub async fn load_threads(
     )
     .bind(subscriber_id)
     .try_map(|row: PgRow| {
-        let origin = match row.get::<String, _>("origin").as_str() {
-            "declared" => ThreadOrigin::Declared,
-            _ => ThreadOrigin::Emergent,
-        };
-        let entities: serde_json::Value = row.get("entities");
         Ok(ThreadRow {
             id: row.get("id"),
-            origin,
+            origin: ThreadOrigin::parse(&row.get::<String, _>("origin")),
             pinned: row.get("pinned"),
             affinity: row.get("affinity"),
-            entities: serde_json::from_value(entities)
-                .map_err(|e| sqlx::Error::Decode(Box::new(e)))?,
+            entities: row.get("entities"),
             first_seen: row.get("first_seen"),
             last_story_time: row.get("last_story_time"),
         })
@@ -144,8 +139,6 @@ pub async fn save_threads(
     upserts: &[ThreadUpsert],
 ) -> Result<(), sqlx::Error> {
     for u in upserts {
-        let entities =
-            serde_json::to_value(&u.entities).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
         let id = match u.id {
             Some(id) => {
                 sqlx::query(
@@ -156,7 +149,7 @@ pub async fn save_threads(
                      WHERE id = $1 AND subscriber_id = $9",
                 )
                 .bind(id)
-                .bind(&entities)
+                .bind(&u.entities)
                 .bind(u.affinity)
                 .bind(u.state.as_str())
                 .bind(u.story_count)
@@ -179,7 +172,7 @@ pub async fn save_threads(
             .bind(subscriber_id)
             .bind(u.origin.as_str())
             .bind(u.pinned)
-            .bind(&entities)
+            .bind(&u.entities)
             .bind(u.affinity)
             .bind(u.state.as_str())
             .bind(u.confidence.as_str())
@@ -244,15 +237,7 @@ pub async fn feedback_cursor(
     executor: impl PgExecutor<'_>,
     subscriber_id: Uuid,
 ) -> Result<DateTime<Utc>, sqlx::Error> {
-    let row = sqlx::query(
-        "SELECT coalesce(
-                  (SELECT built_through FROM thread_maintenance_watermark WHERE subscriber_id = $1),
-                  'epoch'::timestamptz) AS built_through",
-    )
-    .bind(subscriber_id)
-    .fetch_one(executor)
-    .await?;
-    Ok(row.get("built_through"))
+    watermark::read_through(executor, "thread_maintenance_watermark", subscriber_id).await
 }
 
 /// Advance the subscriber's maintenance watermark to `through` (monotonic), stamping `ran_at = now()`
@@ -262,18 +247,14 @@ pub async fn advance_watermark(
     subscriber_id: Uuid,
     through: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO thread_maintenance_watermark (subscriber_id, built_through, ran_at)
-         VALUES ($1, $2, now())
-         ON CONFLICT (subscriber_id) DO UPDATE SET
-            built_through = GREATEST(thread_maintenance_watermark.built_through, EXCLUDED.built_through),
-            ran_at = now()",
+    watermark::advance(
+        executor,
+        "thread_maintenance_watermark",
+        subscriber_id,
+        through,
+        true,
     )
-    .bind(subscriber_id)
-    .bind(through)
-    .execute(executor)
-    .await?;
-    Ok(())
+    .await
 }
 
 /// Subscribers due for a maintenance pass: those whose last run is older than `cadence` (or who have
@@ -317,14 +298,14 @@ pub async fn assign_thread(
     let row = sqlx::query(
         "SELECT id FROM (
             SELECT t.id,
-                   (SELECT count(*) FROM jsonb_array_elements_text(t.entities) AS e
+                   (SELECT count(*) FROM unnest(t.entities) AS e
                      WHERE e = ANY($2)) AS overlap,
                    t.affinity
             FROM thread t
             WHERE t.subscriber_id = $1
               AND t.merged_into IS NULL
               AND t.state <> 'archived'
-              AND jsonb_exists_any(t.entities, $2)
+              AND t.entities && $2
          ) cand
          WHERE overlap >= $3
          ORDER BY overlap::real * affinity DESC, affinity DESC, id

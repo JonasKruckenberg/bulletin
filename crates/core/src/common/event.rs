@@ -184,14 +184,8 @@ pub fn from_row(row: PgRow) -> Result<Event, sqlx::Error> {
     fp.copy_from_slice(&fp_bytes);
 
     let scope_kind: String = row.get("scope_kind");
-    let scope_subscriber_id: Option<Uuid> = row.get("scope_subscriber_id");
-    let scope = match scope_kind.as_str() {
-        "private" => Scope::Private(
-            scope_subscriber_id
-                .ok_or_else(|| decode_err("private event missing scope_subscriber_id"))?,
-        ),
-        _ => Scope::Public,
-    };
+    let scope =
+        Scope::from_columns(&scope_kind, row.get("scope_subscriber_id")).map_err(decode_err)?;
 
     Ok(Event {
         id: row.get("id"),

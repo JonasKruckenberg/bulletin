@@ -92,28 +92,12 @@ pub(crate) fn render(
     greeting: &str,
     content: &DigestContent<'_>,
 ) -> Result<Message> {
-    // The greeting doubles as the subject line, so the inbox preview opens in the same warm,
-    // time-of-day voice as the digest's lead (and varies per window the same way).
-    let subject = greeting;
-
-    // Dates and times are shown in the subscriber's own zone so the masthead date matches when
-    // they actually receive it. An unparseable name can't reach here (the DB rejects it on
-    // signup/update), but fall back to UTC rather than panic if one ever does.
-    let tz: Tz = timezone.parse().unwrap_or(Tz::UTC);
+    let tz = subscriber_tz(timezone);
     let plain = render_plain(window_end, tz, greeting, items);
     let html = render_html(window_end, tz, greeting, items, content);
-
-    Message::builder()
-        .from(
-            from.parse()
-                .with_context(|| format!("invalid from address: {from}"))?,
-        )
-        .to(to
-            .parse()
-            .with_context(|| format!("invalid to address: {to}"))?)
-        .subject(subject)
-        .multipart(MultiPart::alternative_plain_html(plain, html))
-        .context("building digest email")
+    // The greeting doubles as the subject line, so the inbox preview opens in the same warm,
+    // time-of-day voice as the digest's lead (and varies per window the same way).
+    build_message(from, to, greeting, plain, html, "digest email")
 }
 
 /// Renders the "nothing to report" digest: the same editorial card, but a cheerful *you're all
@@ -128,16 +112,33 @@ pub(crate) fn render_empty(
     salutation: &str,
     content: &DigestContent<'_>,
 ) -> Result<Message> {
+    let tz = subscriber_tz(timezone);
+    let plain = render_empty_plain(window_end, tz, salutation);
+    let html = render_empty_html(window_end, tz, salutation, content);
     // Mirror the populated digest: the subject is the email's own opening line, so the inbox
     // preview reads in the same time-of-day voice as the body.
     let subject = format!("{salutation}. You're all caught up");
+    build_message(from, to, &subject, plain, html, "empty digest email")
+}
 
-    // Show the window date in the subscriber's own zone, like the item digest does. An
-    // unparseable name can't reach here (the DB rejects it on signup/update); fall back to UTC.
-    let tz: Tz = timezone.parse().unwrap_or(Tz::UTC);
-    let plain = render_empty_plain(window_end, tz, salutation);
-    let html = render_empty_html(window_end, tz, salutation, content);
+/// Resolves the subscriber's IANA zone, so the masthead date matches when they actually receive the
+/// digest. An unparseable name can't reach here (the DB rejects it on signup/update), but fall back
+/// to UTC rather than panic if one ever does.
+fn subscriber_tz(timezone: &str) -> Tz {
+    timezone.parse().unwrap_or(Tz::UTC)
+}
 
+/// Assembles the `multipart/alternative` message from a rendered plain+HTML pair. Shared by the
+/// populated and empty digests, which differ only in their bodies and subject line. `what` names the
+/// email for the error context.
+fn build_message(
+    from: &str,
+    to: &str,
+    subject: &str,
+    plain: String,
+    html: String,
+    what: &str,
+) -> Result<Message> {
     Message::builder()
         .from(
             from.parse()
@@ -148,7 +149,7 @@ pub(crate) fn render_empty(
             .with_context(|| format!("invalid to address: {to}"))?)
         .subject(subject)
         .multipart(MultiPart::alternative_plain_html(plain, html))
-        .context("building empty digest email")
+        .with_context(|| format!("building {what}"))
 }
 
 /// Plaintext fallback: a numbered list of items (title, link, source, time). Kept deliberately
@@ -266,13 +267,13 @@ fn render_html(
 ) -> String {
     let count = items.len();
     let plural = if count == 1 { "" } else { "s" };
-    let date = window_end.with_timezone(&tz).format("%A, %B %-d, %Y");
+    let date = window_end
+        .with_timezone(&tz)
+        .format("%A, %B %-d, %Y")
+        .to_string();
     let preheader = format!("{count} new item{plural} in your digest");
-    let brand = escape(content.brand);
-    let title = escape(content.title);
     let greeting = escape(greeting);
     let summary = escape(content.summary);
-    let footer = escape(content.footer);
 
     // Per-item placeholders are identical across items today, so escape them once and reuse.
     let category = escape(content.item_category);
@@ -294,49 +295,15 @@ fn render_html(
         });
     }
 
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="light">
-<meta name="supported-color-schemes" content="light">
-<title>Bulletin digest</title>
-{MOBILE_CSS}
-</head>
-<body style="margin:0;padding:0;background-color:{BG};-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%;">
-<div style="display:none;max-height:0;overflow:hidden;opacity:0;mso-hide:all;">{preheader}</div>
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:{BG};">
-<tr>
-<td align="center" style="padding:36px 12px;">
-<table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="width:600px;max-width:100%;background-color:{SURFACE};border:1px solid {BORDER};border-radius:4px;">
-<tr>
-<td class="bx" style="padding:52px 40px 0 40px;">
-<div style="font-family:{SANS};font-size:12px;font-weight:600;letter-spacing:0.12em;text-transform:uppercase;color:{INK_MUTED};text-align:center;">{brand}</div>
-<h1 style="margin:18px 0 30px 0;font-family:{SERIF};font-size:34px;font-weight:700;line-height:1.25;color:{INK};text-align:center;">{title}</h1>
-{date_rule}
-<div style="font-family:{SERIF};font-size:15px;font-style:italic;font-weight:700;color:{ACCENT};margin:34px 0 12px 0;">The big picture</div>
+    let masthead = format!(
+        r#"{head}<div style="font-family:{SERIF};font-size:15px;font-style:italic;font-weight:700;color:{ACCENT};margin:34px 0 12px 0;">The big picture</div>
 <!-- Lead: a time-of-day greeting (real) opens the paragraph, then the "big picture" summary. -->
 <div class="lead" style="font-family:{SERIF};font-size:17px;line-height:1.75;color:{INK_BODY};margin:0;"><strong style="color:{INK};font-weight:700;">{greeting}</strong> <!-- PLACEHOLDER: "big picture" summary — remove or replace once the digest produces a real one -->{summary}<!-- /PLACEHOLDER --></div>
 <div style="font-family:{SERIF};font-size:15px;font-style:italic;font-weight:700;color:{ACCENT};margin:40px 0 0 0;">In this digest &middot; {count} item{plural}</div>
-</td>
-</tr>
-{rows}{soft_divider}<tr>
-<td class="bx" style="padding:30px 40px 52px 40px;">
-<div class="meta" style="font-family:{SANS};font-size:13px;line-height:1.7;color:{INK_MUTED};text-align:center;">{footer}</div>
-</td>
-</tr>
-</table>
-</td>
-</tr>
-</table>
-</body>
-</html>
 "#,
-        date_rule = date_rule(&date.to_string()),
-        soft_divider = divider,
-    )
+        head = masthead_head(content, &date),
+    );
+    document(&preheader, &masthead, &format!("{rows}{divider}"), content)
 }
 
 /// HTML view of the empty digest: the same warm card, brand label, serif masthead and `── date ──`
@@ -350,13 +317,35 @@ fn render_empty_html(
     salutation: &str,
     content: &DigestContent<'_>,
 ) -> String {
-    let date = window_end.with_timezone(&tz).format("%A, %B %-d, %Y");
-    let preheader = "Nothing new — you're all caught up";
-    let brand = escape(content.brand);
-    let title = escape(content.title);
+    let date = window_end
+        .with_timezone(&tz)
+        .format("%A, %B %-d, %Y")
+        .to_string();
     let salutation = escape(salutation);
-    let footer = escape(content.footer);
 
+    let masthead = format!(
+        r#"{head}<div style="text-align:center;padding:46px 8px 18px 8px;">
+<div style="font-size:52px;line-height:1;" aria-hidden="true">&#x1F343;</div>
+<div style="margin:24px 0 0 0;font-family:{SERIF};font-size:28px;font-weight:700;line-height:1.3;color:{ACCENT};">You're all caught up</div>
+<div style="margin:14px auto 0 auto;max-width:360px;font-family:{SERIF};font-size:17px;font-style:italic;line-height:1.7;color:{INK_BODY};">{salutation}. No new notifications this time. Sit back and enjoy the calm.</div>
+</div>
+"#,
+        head = masthead_head(content, &date),
+    );
+    document(
+        "Nothing new — you're all caught up",
+        &masthead,
+        &soft_divider(),
+        content,
+    )
+}
+
+/// The shared HTML shell: doctype, `<head>` (+ the mobile stylesheet), the warm centered card, and
+/// the footer. Both digests fill only `masthead` (the inner content of the top card cell — brand,
+/// title, date rule, and their own lead) and `body` (what follows the masthead row: the item rows
+/// for a populated digest, just a divider for an empty one). `preheader` is the hidden inbox preview.
+fn document(preheader: &str, masthead: &str, body: &str, content: &DigestContent<'_>) -> String {
+    let footer = escape(content.footer);
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -376,17 +365,9 @@ fn render_empty_html(
 <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="width:600px;max-width:100%;background-color:{SURFACE};border:1px solid {BORDER};border-radius:4px;">
 <tr>
 <td class="bx" style="padding:52px 40px 0 40px;">
-<div style="font-family:{SANS};font-size:12px;font-weight:600;letter-spacing:0.12em;text-transform:uppercase;color:{INK_MUTED};text-align:center;">{brand}</div>
-<h1 style="margin:18px 0 30px 0;font-family:{SERIF};font-size:34px;font-weight:700;line-height:1.25;color:{INK};text-align:center;">{title}</h1>
-{date_rule}
-<div style="text-align:center;padding:46px 8px 18px 8px;">
-<div style="font-size:52px;line-height:1;" aria-hidden="true">&#x1F343;</div>
-<div style="margin:24px 0 0 0;font-family:{SERIF};font-size:28px;font-weight:700;line-height:1.3;color:{ACCENT};">You're all caught up</div>
-<div style="margin:14px auto 0 auto;max-width:360px;font-family:{SERIF};font-size:17px;font-style:italic;line-height:1.7;color:{INK_BODY};">{salutation}. No new notifications this time. Sit back and enjoy the calm.</div>
-</div>
-</td>
+{masthead}</td>
 </tr>
-{soft_divider}<tr>
+{body}<tr>
 <td class="bx" style="padding:30px 40px 52px 40px;">
 <div class="meta" style="font-family:{SANS};font-size:13px;line-height:1.7;color:{INK_MUTED};text-align:center;">{footer}</div>
 </td>
@@ -397,9 +378,22 @@ fn render_empty_html(
 </table>
 </body>
 </html>
+"#
+    )
+}
+
+/// The top of the masthead shared by both digests: the small-caps brand label, the serif title, and
+/// the `── date ──` rule. The populated and empty views append their own lead beneath it. Ends with
+/// a trailing newline so the caller's lead slots straight on.
+fn masthead_head(content: &DigestContent<'_>, date: &str) -> String {
+    let brand = escape(content.brand);
+    let title = escape(content.title);
+    format!(
+        r#"<div style="font-family:{SANS};font-size:12px;font-weight:600;letter-spacing:0.12em;text-transform:uppercase;color:{INK_MUTED};text-align:center;">{brand}</div>
+<h1 style="margin:18px 0 30px 0;font-family:{SERIF};font-size:34px;font-weight:700;line-height:1.25;color:{INK};text-align:center;">{title}</h1>
+{date_rule}
 "#,
-        date_rule = date_rule(&date.to_string()),
-        soft_divider = soft_divider(),
+        date_rule = date_rule(date),
     )
 }
 
@@ -461,10 +455,35 @@ fn render_story_row(
         ),
     };
 
-    let source = escape(item.source.as_str());
-    // Debug fields: the recency key selection ranked on (full date), the 1-based position, the raw
-    // link, and the count of fused sub-items — the machine trace behind the human reason caption.
+    let connections = render_connections(&item.connections);
+    let thread_chip = render_thread_chip(item.thread.as_ref());
+    let reason = escape(&reason_line(&item.reason));
+    let debug = debug_trace_block(position, item, tz);
+
+    format!(
+        r#"<tr>
+<td class="bx" style="padding:30px 40px;">
+{thread_chip}{headline}
+<!-- PLACEHOLDER: per-item category — remove or replace once items carry a category -->
+<div class="meta" style="margin-top:9px;font-family:{SANS};font-size:13px;font-weight:500;letter-spacing:0.04em;color:{ACCENT};">{category}</div>
+<!-- /PLACEHOLDER -->
+<!-- PLACEHOLDER: per-item summary — remove or replace once items carry a summary -->
+<div class="meta" style="margin-top:12px;font-family:{SERIF};font-size:16px;font-style:italic;line-height:1.65;color:{INK_MUTED};">{item_summary}</div>
+<!-- /PLACEHOLDER -->
+{connections}<div class="meta" style="margin-top:16px;font-family:{SANS};font-size:12px;line-height:1.6;color:{INK_MUTED};"><span style="font-weight:600;color:{ACCENT};">Why</span> &middot; {reason}</div>
+{debug}</td>
+</tr>
+"#
+    )
+}
+
+/// The debug-only selection trace beneath a story card: a monospace, dashed-amber callout carrying
+/// the machine trace (1-based rank, ranking basis, recency key, source, fused-item count, thread
+/// assignment, entity spine, raw link — design §10.2). Styled to read as scaffolding, and isolated
+/// in one function so it's a single block to strip before launch.
+fn debug_trace_block(position: usize, item: &RenderItem, tz: Tz) -> String {
     let rank = position + 1;
+    let source = escape(item.source.as_str());
     let recency_key = item
         .last_event_time
         .with_timezone(&tz)
@@ -475,12 +494,8 @@ fn render_story_row(
         .map(escape)
         .unwrap_or_else(|| "—".into());
     let related = item.connections.len();
-    let connections = render_connections(&item.connections);
-    let thread_chip = render_thread_chip(item.thread.as_ref());
-    let reason = escape(&reason_line(&item.reason));
-
-    // Decision-log fields (§10.2): priority is the ranking key (relevance + severity, recency-decayed);
-    // the entity spine is what relevance scored on; the thread line records the assignment + its band.
+    // priority is the ranking key (relevance + severity, recency-decayed); the entity spine is what
+    // relevance scored on; the thread line records the assignment + its identity band.
     let basis = format!(
         "priority {:.3}, richness {}",
         item.reason.priority, item.reason.richness
@@ -503,17 +518,7 @@ fn render_story_row(
     };
 
     format!(
-        r#"<tr>
-<td class="bx" style="padding:30px 40px;">
-{thread_chip}{headline}
-<!-- PLACEHOLDER: per-item category — remove or replace once items carry a category -->
-<div class="meta" style="margin-top:9px;font-family:{SANS};font-size:13px;font-weight:500;letter-spacing:0.04em;color:{ACCENT};">{category}</div>
-<!-- /PLACEHOLDER -->
-<!-- PLACEHOLDER: per-item summary — remove or replace once items carry a summary -->
-<div class="meta" style="margin-top:12px;font-family:{SERIF};font-size:16px;font-style:italic;line-height:1.65;color:{INK_MUTED};">{item_summary}</div>
-<!-- /PLACEHOLDER -->
-{connections}<div class="meta" style="margin-top:16px;font-family:{SANS};font-size:12px;line-height:1.6;color:{INK_MUTED};"><span style="font-weight:600;color:{ACCENT};">Why</span> &middot; {reason}</div>
-<!-- DEBUG: selection trace — debugging info, remove before launch -->
+        r#"<!-- DEBUG: selection trace — debugging info, remove before launch -->
 <div style="margin-top:12px;padding:9px 12px;background-color:{DEBUG_BG};border:1px dashed {DEBUG_BORDER};border-radius:3px;font-family:{MONO};font-size:12px;line-height:1.6;color:{DEBUG_INK};">
 <span style="display:inline-block;padding:1px 6px;margin-right:8px;background-color:{DEBUG_BORDER};color:{DEBUG_BG};font-weight:700;text-transform:uppercase;letter-spacing:0.1em;border-radius:2px;">debug</span>
 <span style="font-weight:700;">selected #{rank}</span> <span>by {basis}</span>
@@ -521,8 +526,6 @@ fn render_story_row(
 {thread_trace}{spine}<div style="margin-top:4px;word-break:break-all;">link {link}</div>
 </div>
 <!-- /DEBUG -->
-</td>
-</tr>
 "#
     )
 }

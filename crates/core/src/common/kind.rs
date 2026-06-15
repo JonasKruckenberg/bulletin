@@ -1,21 +1,44 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
-pub enum SourceKind {
-    Rss,
-    Github,
-    Slack,
+/// Declares a text-backed enum and its `as_str`/`TryFrom<&str>` from one variant → literal table, so
+/// the two string mappings can't drift. Variant order is preserved, so the derived `Ord` follows
+/// declaration order (load-bearing for `ContentKind`).
+macro_rules! text_enum {
+    (
+        $(#[$meta:meta])*
+        $vis:vis enum $name:ident { $( $variant:ident => $lit:literal ),+ $(,)? }
+        err = $err:literal
+    ) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+        $vis enum $name {
+            $( $variant ),+
+        }
+
+        impl $name {
+            pub fn as_str(self) -> &'static str {
+                match self { $( $name::$variant => $lit ),+ }
+            }
+        }
+
+        impl TryFrom<&str> for $name {
+            type Error = &'static str;
+            fn try_from(s: &str) -> Result<Self, Self::Error> {
+                match s {
+                    $( $lit => Ok($name::$variant), )+
+                    _ => Err($err),
+                }
+            }
+        }
+    };
+}
+
+text_enum! {
+    pub enum SourceKind { Rss => "rss", Github => "github", Slack => "slack" }
+    err = "unknown source kind"
 }
 
 impl SourceKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            SourceKind::Rss => "rss",
-            SourceKind::Github => "github",
-            SourceKind::Slack => "slack",
-        }
-    }
-
     /// Whether this source can emit *private* (scope-restricted) events, and therefore requires an
     /// owning subscriber on its connection — without one, `finalize` would have no scope to bind a
     /// private item to. RSS is public-only (a feed URL is global); GitHub sees private repos. Keep in
@@ -30,53 +53,15 @@ impl SourceKind {
     }
 }
 
-impl TryFrom<&str> for SourceKind {
-    type Error = &'static str;
-
-    fn try_from(s: &str) -> Result<Self, Self::Error> {
-        match s {
-            "rss" => Ok(SourceKind::Rss),
-            "github" => Ok(SourceKind::Github),
-            "slack" => Ok(SourceKind::Slack),
-            _ => Err("unknown source kind"),
-        }
-    }
-}
-
-/// Adapter-declared depth signal: how much material an event carries. **Ordered**
-/// (`Message < Announcement < Longform`) so a cluster's `content_depth` can be `max()` over its
-/// events and feed the later Story-vs-Note classification (design §5.1/§8.3). The connector sets it
-/// because source semantics live there — a GitHub release is an announcement, an RSS item is
-/// longform, a chat/comment is a message; deriving it downstream from body length would be a
-/// gameable heuristic (§7.1).
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
-pub enum ContentKind {
-    Message,
-    Announcement,
-    Longform,
-}
-
-impl ContentKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ContentKind::Message => "message",
-            ContentKind::Announcement => "announcement",
-            ContentKind::Longform => "longform",
-        }
-    }
-}
-
-impl TryFrom<&str> for ContentKind {
-    type Error = &'static str;
-
-    fn try_from(s: &str) -> Result<Self, Self::Error> {
-        match s {
-            "message" => Ok(ContentKind::Message),
-            "announcement" => Ok(ContentKind::Announcement),
-            "longform" => Ok(ContentKind::Longform),
-            _ => Err("unknown content kind"),
-        }
-    }
+text_enum! {
+    /// Adapter-declared depth signal: how much material an event carries. **Ordered**
+    /// (`Message < Announcement < Longform`) so a cluster's `content_depth` can be `max()` over its
+    /// events and feed the later Story-vs-Note classification (design §5.1/§8.3). The connector sets
+    /// it because source semantics live there — a GitHub release is an announcement, an RSS item is
+    /// longform, a chat/comment is a message; deriving it downstream from body length would be a
+    /// gameable heuristic (§7.1).
+    pub enum ContentKind { Message => "message", Announcement => "announcement", Longform => "longform" }
+    err = "unknown content kind"
 }
 
 /// `SourceKind`/`ContentKind` round-trip as their `as_str()` text in Postgres, so `.bind(kind)` and
