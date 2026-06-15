@@ -2,6 +2,7 @@
 //! cache, select by recency, freeze the selection, render, and deliver — advancing the subscriber's
 //! schedule on delivery. A pure read of the materialization side's snapshot (design §3.0, §9.4).
 
+pub mod eval;
 mod greeting;
 mod render;
 pub mod select;
@@ -623,4 +624,35 @@ pub async fn provenance(pool: &PgPool, story_id: Uuid) -> Result<Vec<TimelineEnt
         })
     })
     .await
+}
+
+/// Eval harness (design §10.3): score a subscriber's recent selection quality from the persisted
+/// decision logs + their story feedback — read-only, no writes, no send. Reports structure/volume
+/// (useful immediately, for tuning the scorer's config against real digests) and, once a feedback
+/// surface populates the log, precision + nDCG. Per-subscriber by design: feedback and the decision
+/// log's entity spines are the subscriber's own, so both reads run in *their* RLS context (an admin
+/// cross-tenant read would touch private content). The `debug eval` command renders the result.
+pub async fn eval_report(pool: &PgPool, subscriber_id: Uuid, limit: i64) -> Result<eval::Metrics> {
+    load_required(pool, subscriber_id).await?;
+    let (logs, feedback) = with_scope(pool, ScopeCtx::Subscriber(subscriber_id), move |conn| {
+        Box::pin(async move {
+            let logs = store::load_decision_logs(&mut *conn, subscriber_id, limit)
+                .await
+                .context("load decision logs")?;
+            let feedback = store::story_feedback(&mut *conn, subscriber_id)
+                .await
+                .context("load story feedback")?;
+            Ok((logs, feedback))
+        })
+    })
+    .await?;
+
+    // Latest grade per story (the rows arrive newest-first, so the first occurrence wins).
+    let mut grades: HashMap<Uuid, eval::Grade> = HashMap::new();
+    for (story_id, signal) in feedback {
+        if let Some(g) = eval::Grade::from_signal(&signal) {
+            grades.entry(story_id).or_insert(g);
+        }
+    }
+    Ok(eval::evaluate(&logs, &grades))
 }

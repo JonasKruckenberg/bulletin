@@ -78,6 +78,14 @@ pub enum DebugCommand {
     },
     /// Explain a subscriber's selection: every candidate cluster + why it's in or out (dry-run)
     DigestExplain { subscriber: Uuid },
+    /// Eval selection quality from the decision log + feedback (read-only): volume/format balance now,
+    /// precision + nDCG once feedback flows
+    DigestEval {
+        subscriber: Uuid,
+        /// How many recent digests to score
+        #[arg(long, default_value = "50")]
+        limit: i64,
+    },
     /// Show the data behind a story: its event timeline (source · link · time), oldest-first
     DigestProvenance { story_id: Uuid },
     /// Print a single-glance snapshot of pipeline state (events, clusters, queue, …)
@@ -250,6 +258,9 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> R
         }
         DebugCommand::DigestExplain { subscriber } => {
             print_explain(&digest::explain(pool, subscriber).await?);
+        }
+        DebugCommand::DigestEval { subscriber, limit } => {
+            print!("{}", digest::eval_report(pool, subscriber, limit).await?);
         }
         DebugCommand::DigestProvenance { story_id } => {
             print_provenance(story_id, &digest::provenance(pool, story_id).await?);

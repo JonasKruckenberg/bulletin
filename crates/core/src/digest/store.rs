@@ -408,6 +408,58 @@ pub async fn load_decisions(
     Ok(serde_json::from_value(json).unwrap_or_default())
 }
 
+/// The decision logs of a subscriber's most recent `limit` digests, newest-first — the eval harness
+/// input (design §10.3). Reads `digest` (RLS-protected) → runs in the subscriber's own scope. A
+/// pre-M4 digest's `'[]'` default decodes to an empty log.
+pub async fn load_decision_logs(
+    conn: &mut PgConnection,
+    subscriber_id: Uuid,
+    limit: i64,
+) -> Result<Vec<Vec<DecisionRecord>>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT decisions FROM digest
+         WHERE subscriber_id = $1
+         ORDER BY window_end DESC
+         LIMIT $2",
+    )
+    .bind(subscriber_id)
+    .bind(limit)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let json: serde_json::Value = row.get("decisions");
+            serde_json::from_value(json).unwrap_or_default()
+        })
+        .collect())
+}
+
+/// This subscriber's story-level feedback signals (`target_type = 'story'`), newest-first — the
+/// grades the eval harness scores selection against. Reads `feedback` (RLS-protected) → the
+/// subscriber's own scope. A non-uuid `target_id` is skipped (defensive; the API binds story ids).
+pub async fn story_feedback(
+    conn: &mut PgConnection,
+    subscriber_id: Uuid,
+) -> Result<Vec<(Uuid, String)>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT target_id, signal FROM feedback
+         WHERE subscriber_id = $1 AND target_type = 'story'
+         ORDER BY created_at DESC",
+    )
+    .bind(subscriber_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            Uuid::parse_str(&row.get::<String, _>("target_id"))
+                .ok()
+                .map(|id| (id, row.get::<String, _>("signal")))
+        })
+        .collect())
+}
+
 /// Marks the digest delivered and advances the subscriber's schedule in one transaction, so the
 /// "delivered ⇒ schedule moved" invariant can't tear across a crash. `delivered_through` becomes
 /// the new `last_run_at` (the lookback's consideration floor); `next_run_at` jumps to the next
