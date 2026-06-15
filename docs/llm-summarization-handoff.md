@@ -17,7 +17,7 @@ per-subscriber/private wiring are the *next phase*; this doc hands them off.
 
 ## 1. What was built (and where)
 
-### 1.1 Schema — `crates/core/migrations/20200101000025_cluster_summary.sql`
+### 1.1 Schema — `crates/core/migrations/20200101000027_cluster_summary.sql`
 
 The cluster tier of `llm-summarization.md` §2.1, exactly as designed:
 
