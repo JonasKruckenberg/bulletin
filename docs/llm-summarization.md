@@ -94,6 +94,7 @@ CREATE INDEX cluster_needs_summary ON cluster (last_event_time)
     "entities":   ["repo:acme/auth", "cve:CVE-2026-1234", "user:dlewis"],
     "event_type": "incident",
     "state":      "resolved",         // detected → resolved (local-ml-options §6 comprehension)
+    "certainty":  "asserted",         // asserted | tentative — the source's stance; drives the hedge rule (§3.6)
     "numbers":    ["12%", "40m"],
     "dates":      ["2026-06-14T14:02Z"]
   },
@@ -268,60 +269,86 @@ handles the **two uncertainties oppositely**:
   call, rendered as the badge band / "possibly" (§6.2, §10.4). The prompt forbids the model from
   hedging about *who/what* an entity is — it just references the token; the interface shows the doubt.
 - **Factual / state uncertainty is inherited from the source.** Whether the cause is confirmed or the
-  incident resolved lives in the extracted `facts` (`state: detected | investigating | resolved`) and
-  the source's own words. The prompt makes the model **mirror that stance** — state settled facts
-  plainly, keep the source's hedges ("suspected", "appears to", "proposed", "investigating"), and never
-  upgrade a guess to a fact or add cause/blame/outcome the source doesn't state.
+  incident resolved is decided once, in extraction, and handed to the summarizer as a structured
+  **`certainty: asserted | tentative`** flag (+ `state`) on each fact — *not* something the small model
+  must infer (see "Built for a 3–4B model" below). The summarizer just branches on it: asserted ⇒ state
+  it plainly, tentative ⇒ keep the source's hedge ("suspected", "appears to", "investigating"); it never
+  upgrades a guess to a fact or adds cause/blame/outcome the source doesn't state.
 
-A single **system prompt** (constant ⇒ prefix-cached by llama.cpp, so it's near-free per call) carries
-the house style; a short **user prompt** per task carries the structured input. Sketch:
+#### Built for a 3–4B model, not GPT-4
+
+A "stupid cheap" model (Qwen3.5-4B, Granite-3B) won't honor a long, abstract, negation-heavy brief: it
+drops instructions buried in prose, follows *"don't…"* rules poorly, and **cannot reliably infer**
+something as subtle as "the source's epistemic stance." So the prompt is engineered for small models,
+and — on doctrine — **anything that can be enforced mechanically is taken off the model's plate**:
+
+1. **The stance is an input, not a judgment.** The extraction pass (§2.1) already tags each fact with
+   `state` *and* a **`certainty: asserted | tentative`** flag. The model doesn't *detect* hedging — it
+   **looks it up**: tentative ⇒ use a hedge verb, asserted ⇒ state it plainly. A subtle reasoning task
+   becomes a mechanical branch a 3B model can follow.
+2. **Short, positive, imperative.** One screen of *do-this* rules, not paragraphs of nuance. The few
+   negatives that survive are a **concrete token denylist** ("massive", "huge", "!", "you"), which a
+   small model can match, not an abstract "no hype."
+3. **Few-shot carries what rules can't.** Two or three worked input→output pairs are the single biggest
+   reliability lever for small models — they *show* asserted→plain, tentative→hedged, entity-by-id, and
+   no-hype better than any description. They live in the cached prefix, so they're near-free.
+4. **One job per call.** Extraction is already split out (§3.2); the summarizer only *rephrases given
+   facts*. Low cognitive load is what keeps a small model faithful.
+5. **A deterministic lint is the real backstop.** The model *will* occasionally slip a banned word, a
+   second-person, or an over-length line. A cheap post-filter (denylist strip + length clamp) plus the
+   §3.4 faithfulness gate catches it — strip the word, or reject → deterministic fallback. The prompt
+   asks; the harness enforces.
+
+A single **system prompt** (constant ⇒ prefix-cached, near-free per call) carries the house style:
 
 ```text
 SYSTEM (shared, cached)
-You write the lines for one person's work digest — short, grounded summaries of what
-happened in the tools and feeds they follow (GitHub, Slack, CVE advisories, releases, RSS).
+You turn given facts into one short line for a work digest.
+You rephrase the facts. You add nothing.
 
-Voice
-• Calm and plain. Active voice, concrete nouns, exact numbers. A colleague briefing you in
-  one breath — not a press release.
-• Lead with what happened and who it affects. Cut filler ("it's worth noting", "this means").
-• No hype, no magnitude adjectives ("massive", "critical") unless the source uses them, no
-  exclamation, no second person, no calls to action.
+1. Use only the facts and source text given. Every name, number, and date you write
+   must be in the input. Not given → leave it out.
+2. Refer to people, repos, services, and CVEs only by the entity ids listed. Nothing more.
+3. Each fact has "certainty". tentative → use a hedge verb (suspected, appears to,
+   reportedly, proposed). asserted → say it plainly. Never change a fact's certainty.
+4. Plain words. Active voice. Do not use: massive, huge, critical (unless in the
+   source), game-changing, exciting, "!", "you", "we".
+5. Output only the JSON the schema asks for. No preamble.
 
-Honesty about certainty — match the source, never manufacture it
-• State settled facts plainly: if the source confirms a cause or outcome, say it directly.
-• Preserve the source's hedge when it is tentative — "suspected", "appears to", "proposed",
-  an investigating/unresolved state stays unresolved. Never upgrade a guess to a fact.
-• Add no cause, blame, or consequence the source does not state. If it isn't in the facts, omit it.
-• Do not comment on whether a name or identity is correct — just refer to the entity you are
-  given, by its id. The interface shows certainty about identity; that is not your job.
+EXAMPLES
+facts: {event: deploy broke logins, state: resolved, certainty: asserted,
+        repo: acme/auth, numbers: [12%, 40m], cause: bad config}
+out: {"headline":"Auth logins broke after the token-rotation deploy",
+      "tldr":[{"text":"A bad config in the rollout broke token validation in "},
+              {"ref":"repo:acme/auth","surface":"acme/auth"},
+              {"text":"; ~12% of logins failed for 40m until a rollback."}]}
 
-Grounding
-• Use only the facts and source text provided. Every entity, number, and date you write must
-  appear in the input. Drop anything unsupported; never invent.
-• Refer to people, repos, services, and CVEs only through the entity references provided.
-
-Output
-• Return only the JSON the schema asks for. No preamble.
+facts: {event: SSRF advisory, state: investigating, certainty: tentative,
+        cve: CVE-2026-2200, severity: high}
+out: {"headline":"Suspected SSRF in the invoice PDF renderer",
+      "tldr":[{"text":"A high-severity advisory, "},
+              {"ref":"cve:CVE-2026-2200","surface":"CVE-2026-2200"},
+              {"text":", appears to affect billing's PDF path; no patch yet."}]}
 ```
 
-Per-task **user** prompts (all over the §4 inputs — pre-distilled, short):
+The examples do the teaching the rules can't: `asserted`→"broke" (plain), `tentative`→"Suspected"/"appears
+to" (hedged, unprompted by any clever inference), entities by id, zero hype.
 
-- **Cluster** — `facts` + the allowed-entity enum + budgeted source text → *"Write `headline` (≤90 chars,
-  the single most important thing) and `tldr` (1–2 sentences: what happened, the impact, the current
-  state). Reference entities by id where natural."*
-- **Story synthesis** — the member cluster summaries + shared entities + thread label (for tone only) →
-  *"These items are the same happening, seen across {sources}. Write one fused headline + tldr that says
-  what the cross-source picture is. Don't re-list each source — that list renders beneath your line."*
-- **Thread delta** — the thread label + the new stories' summaries since `delta_through` → *"Name what
-  newly changed in ≤ ~6 words — a flag, not a sentence ('staging cutover landed', 'reactivated', '3
-  follow-ups assigned'). No trailing punctuation."*
-- **Digest lead** (Phase D) — the selected items' headlines → *"Write a 1–2 sentence opening: what
-  dominated, what else moved. Name the one or two threads that mattered. Don't list every item."*
+Per-task **user** prompts stay equally short and concrete (all over the §4 pre-distilled inputs):
 
-The **extraction** pass that produces `facts` is a separate, *non-editorial* prompt (event-type, state,
-entities, numbers, dates only) run scratchpad-then-constrained (§3.2) — it feeds this voice, it doesn't
-share it.
+- **Cluster** — `facts` + allowed-entity ids + budgeted source text → *"headline ≤90 chars: the one most
+  important thing. tldr 1–2 sentences: what happened, the impact, the current state."*
+- **Story synthesis** — member cluster summaries + shared entity ids → *"These are the same happening,
+  across {sources}. One headline + tldr for the whole thing. Do not list the sources."*
+- **Thread delta** — thread label + the new stories since `delta_through` → *"≤6 words: what newly
+  changed. A flag, not a sentence. No end punctuation."* + examples ("staging cutover landed",
+  "reactivated").
+- **Digest lead** (Phase D) — selected headlines → *"1–2 sentences: what dominated, what else moved.
+  Name 1–2 threads. Do not list every item."*
+
+The **extraction** pass that produces `facts` (incl. the `certainty` flag) is a separate, *non-editorial*
+prompt run scratchpad-then-constrained (§3.2) — it does the epistemic judging once, so every summary
+call downstream is a mechanical rephrase.
 
 ---
 
