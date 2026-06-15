@@ -7,6 +7,7 @@ use crate::digest::select::{
 };
 use crate::identity::ConfidenceBand;
 use crate::link::ClusterRef;
+use crate::summarize::ClusterSummary;
 use chrono::{DateTime, Utc};
 use sqlx::{postgres::PgRow, PgConnection, PgPool, Row};
 use uuid::Uuid;
@@ -145,6 +146,15 @@ pub struct RenderItem {
     /// The decision log behind this item's rank (relevance term + entity spine) — surfaced in the
     /// debug trace. Empty for a pure-recency selection.
     pub reason: ItemReason,
+    /// The editor-grade headline shown above the item (`llm-summarization.md` §6.1 zone 2): the
+    /// representative cluster's `summary.headline`, falling back to the raw cluster `title` when no
+    /// summary has run or the faithfulness gate rejected one. Always non-empty (it degrades to
+    /// `title`), so the renderer never has a blank headline.
+    pub headline: String,
+    /// The one grounded TL;DR sentence beneath the headline (§6.1 zone 3): the representative
+    /// cluster's `summary.tldr_text`. Empty until a summary has run — the renderer then omits the
+    /// summary line entirely (no placeholder), so a pre-summarization digest simply has no TL;DR.
+    pub summary: String,
 }
 
 /// The thread chip on a rendered item: the thread's label and identity confidence band.
@@ -168,6 +178,10 @@ pub(crate) struct ClusterCard {
     link: Option<String>,
     source: SourceKind,
     last_event_time: DateTime<Utc>,
+    /// The cluster's precomputed summary (`cluster.summary` jsonb, `llm-summarization.md` §2.1). The
+    /// inert `'{}'` default deserializes to the empty [`ClusterSummary`] (`is_empty()`), so a cluster
+    /// that was never summarized carries no headline/tldr and the render falls back to `title`.
+    summary: ClusterSummary,
 }
 
 /// Fetch the display card for each cluster id (order unspecified; callers index by id). Reads
@@ -176,22 +190,29 @@ pub(crate) async fn cluster_cards(
     conn: &mut PgConnection,
     ids: &[Uuid],
 ) -> Result<HashMap<Uuid, ClusterCard>, sqlx::Error> {
-    sqlx::query("SELECT id, title, link, source, last_event_time FROM cluster WHERE id = ANY($1)")
-        .bind(ids)
-        .try_map(|row: PgRow| {
-            Ok((
-                row.get::<Uuid, _>("id"),
-                ClusterCard {
-                    title: row.get("title"),
-                    link: row.get("link"),
-                    source: row.try_get("source")?,
-                    last_event_time: row.get("last_event_time"),
-                },
-            ))
-        })
-        .fetch_all(conn)
-        .await
-        .map(|rows| rows.into_iter().collect())
+    sqlx::query(
+        "SELECT id, title, link, source, last_event_time, summary FROM cluster WHERE id = ANY($1)",
+    )
+    .bind(ids)
+    .try_map(|row: PgRow| {
+        // `cluster.summary` is `NOT NULL DEFAULT '{}'`, so the value is always present; the empty
+        // object deserializes to the inert `ClusterSummary::default()`.
+        let summary: ClusterSummary = serde_json::from_value(row.try_get("summary")?)
+            .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+        Ok((
+            row.get::<Uuid, _>("id"),
+            ClusterCard {
+                title: row.get("title"),
+                link: row.get("link"),
+                source: row.try_get("source")?,
+                last_event_time: row.get("last_event_time"),
+                summary,
+            },
+        ))
+    })
+    .fetch_all(conn)
+    .await
+    .map(|rows| rows.into_iter().collect())
 }
 
 /// Assemble a story's `RenderItem` from its member refs and the cluster cards: the representative is
@@ -224,6 +245,16 @@ pub(crate) fn build_render_item(
         })
         .collect();
 
+    // Prefer the representative's abstractive `summary.headline`; degrade to the raw cluster `title`
+    // when no summary has run or the gate rejected one (`llm-summarization.md` §6.1). The `tldr_text`
+    // rides through as-is — empty until a summary lands, which the renderer treats as "no TL;DR".
+    let headline = if rep.summary.headline.trim().is_empty() {
+        rep.title.clone()
+    } else {
+        rep.summary.headline.clone()
+    };
+    let summary = rep.summary.tldr_text.clone();
+
     Some(RenderItem {
         title: rep.title.clone(),
         link: rep.link.clone(),
@@ -232,6 +263,8 @@ pub(crate) fn build_render_item(
         connections,
         thread: None,
         reason: ItemReason::default(),
+        headline,
+        summary,
     })
 }
 

@@ -27,6 +27,38 @@ fn reason_line(reason: &ItemReason) -> String {
     format!("{format} · {richness} · relevance {:.2}", reason.relevance)
 }
 
+/// The deterministic big-picture lead (`llm-summarization.md` §2.4/§3.1): one sentence composed at
+/// fire time from the selected items' headlines — **no model call on the punctual path**. Leads with
+/// the top-ranked item's headline (what dominated) and notes how much else moved. Falls back to the
+/// raw cluster `title` per item (carried on [`RenderItem::headline`]), so it reads sensibly with the
+/// summarization feature off too. Empty for an empty item list (the caller renders the empty digest).
+fn compose_lead(items: &[RenderItem]) -> String {
+    let headlines: Vec<&str> = items
+        .iter()
+        .map(|item| item.headline.trim())
+        .filter(|h| !h.is_empty())
+        .collect();
+    match headlines.as_slice() {
+        [] => String::new(),
+        [one] => format!("Leading this digest: {}.", trim_sentence_end(one)),
+        [first, rest @ ..] => {
+            let n = rest.len();
+            let unit = if n == 1 { "update" } else { "updates" };
+            format!(
+                "Leading this digest: {}, with {n} more {unit} below.",
+                trim_sentence_end(first)
+            )
+        }
+    }
+}
+
+/// Strip a single trailing sentence terminator from a headline so the composed lead's own punctuation
+/// doesn't double it ("…deploy." → "…deploy"). Headlines are abstractive and usually unterminated, but
+/// the deterministic baseline reuses the raw cluster `title`, which may end in one.
+fn trim_sentence_end(s: &str) -> &str {
+    s.trim_end_matches(['.', '!', '?']).trim_end()
+}
+
 /// The delivery seam: something that can send a rendered digest, and knows the From address to
 /// render it as. The binary implements this over its file/SMTP transports.
 pub trait Mailer {
@@ -39,9 +71,9 @@ pub trait Mailer {
 /// The configurable, non-item content of a digest email — everything that isn't the item list or
 /// the per-digest greeting. Lets the caller supply the brand, masthead title, and footer (e.g. from
 /// config) instead of baking them into the renderer, so the same layout can be re-skinned without
-/// touching this module. The `summary` / `item_*` fields are stand-ins for reference-design
-/// sections the data model doesn't feed yet; their defaults are lorem-ipsum and they're HTML-marked
-/// for removal.
+/// touching this module. The big-picture lead and per-item summaries are now fed by the data model
+/// (composed deterministically from the items' summaries, `llm-summarization.md` §2.4/§6.1); the only
+/// remaining stand-in is the per-item `item_category`, HTML-marked for removal.
 #[derive(Clone, Copy)]
 pub struct DigestContent<'a> {
     /// Small-caps brand label at the very top (e.g. "Bulletin").
@@ -50,13 +82,8 @@ pub struct DigestContent<'a> {
     pub title: &'a str,
     /// Footer note rendered beneath the items.
     pub footer: &'a str,
-    /// The "big picture" summary that follows the greeting in the lead. **Placeholder** until the
-    /// digest produces one.
-    pub summary: &'a str,
     /// Per-item category label (e.g. "Geopolitics/Diplomacy"). **Placeholder** until items carry one.
     pub item_category: &'a str,
-    /// Per-item summary/TL;DR. **Placeholder** until items carry one.
-    pub item_summary: &'a str,
 }
 
 impl Default for DigestContent<'_> {
@@ -66,14 +93,9 @@ impl Default for DigestContent<'_> {
             title: "Your Digest",
             footer: "You're receiving this digest from Bulletin, \
                      gathered from the sources you subscribed to.",
-            // Lorem-ipsum stand-ins for sections the reference design has but our data model
+            // The last lorem-ipsum stand-in: a section the reference design has but our data model
             // doesn't feed yet. Wrapped in `<!-- PLACEHOLDER … -->` markers in the rendered HTML.
-            summary: "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod \
-                      tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, \
-                      quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo.",
             item_category: "Lorem / Ipsum",
-            item_summary: "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do \
-                           eiusmod tempor incididunt ut labore et dolore magna aliqua.",
         }
     }
 }
@@ -152,20 +174,26 @@ fn build_message(
         .with_context(|| format!("building {what}"))
 }
 
-/// Plaintext fallback: a numbered list of items (title, link, source, time). Kept deliberately
-/// plain — this is what HTML-averse clients and screen-reader-friendly setups fall back to.
+/// Plaintext fallback: a numbered list of items (headline, grounded tldr, link, source, time). Kept
+/// deliberately plain — this is what HTML-averse clients and screen-reader-friendly setups fall back
+/// to. Opens with the same deterministic big-picture lead the HTML view carries (§2.4).
 fn render_plain(window_end: DateTime<Utc>, tz: Tz, greeting: &str, items: &[RenderItem]) -> String {
     let mut body = format!(
-        "{greeting}\n\nYour digest for the window ending {}\n\n",
-        window_end.with_timezone(&tz).format("%Y-%m-%d %H:%M %Z")
+        "{greeting} {lead}\n\nYour digest for the window ending {}\n\n",
+        window_end.with_timezone(&tz).format("%Y-%m-%d %H:%M %Z"),
+        lead = compose_lead(items),
     );
     for (i, item) in items.iter().enumerate() {
         body.push_str(&format!(
             "{}. [{}] {}\n",
             i + 1,
             item.reason.format.as_str().to_uppercase(),
-            item.title
+            item.headline
         ));
+        // The grounded one-sentence tldr (§6.1 zone 3), when a summary has run; omitted otherwise.
+        if !item.summary.trim().is_empty() {
+            body.push_str(&format!("   {}\n", item.summary));
+        }
         if let Some(link) = &item.link {
             body.push_str(&format!("   {link}\n"));
         }
@@ -249,11 +277,13 @@ const MOBILE_CSS: &str = r#"<style>
 /// ruled list (a terracotta number, the headline link, a category, a summary, and a source · time
 /// caption), closed by a rule and footer.
 ///
-/// The greeting stands in for the reference design's "big picture" summary until the digest
-/// produces a real one. Per-item sections the data model doesn't feed yet (category/summary) render
-/// parametric lorem-ipsum placeholders wrapped in `<!-- PLACEHOLDER … -->`; the source · time
-/// caption is debug-only, wrapped in `<!-- DEBUG … -->` and styled as a distinct monospace amber
-/// callout so it never reads as real content — both are easy to grep out later.
+/// The lead opens with the time-of-day greeting, then the deterministic big-picture summary composed
+/// from the selected items' headlines (§2.4). Per item, the headline is the representative cluster's
+/// `summary.headline` (falling back to the raw `title`) and the summary line is its grounded `tldr`
+/// (omitted when no summary has run). The remaining placeholder — the per-item category — renders
+/// parametric lorem wrapped in `<!-- PLACEHOLDER … -->`; the source · time caption is debug-only,
+/// wrapped in `<!-- DEBUG … -->` and styled as a distinct monospace amber callout so it never reads
+/// as real content — both are easy to grep out later.
 ///
 /// Table-based, all-inline-CSS, single column — the "bulletproof" shape that survives the
 /// patchwork of email clients. The chrome comes from `content`; every piece of caller- or
@@ -273,11 +303,12 @@ fn render_html(
         .to_string();
     let preheader = format!("{count} new item{plural} in your digest");
     let greeting = escape(greeting);
-    let summary = escape(content.summary);
+    // The big-picture lead is composed deterministically from the selected items' headlines (§2.4) —
+    // no model call, no lorem; null/empty only when there are no items (the empty digest path).
+    let summary = escape(&compose_lead(items));
 
-    // Per-item placeholders are identical across items today, so escape them once and reuse.
+    // The category placeholder is identical across items today, so escape it once and reuse.
     let category = escape(content.item_category);
-    let item_summary = escape(content.item_summary);
 
     // One divider, reused between every item and above the footer.
     let divider = soft_divider();
@@ -290,15 +321,15 @@ fn render_html(
         // Note as a compact one-liner (design §8.4/§9.5). The format is purely a richness-driven
         // rendering difference.
         rows.push_str(&match item.reason.format {
-            Format::Story => render_story_row(i, item, tz, &category, &item_summary),
+            Format::Story => render_story_row(i, item, tz, &category),
             Format::Note => render_note_row(item, tz),
         });
     }
 
     let masthead = format!(
         r#"{head}<div style="font-family:{SERIF};font-size:15px;font-style:italic;font-weight:700;color:{ACCENT};margin:34px 0 12px 0;">The big picture</div>
-<!-- Lead: a time-of-day greeting (real) opens the paragraph, then the "big picture" summary. -->
-<div class="lead" style="font-family:{SERIF};font-size:17px;line-height:1.75;color:{INK_BODY};margin:0;"><strong style="color:{INK};font-weight:700;">{greeting}</strong> <!-- PLACEHOLDER: "big picture" summary — remove or replace once the digest produces a real one -->{summary}<!-- /PLACEHOLDER --></div>
+<!-- Lead: a time-of-day greeting (real) opens the paragraph, then the deterministic big-picture summary composed from the selected items' headlines (§2.4). -->
+<div class="lead" style="font-family:{SERIF};font-size:17px;line-height:1.75;color:{INK_BODY};margin:0;"><strong style="color:{INK};font-weight:700;">{greeting}</strong> {summary}</div>
 <div style="font-family:{SERIF};font-size:15px;font-style:italic;font-weight:700;color:{ACCENT};margin:40px 0 0 0;">In this digest &middot; {count} item{plural}</div>
 "#,
         head = masthead_head(content, &date),
@@ -430,29 +461,36 @@ fn date_rule(date: &str) -> String {
 }
 
 /// A **Story** row (design §8.4 richness → format): the rich editorial card — an optional thread
-/// chip, the headline (a link when the cluster has one), a placeholder category and summary, the
-/// fused cross-source connections, a human-readable reason caption, then the debug block. `category`
-/// and `item_summary` are pre-escaped placeholders; the reason caption is the "why" (design §10.2);
-/// the debug block is debug-only — a monospace, dashed-amber callout (a `debug` tag so it reads as
-/// scaffolding) carrying the machine trace: priority position, ranking basis, recency key, source,
-/// fused-item count, thread assignment, entity spine, and raw link. `position` is the 0-based render
-/// slot (global priority order). Items are separated by [`soft_divider`], not a per-item rule.
-fn render_story_row(
-    position: usize,
-    item: &RenderItem,
-    tz: Tz,
-    category: &str,
-    item_summary: &str,
-) -> String {
-    let title = escape(&item.title);
+/// chip, the editor-grade `headline` (a link when the cluster has one), a placeholder category, the
+/// grounded one-sentence summary (§6.1 zone 3 — the representative cluster's `tldr`, omitted when no
+/// summary has run), the fused cross-source connections, a human-readable reason caption, then the
+/// debug block. `category` is the last pre-escaped placeholder; the reason caption is the "why"
+/// (design §10.2); the debug block is debug-only — a monospace, dashed-amber callout (a `debug` tag
+/// so it reads as scaffolding) carrying the machine trace: priority position, ranking basis, recency
+/// key, source, fused-item count, thread assignment, entity spine, and raw link. `position` is the
+/// 0-based render slot (global priority order). Items are separated by [`soft_divider`], not a rule.
+fn render_story_row(position: usize, item: &RenderItem, tz: Tz, category: &str) -> String {
+    let headline_text = escape(&item.headline);
     let headline = match &item.link {
         Some(link) => format!(
-            r#"<a class="headline" href="{}" style="font-family:{SERIF};font-size:21px;font-weight:700;line-height:1.3;color:{INK};text-decoration:none;">{title}</a>"#,
+            r#"<a class="headline" href="{}" style="font-family:{SERIF};font-size:21px;font-weight:700;line-height:1.3;color:{INK};text-decoration:none;">{headline_text}</a>"#,
             escape(link)
         ),
         None => format!(
-            r#"<span class="headline" style="font-family:{SERIF};font-size:21px;font-weight:700;line-height:1.3;color:{INK};">{title}</span>"#
+            r#"<span class="headline" style="font-family:{SERIF};font-size:21px;font-weight:700;line-height:1.3;color:{INK};">{headline_text}</span>"#
         ),
+    };
+
+    // The grounded TL;DR sentence (§6.1): real content set in upright body serif (a confident
+    // statement, not a muted italic aside). Omitted entirely until a summary has run — no placeholder.
+    let summary = if item.summary.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<div class="meta" style="margin-top:12px;font-family:{SERIF};font-size:16px;line-height:1.65;color:{INK_BODY};">{}</div>
+"#,
+            escape(&item.summary)
+        )
     };
 
     let connections = render_connections(&item.connections);
@@ -467,10 +505,7 @@ fn render_story_row(
 <!-- PLACEHOLDER: per-item category — remove or replace once items carry a category -->
 <div class="meta" style="margin-top:9px;font-family:{SANS};font-size:13px;font-weight:500;letter-spacing:0.04em;color:{ACCENT};">{category}</div>
 <!-- /PLACEHOLDER -->
-<!-- PLACEHOLDER: per-item summary — remove or replace once items carry a summary -->
-<div class="meta" style="margin-top:12px;font-family:{SERIF};font-size:16px;font-style:italic;line-height:1.65;color:{INK_MUTED};">{item_summary}</div>
-<!-- /PLACEHOLDER -->
-{connections}<div class="meta" style="margin-top:16px;font-family:{SANS};font-size:12px;line-height:1.6;color:{INK_MUTED};"><span style="font-weight:600;color:{ACCENT};">Why</span> &middot; {reason}</div>
+{summary}{connections}<div class="meta" style="margin-top:16px;font-family:{SANS};font-size:12px;line-height:1.6;color:{INK_MUTED};"><span style="font-weight:600;color:{ACCENT};">Why</span> &middot; {reason}</div>
 {debug}</td>
 </tr>
 "#
@@ -536,14 +571,14 @@ fn debug_trace_block(position: usize, item: &RenderItem, tz: Tz) -> String {
 /// a Note is deliberately terse. Format is purely a richness-driven rendering difference — a Note can
 /// still out-rank a Story (it's interleaved in global priority order).
 fn render_note_row(item: &RenderItem, tz: Tz) -> String {
-    let title = escape(&item.title);
+    let headline_text = escape(&item.headline);
     let headline = match &item.link {
         Some(link) => format!(
-            r#"<a href="{}" style="font-family:{SERIF};font-size:17px;font-weight:700;line-height:1.4;color:{INK};text-decoration:none;">{title}</a>"#,
+            r#"<a href="{}" style="font-family:{SERIF};font-size:17px;font-weight:700;line-height:1.4;color:{INK};text-decoration:none;">{headline_text}</a>"#,
             escape(link)
         ),
         None => format!(
-            r#"<span style="font-family:{SERIF};font-size:17px;font-weight:700;line-height:1.4;color:{INK};">{title}</span>"#
+            r#"<span style="font-family:{SERIF};font-size:17px;font-weight:700;line-height:1.4;color:{INK};">{headline_text}</span>"#
         ),
     };
     let source = escape(item.source.as_str());
@@ -662,6 +697,10 @@ mod tests {
             connections: Vec::new(),
             thread: None,
             reason: crate::digest::select::ItemReason::default(),
+            // No summary ran: the headline degrades to the raw title and the tldr is empty (the
+            // renderer then omits the summary line), matching a feature-off / not-yet-summarized item.
+            headline: title.to_string(),
+            summary: String::new(),
         }
     }
 
@@ -718,15 +757,16 @@ mod tests {
 
     #[test]
     fn placeholder_and_debug_sections_are_marked() {
-        let items = vec![item(
-            "Headline",
-            Some("https://example.com"),
-            SourceKind::Rss,
-        )];
+        // A summarized item carries an editor-grade headline + a grounded tldr; render them as real
+        // content (no lorem placeholders), and compose the lead from the headline deterministically.
+        let summarized = RenderItem {
+            headline: "EDITOR_HEADLINE".to_string(),
+            summary: "GROUNDED_TLDR_SENTENCE".to_string(),
+            ..item("RAW_TITLE", Some("https://example.com"), SourceKind::Rss)
+        };
+        let items = vec![summarized];
         let content = DigestContent {
-            summary: "BIG_PICTURE_TEXT",
             item_category: "CAT_TEXT",
-            item_summary: "ITEM_SUMMARY_TEXT",
             ..DigestContent::default()
         };
         let html = render_html(
@@ -737,20 +777,21 @@ mod tests {
             &content,
         );
 
-        // The greeting opens the lead as real (non-placeholder) content, ahead of the summary.
+        // The greeting opens the lead as real content, ahead of the deterministic big-picture summary
+        // — which is composed from the item's headline (no model, no lorem).
         assert!(html.contains("GREETING_TEXT"));
         let greeting_at = html.find("GREETING_TEXT").unwrap();
-        let summary_at = html.find("BIG_PICTURE_TEXT").unwrap();
-        assert!(
-            greeting_at < summary_at,
-            "greeting must precede the summary"
-        );
-        // Parametric placeholder content renders...
-        assert!(html.contains("BIG_PICTURE_TEXT"));
+        let lead_at = html.find("Leading this digest: EDITOR_HEADLINE").unwrap();
+        assert!(greeting_at < lead_at, "greeting must precede the lead");
+        // The editor-grade headline (not the raw title) leads the item, and the grounded tldr renders
+        // as real upright body content — no lorem, no big-picture placeholder.
+        assert!(html.contains("EDITOR_HEADLINE"));
+        assert!(html.contains("GROUNDED_TLDR_SENTENCE"));
+        assert!(!html.contains("RAW_TITLE"));
+        assert!(!html.contains("Lorem ipsum"));
+        // The only remaining placeholder is the per-item category.
         assert!(html.contains("CAT_TEXT"));
-        assert!(html.contains("ITEM_SUMMARY_TEXT"));
-        // ...inside grep-able markers for later removal/replacement (summary + category + item).
-        assert_eq!(html.matches("<!-- PLACEHOLDER:").count(), 3);
+        assert_eq!(html.matches("<!-- PLACEHOLDER:").count(), 1);
         assert!(html.contains("<!-- DEBUG: selection trace"));
         assert!(html.contains("<!-- /DEBUG -->"));
         // The debug block is styled to look unmistakably like scaffolding — a monospace,
@@ -789,14 +830,68 @@ mod tests {
             &[note],
             &DigestContent::default(),
         );
-        // The Note tag + headline + reason are present...
+        // The Note tag + headline (degraded to the raw title) + reason are present...
         assert!(html.contains(">Note</span>"));
         assert!(html.contains("A small ping"));
         assert!(html.contains("Note · announcement"));
-        // ...but a Note row carries no per-item lorem placeholders (only the masthead lead's "big
-        // picture" one remains) and no amber debug block.
-        assert_eq!(html.matches("<!-- PLACEHOLDER:").count(), 1);
+        // ...and with the big-picture lead now composed (no lorem) and a Note carrying no per-item
+        // placeholders, there are no PLACEHOLDER markers at all and no amber debug block.
+        assert_eq!(html.matches("<!-- PLACEHOLDER:").count(), 0);
         assert!(!html.contains("<!-- DEBUG:"));
+    }
+
+    #[test]
+    fn lead_is_composed_from_headlines_deterministically() {
+        // No items → empty lead (the empty-digest path renders its own copy).
+        assert!(compose_lead(&[]).is_empty());
+
+        // One item → leads with its headline; a trailing terminator is trimmed so it isn't doubled.
+        let one = RenderItem {
+            headline: "Auth outage traced to the deploy.".to_string(),
+            ..item("raw", None, SourceKind::Rss)
+        };
+        assert_eq!(
+            compose_lead(&[one]),
+            "Leading this digest: Auth outage traced to the deploy."
+        );
+
+        // Several → leads with the top-ranked headline + a count of the rest (pluralized).
+        let mk = |h: &str| RenderItem {
+            headline: h.to_string(),
+            ..item("raw", None, SourceKind::Rss)
+        };
+        assert_eq!(
+            compose_lead(&[mk("Top story"), mk("Second")]),
+            "Leading this digest: Top story, with 1 more update below."
+        );
+        assert_eq!(
+            compose_lead(&[mk("Top story"), mk("Second"), mk("Third")]),
+            "Leading this digest: Top story, with 2 more updates below."
+        );
+    }
+
+    #[test]
+    fn story_without_a_summary_omits_the_tldr_line() {
+        // A not-yet-summarized story: the headline degrades to the raw title and no tldr is rendered.
+        let items = vec![item(
+            "Just a title",
+            Some("https://example.com"),
+            SourceKind::Rss,
+        )];
+        let html = render_html(
+            Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
+            Tz::UTC,
+            "Hi.",
+            &items,
+            &DigestContent::default(),
+        );
+
+        assert!(html.contains("Just a title"));
+        // The body-serif summary line only appears when the item carries a tldr — none here.
+        let summary_style = format!("font-size:16px;line-height:1.65;color:{INK_BODY}");
+        assert!(!html.contains(&summary_style));
+        // The lead still composes from the (title-derived) headline.
+        assert!(html.contains("Leading this digest: Just a title."));
     }
 
     #[test]

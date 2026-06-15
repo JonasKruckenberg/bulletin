@@ -102,8 +102,17 @@ is the only switch — without it `summarize_public` is an empty no-op and no su
    yet called**. Deliberately *not* hung off `generate()` (the punctual path); they want a dedicated
    best-effort step (see §4).
 4. **Cluster tier schema only.** Story/thread/digest columns are deferred to their phases.
-5. **The render side is untouched.** `cluster.summary` is produced and stored but nothing reads it into
-   the email yet — the §6 row redesign is the next phase.
+5. **~~The render side is untouched.~~** **Done (§4.1, 2026-06-15):** the digest now reads
+   `cluster.summary` into the email. `ClusterCard`/`cluster_cards` `SELECT summary` and deserialize it;
+   `RenderItem` carries `headline` (the representative cluster's `summary.headline`, degrading to the raw
+   `title`) and `summary` (the grounded `tldr_text`, omitted when no summary has run). `render.rs` fills
+   the §6.1 zone-2 headline and zone-3 summary line from these, and composes the big-picture **lead
+   deterministically** from the selected items' headlines (§2.4 — no model call). The per-item summary +
+   big-picture lorem are retired (only `item_category` remains a placeholder). The flat `tldr_text` ships
+   first; the run-list → inline entity **badges** (§6.2) and the full §6 four-zone redesign
+   (eyebrow/provenance, deleting the debug block) are still follow-ups. With the feature off, `summary` is
+   the inert `'{}'` default, so the headline/lead degrade to the cluster titles — a real deterministic
+   lead, no lorem.
 
 ---
 
@@ -133,16 +142,13 @@ is the only switch — without it `summarize_public` is an empty no-op and no su
 
 ## 4. Next phase — concrete TODO (ordered)
 
-1. **Finish Phase A render consumption (small, high-value).** Thread `cluster.summary` into the digest:
-   - extend `digest::store::ClusterCard` + `cluster_cards` to `SELECT summary`, deserialize to
-     `ClusterSummary`;
-   - carry `headline` / `tldr_text` onto `RenderItem` (fall back to the cluster `title` when
-     `is_empty()` — the gate's `Uncertain` baseline is already a good line);
-   - in `render.rs`, fill `item_summary` from the representative cluster's `tldr_text` and prefer
-     `summary.headline` for the headline; compose `digest.lead` **deterministically** from the selected
-     items' headlines (§2.4/§3.1 — no model call). Retire the `item_summary` + big-picture lorem.
-   - The `tldr` run-list → inline entity **badges** (§6.2) needs identity resolution at render; ship the
-     flat `tldr_text` first, badges as a follow-up.
+1. ~~**Finish Phase A render consumption.**~~ **Done (2026-06-15) — see §2 deviation 5.** Threaded
+   `cluster.summary` into the digest: `cluster_cards` selects + deserializes it, `RenderItem` carries
+   `headline`/`summary`, `render.rs` fills the headline + grounded summary line and composes the lead
+   deterministically from the selected headlines; the per-item summary + big-picture lorem are retired.
+   **Still open:** the `tldr` run-list → inline entity **badges** (§6.2, needs identity resolution at
+   render), and the full §6 four-zone redesign (context eyebrow, deterministic provenance line replacing
+   the "Related"/"Why" captions, deleting the amber debug block) — the flat `tldr_text` ships first.
 2. **Wire the comprehension pass into `extract_facts`** (Phase 2, `local-ml-options.md` §6): GLiNER
    spans + a tiny constrained LLM for `event_type` / `state` / per-fact `certainty`. This is what makes
    the hedge rule (§3.6) and the numeric gate actually sharp. Until then the summarizer is honest but
