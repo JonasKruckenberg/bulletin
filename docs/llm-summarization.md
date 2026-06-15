@@ -1,6 +1,12 @@
 # Digest System — LLM Summarization
 
-**Status:** Design doc (2026-06-15). Not yet implemented. Promotes the roadmap-deferred *LLM
+**Status:** Design doc (2026-06-15). **Phase A foundation implemented** (2026-06-15) — the cluster-tier
+schema, the write-side summarization pipeline (content hash → grammar-constrained sidecar → faithfulness
+gate → deterministic baseline), the local llama.cpp deployment, behind the `llm-summarization` cargo
+feature as the **sole, compile-time** kill switch (no runtime flag — §2.5's "+ runtime flag" was dropped
+in build), off by default. The render consumption + phases B–D remain. See
+[`llm-summarization-handoff.md`](llm-summarization-handoff.md) for what's built and the next-phase TODO.
+Promotes the roadmap-deferred *LLM
 summarization* item (design §9.5, roadmap M6 backlog) into a concrete build plan, now that the email
 template has summary slots to fill (`digest/render.rs` — the three lorem-ipsum placeholders).
 **Companion to:** `local-ml-options.md` (the serving stack + model picks — this doc is the *how it

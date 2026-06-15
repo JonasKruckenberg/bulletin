@@ -10,6 +10,9 @@
 //!   subscriber's stories into persistent `Thread`s and a projected entity-weight map the digest's
 //!   relevance term reads (`docs/thread-layer.md`).
 //! - [`identity`] — tiered, probabilistic entity-identity resolution that feeds the thread layer.
+//! - [`summarize`] — write-side, best-effort LLM pre-summarization (Phase A: the content-hashed
+//!   `cluster.summary` foundation), behind the `llm-summarization` feature and degrading to a
+//!   deterministic baseline (`docs/llm-summarization.md`).
 //! - [`feedback`] — the append-only correction log (care/less, must/cannot-link).
 //!
 //! Each flow exposes a pure entry function over the DB; [`common`] holds the shared vocabulary.
@@ -22,6 +25,7 @@ pub mod feedback;
 pub mod identity;
 pub mod ingest;
 pub mod link;
+pub mod summarize;
 pub mod thread;
 
 // Ergonomic re-exports of the shared vocabulary.

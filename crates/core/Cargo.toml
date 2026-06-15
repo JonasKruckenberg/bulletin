@@ -11,6 +11,13 @@ default = ["thread-weighting"]
 # `--no-default-features` to take that path off the build entirely; the deterministic recency digest
 # is unaffected. (The `thread_maintenance` write side is harmless either way.)
 thread-weighting = []
+# Phase A of LLM summarization (docs/llm-summarization.md §2.5): compiles in the write-side,
+# best-effort cluster summarization sweep and its local-sidecar HTTP client. **Off by default** — the
+# deterministic baseline ships and the whole feature (including the client) compiles out, mirroring
+# `thread-weighting`. The pure logic (content hash, faithfulness gate, prompt/schema, deterministic
+# fallback) is always compiled and unit-tested regardless of the feature; only the DB sweep and the
+# network call are gated. No new dependency: the client rides the existing `reqwest`.
+llm-summarization = []
 
 [dependencies]
 anyhow      = { workspace = true }

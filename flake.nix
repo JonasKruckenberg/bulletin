@@ -86,24 +86,41 @@
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
           mkBin =
-            { pname, crate }:
+            {
+              pname,
+              crate,
+              features ? [ ],
+            }:
             craneLib.buildPackage (
               commonArgs
               // {
                 inherit pname cargoArtifacts;
                 version = "0.1.0";
-                cargoExtraArgs = "-p ${crate}";
+                cargoExtraArgs =
+                  "-p ${crate}"
+                  + lib.optionalString (features != [ ]) " --features ${lib.concatStringsSep "," features}";
                 meta.mainProgram = pname;
               }
             );
 
+          # Default build: no LLM summarization compiled in (the feature is the compile-time kill
+          # switch, off by default — the deterministic digest baseline).
           bulletin = mkBin {
             pname = "bulletin";
             crate = "bulletin";
           };
+
+          # The summarization-enabled build (no new deps; rides the existing reqwest). Selected by the
+          # NixOS module's `services.bulletin.llm.enable`. Turning summarization on or off is a build
+          # choice — there is no runtime flag — so the off build genuinely has no summarization code.
+          bulletin-llm = mkBin {
+            pname = "bulletin";
+            crate = "bulletin";
+            features = [ "llm-summarization" ];
+          };
         in
         {
-          inherit bulletin;
+          inherit bulletin bulletin-llm;
           default = bulletin;
         }
       );

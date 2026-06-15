@@ -26,7 +26,8 @@ built. The single source of truth for what's shipped is [`roadmap.md`](roadmap.m
 | [`thread-layer.md`](thread-layer.md) | The persistent per-subscriber **Thread** weave + **tiered probabilistic identity** + confidence-as-rendered-signal. Designed-for; first slice implemented (§9). |
 | [`data-sources.md`](data-sources.md) | The candidate-source **backlog** — everything beyond the v1 set, scored on the same connector axes. Research snapshot. |
 | [`local-ml-options.md`](local-ml-options.md) | Locally-hostable ML (mid-2026) for the deferred ML layer that runs inside `thread_maintenance` — no data egress. Research snapshot. |
-| [`llm-summarization.md`](llm-summarization.md) | How LLM summarization plugs into the content graph — the durability-tiered, content-hashed pre-summarization that fills the email's summary slots off the punctual path. Designed-for; not yet built. |
+| [`llm-summarization.md`](llm-summarization.md) | How LLM summarization plugs into the content graph — the durability-tiered, content-hashed pre-summarization that fills the email's summary slots off the punctual path. Designed-for; **Phase A foundation built** (see the handoff). |
+| [`llm-summarization-handoff.md`](llm-summarization-handoff.md) | What the Phase A foundation actually shipped (schema, the `summarize` pipeline, the local-sidecar client, the llama.cpp deployment), the deviations from the design, and the ordered next-phase TODO. |
 | [`web-frontend.md`](web-frontend.md) | The web surface as a backend/product concern — the read API, auth/IDOR/RLS on the read path, delivery-tech recommendation. Scoping (lands around M5). |
 | [`github-events.md`](github-events.md) | Reference map of GitHub's webhook/event surface and what M2 ingests. |
 | [`operating-eval.md`](operating-eval.md) | Operator guide: using the **eval harness** (`debug eval` / `config` / the config sweep) to measure and tune selection quality. |
