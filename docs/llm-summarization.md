@@ -29,9 +29,9 @@ its summary is computed and how often.
 | Email slot (`render.rs`) | Content-graph unit | Durability / sharing | Where it's produced |
 |---|---|---|---|
 | per-item `item_summary` (the TL;DR under a Story headline) | **Cluster** (representative) → **Story** (cross-source) | cluster: durable, *public ones shared across all subscribers*; story: per-fire recompute, id-forwarded, per-subscriber | `public_build` / `private_build` (cluster); `thread_maintenance` (story synthesis) |
-| per-item `item_category` (the kicker label) | **Thread** label (not a topic category — §1.1) | durable, per-subscriber | `thread_maintenance` |
+| per-item `item_category` → the **context eyebrow** | **Thread** label + delta (not a topic category — §1.1/§6.1) | durable, per-subscriber | `thread_maintenance` |
 | digest-level `summary` (the "big picture" lead) | **Digest** (this fire's selected set) | per-fire, per-subscriber, *cannot* exist before selection | fire-time **deterministic compose**; optional async editor's note (Phase D) |
-| thread chip **delta line** (`thread-layer.md` §5.2 — "Acme migration — staging cutover landed; 2 follow-ups assigned to you") | **Thread** | durable, per-subscriber | `thread_maintenance` |
+| in-summary **entity badges** (person/repo/CVE) | **Entity** refs in the tldr (§6.2) | resolved per-subscriber via the identity layer | model emits refs; render resolves |
 
 The key consequence: **the only unit that is both stable and shared is the cluster.** The story is
 recomputed every fire; the digest can't be summarized until its items are picked; the thread is
@@ -40,25 +40,22 @@ public ones once for everybody — and every higher surface is **composed from s
 never re-derived from raw events. That is the incremental pre-summarization answer (§4), and it is what
 makes the whole thing affordable on a bandwidth-bound M2 (`local-ml-options.md` §2).
 
-### 1.1 The kicker is the Thread, not a topic category
+### 1.1 The per-item kicker is the Thread, not a topic category
 
 The reference template's per-item slot is a **kicker** (a small label above the summary, e.g.
 "Geopolitics/Diplomacy"). A *generic topic category* ("Incident", "Release") is weakly meaningful and
 needs a whole closed-taxonomy apparatus to stay stable. The far stronger fill is the **label of the
 Thread the story belongs to** — "Acme migration", "On-call rotation" — the persistent thread of the
 user's life this happening advances (`thread-layer.md` §1). It is more specific, already per-subscriber
-and personal, and it is *already produced* by the thread layer (`thread.label`), so the kicker costs no
-new model call beyond the thread label we were summarizing anyway (§2.3).
+and personal, and it is *already produced* by the thread layer (`thread.label`), so it costs no new
+model call beyond the thread label we were summarizing anyway (§2.3). The redesigned row (§6.1) renders
+it as the **context eyebrow** — thread + a terse delta — and **drops the topic category entirely**.
 
 **Consolidate with the existing chip.** The renderer *already* names the thread once, as a chip above
-the headline (`render.rs::render_thread_chip` → "▸ possibly Acme migration"). Filling the kicker slot
-*and* the chip with the same label is the same text twice. So this is a **consolidation**, not an
-addition: the Thread label becomes the editorial kicker in the former `item_category` slot (carrying the
-confidence qualifier and the §5.2 delta line with it), the standalone chip folds into it, and the
-**LLM topic category drops out of the core design**. An un-threaded story (no assignment, or the
-`thread-weighting` feature off) simply renders **no kicker** — graceful omit, exactly as a story with no
-thread chip does today. A lightweight cluster `category` survives only as an *optional* fallback kicker
-for the un-threaded case (§2.1), and may be cut entirely.
+the headline (`render.rs::render_thread_chip` → "▸ possibly Acme migration"). So this is a
+**consolidation**, not an addition: the Thread label becomes the context eyebrow (carrying the
+confidence qualifier and the §5.2 delta with it), the standalone chip folds into it, and an un-threaded
+story simply renders **no eyebrow** — graceful omit, exactly as a story with no thread chip does today.
 
 ---
 
@@ -91,8 +88,8 @@ CREATE INDEX cluster_needs_summary ON cluster (last_event_time)
 ```jsonc
 {
   "headline":  "Auth service returns 500s after the token-rotation deploy",  // abstractive, ≤ ~90 chars
-  "tldr":      "A bad config in the 14:02 rollout broke token validation; ~12% of logins failed for 40m until rollback.", // 1–2 sentences
-  "category":  "Incident",            // OPTIONAL fallback kicker for un-threaded stories (§1.1); a closed enum (§3.3), may be cut
+  "tldr":      [ /* structured run-list with grounded entity refs — see §6.2 */ ], // 1–2 sentences
+  "tldr_text": "A bad config in the 14:02 rollout broke token validation; ~12% of logins failed for 40m until rollback.", // flat concat, for plaintext + preview
   "facts": {                          // the "extract" half — Phase-2 comprehension output, reused as grounding
     "entities":   ["repo:acme/auth", "cve:CVE-2026-1234", "user:dlewis"],
     "event_type": "incident",
@@ -121,7 +118,7 @@ summary without an LLM call on the hot path (forbidden). Instead it hosts a **ca
 signature of its members, written by a best-effort pass and *read* at fire time:
 
 ```sql
-ALTER TABLE story ADD COLUMN summary       jsonb NOT NULL DEFAULT '{}';  -- the fused, cross-source item summary + category
+ALTER TABLE story ADD COLUMN summary       jsonb NOT NULL DEFAULT '{}';  -- the fused, cross-source item summary (headline + tldr)
 ALTER TABLE story ADD COLUMN summary_sig   bytea;        -- hash of (sorted member cluster.summary_hash[] ‖ thread_id)
 ALTER TABLE story ADD COLUMN summary_model text;
 ALTER TABLE story ADD COLUMN summarized_at timestamptz;
@@ -135,7 +132,7 @@ ALTER TABLE story ADD COLUMN summarized_at timestamptz;
   incident PR, and a Slack flurry are the same outage"), which a single cluster summary can't — but it
   is built from the **member cluster summaries**, never by re-reading their raw events (§4).
 - **Graceful cold-start (the important bit):** a brand-new story has no cached synthesis. Fire-time does
-  **not** wait — it falls back to the representative cluster's `summary.tldr`/`category` (always
+  **not** wait — it falls back to the representative cluster's `summary.tldr`/`headline` (always
   precomputed, build-side). The fallback is itself a grounded, good one-liner, so the email is never
   empty; the cross-source rewrite is a *quality upgrade* that lands on the next fire after a best-effort
   pass has synthesized it. This is why Phase A (cluster summaries) already fills the email slot.
@@ -174,8 +171,8 @@ falls back to the greeting alone (exactly today's lead).
 
 ### 2.5 Config + kill switch (mirror `MaintenanceConfig` / `digest_config`)
 
-A `SummarizationConfig` (model name, sidecar `base_url`, per-task `max_tokens`/temperature, the closed
-category enum, the faithfulness-gate toggle) held like `thread::maintain::MaintenanceConfig` — a struct
+A `SummarizationConfig` (model name, sidecar `base_url`, per-task `max_tokens`/temperature, the
+entity-badge budget, the faithfulness-gate toggle) held like `thread::maintain::MaintenanceConfig` — a struct
 now, a `summarization_config` row when per-deployment tuning bites. Guard the whole feature behind a
 **`llm-summarization` cargo feature** (compile-time kill switch, mirroring `thread-weighting`) **and** a
 runtime flag, so it compiles out entirely and the deterministic baseline ships by default.
@@ -217,10 +214,11 @@ JSON, so direct grammar-constrained decoding is fine.
 (`local-ml-options.md` §4), so the Rust side never parses-and-prays. The schema does real work beyond
 validity:
 
-- `headline`/`tldr` carry **`maxLength`** → length control is enforced by the grammar, not hoped for.
-- the optional fallback `category` (§1.1 — used only as an un-threaded kicker, if kept at all) is a
-  **closed `enum`** (`Incident | Release | Discussion | Security | …`), so the model **classifies into a
-  stable taxonomy** instead of inventing a per-cluster label that would drift.
+- `headline`/`tldr`/`delta` carry **`maxLength`** → length control (and the single-line eyebrow, §6.1)
+  is enforced by the grammar, not hoped for.
+- the `tldr` is a **run-list** (§6.2) whose entity `ref`s are a **closed `enum` of the input
+  `facts.entities`** — so the model can *reference* a grounded entity for an inline badge but can never
+  name one that wasn't extracted from ground truth. Structural entity-faithfulness, not a post-check.
 - Low **temperature (≤ 0.2)** + a **fixed seed** → reproducible output, so a content-unchanged cluster
   re-summarizes identically (idempotency; the cache is meaningful).
 - Short **`max_tokens`** per task (headline ~24, tldr ~80, delta ~60) — short outputs both cut latency
@@ -269,7 +267,7 @@ summarizes the **summaries of the tier below**, never the raw firehose, and each
 
 ```
 RAW EVENTS  ──extract+summarize──►  CLUSTER.summary   (build-side, content-hashed, public ones shared)
-                                         │  facts + tldr + headline + category
+                                         │  facts + tldr (entity refs) + headline
 CLUSTER summaries  ──synthesize──►  STORY.summary     (thread_maintenance, cached by member-sig)
                                          │  the cross-source "what's happening"
 STORY summaries    ──delta──────►   THREAD.delta      (thread_maintenance, watermark = last delivered)
@@ -317,9 +315,9 @@ MATERIALIZATION (write side · best-effort · off the punctual path)
 PROJECTION (read side · fire-time · pure over the snapshot · NO model call)
   generate:
     … select stories (unchanged) …
-    + read story.summary (or fall back to representative cluster.summary)  → item_summary / item_category
-    + read thread.delta                                                    → thread chip delta line
-    + compose digest.lead deterministically from the above                 → big-picture lead
+    + read story.summary (or fall back to representative cluster.summary)  → headline + summary (zones 2–3)
+    + read thread.label + thread.delta                                     → context eyebrow (zone 1)
+    + compose provenance from member sources, digest.lead from the above   → provenance (zone 4) + lead
 ```
 
 No new apalis job kind is required — the cluster work hangs off the builds (which already recompute a
@@ -330,23 +328,95 @@ a late or wrong digest.
 
 ---
 
-## 6. Render mapping — retiring the lorem ipsum (`digest/render.rs`)
+## 6. Render — the item row, redesigned around the summary
 
-The three placeholders and their `<!-- PLACEHOLDER … -->` markers come out; the slots read from the
-new fields, and **degrade gracefully to nothing** (omit the section) rather than to lorem:
+The current `render_story_row` (`digest/render.rs`) stacks seven labeled zones — a loud `▸ possibly
+…` chip, headline, a category kicker, a summary, a full "Related" list, a `Why · … · relevance 0.94`
+caption, and an amber debug block. It names the thread twice and leans on *machine* signals (a relevance
+float, format tags) to assert trust. The LLM summary lets us invert that: **trust is carried by grounded
+specifics + provenance, and the scaffolding comes out.** Mockup: `docs/mockups/item-redesign.html`.
 
-- `DigestContent.summary` (the "big picture") → `digest.lead`. Null ⇒ the lead is the greeting alone
-  (the `<strong>{greeting}</strong>` already there), no placeholder paragraph.
-- per-item `item_category` (the **kicker**) → the assigned **thread's `label`** (§1.1), with its
-  `ConfidenceBand` qualifier ("possibly …") and the §5.2 `thread.delta` line beneath it. The standalone
-  `render_thread_chip` folds into this slot (one thread reference per item, not two). Un-threaded ⇒ the
-  kicker is omitted (or the optional `cluster.summary.category` fallback), never "Lorem / Ipsum".
-- per-item `item_summary` → `story.summary.tldr` ‖ representative `cluster.summary.tldr`. Absent ⇒ the
-  summary line is omitted.
+### 6.1 Four quiet zones
 
-Because every slot has a precomputed-or-omit fallback, **the renderer is correct at every phase** —
-ship Phase A and the per-item summary fills from cluster summaries with the lead still greeting-only;
-later phases light up the remaining slots with no render rework.
+```
+Acme auth migration · staging cutover landed         1 · CONTEXT eyebrow  (one line, a few words)
+Auth outage traced to the token-rotation deploy      2 · HEADLINE         (editor-grade, abstractive)
+A bad config in the 14:02 rollout broke validation   3 · SUMMARY          (one grounded sentence)
+in acme/auth; ~12% of logins failed for 40m until
+Dana rolled it back.
+Across GitHub · a CVE advisory · Slack — 2h ago      4 · PROVENANCE       (corroboration, made calm)
+```
+
+1. **Context eyebrow** — the assigned **thread label** (§1.1) + a **terse delta flag**, on **one line**.
+   The delta is a few words ("staging cutover landed", "reactivated", "3 follow-ups") — *a flag, not a
+   clause*; the detail lives in the summary below. Enforced two ways: a hard `maxLength` on `thread.delta`
+   in the schema (§3.3) **and** `white-space:nowrap; overflow:hidden; text-overflow:ellipsis` at render,
+   so it can never wrap. Identity doubt shows as a quiet italic "possibly" before the label (Probable;
+   omit the eyebrow for Uncertain — *budget the doubt*, §10.4). **Un-threaded ⇒ no eyebrow at all** (the
+   standalone `render_thread_chip` is folded into this zone — one thread reference per item, not two).
+2. **Headline** ← `cluster.summary.headline` (the representative). Editor-grade and normalized across
+   sources; falls back to the raw cluster `title` if the faithfulness gate (§3.4) rejects it.
+3. **Summary** ← `story.summary.tldr` ‖ representative `cluster.summary.tldr` — **one** grounded
+   sentence, set in upright body serif (a confident statement, not a muted italic aside). Its specifics
+   (`14:02`, `12%`, `40m`) are the trust workhorse. Entity mentions render as inline badges (§6.2).
+4. **Provenance** ← composed deterministically from the story's member sources: **`Across <source> ·
+   <source> · <source> — <when>`** for a multi-source story (surfacing the M3 cross-source value as the
+   confidence line), or just **`<source> — <when>`** for a single source. This replaces *both* the
+   verbose "Related" list and the `Why · relevance` caption.
+
+The digest-level `DigestContent.summary` → `digest.lead` (§2.4); null ⇒ greeting alone.
+
+**What moves off the email:** the full per-source breakdown (each fused cluster + its `link_reason`) and
+the machine "why" (relevance/priority/`digest.decisions`) move to the **authenticated deep-link / explain
+view** — email stays editorial, the audit trail stays inspectable (system-design §9.5 "notification +
+deep-link, not content-dumping"; §10.2 reason records). The amber **debug block is deleted**.
+
+Every zone has a precomputed-or-omit fallback, so **the renderer is correct at every phase** — ship
+Phase A and the summary fills from cluster summaries with no eyebrow; later phases light up the eyebrow,
+delta, and cross-source synthesis with no render rework.
+
+### 6.2 Structured entity references → inline badges
+
+The model may **refer to entities inside the summary** — but in a structured, *grounded* way that lets
+rendering emit an inline badge (a person + avatar, a repo tag, a CVE pill) instead of plain text. The
+correctness comes from constraining the model to a **closed set**, never free-naming.
+
+- **The model references, it does not name.** The summarization schema (§3.3) emits the tldr as an
+  ordered run-list, each run either plain `text` or an **entity `ref`** whose token is grammar-constrained
+  to an `enum` of the input `facts.entities` (the deterministically-extracted set, §2.1/§3.2). So the
+  model can only point at an entity that was extracted from ground truth — a hallucinated mention is
+  *structurally impossible*, not merely caught after the fact. It picks *which* token to reference and
+  the visible surface text; it asserts no identity.
+
+  ```jsonc
+  "tldr": [
+    { "text": "A bad config broke token validation in " },
+    { "ref": "repo:acme/auth", "surface": "acme/auth" },     // ref ∈ enum(facts.entities)
+    { "text": "; ~12% of logins failed until " },
+    { "ref": "user:U0123", "surface": "Dana" },
+    { "text": " rolled it back." }
+  ]
+  // a flat "tldr_text" is stored alongside (concat of text+surface) for the plaintext email + inbox preview.
+  ```
+
+- **Rendering owns identity, avatar, and confidence — not the model.** Each `ref` resolves through the
+  identity layer to the existing render contract `{ display_name, canonical_id?, confidence_band,
+  avatar_ref? }` (thread-layer §4 / §10.4). Treatment is by entity *type* × *confidence*:
+  - `user:` → a person chip; the **authoritative avatar only** (the §4 footgun: avatar provenance must
+    equal identity provenance — a Slack `U0123` *carries* its avatar; otherwise initials/placeholder).
+    Uncertain → name + a quiet "?", which **is the §10.4 correction affordance** (tap → must-link /
+    cannot-link feedback → the edge hardens for next recompute).
+  - `repo:` → a faint dotted-underline tag linking to the repo; `cve:` → a severity-tinted pill linking
+    to the advisory; `url:`/`domain:` → a domain chip.
+- **Safe degeneration.** An unresolved or dropped `ref` renders as **plain `surface` text** — never a
+  broken badge; clients that strip the badge styling still get the inline display text (the badge is
+  progressive enhancement, the plaintext part already uses `tldr_text`). **Budget the badges** (§10.4):
+  cap the badged mentions per summary to the salient few, the rest stay plain, so the sentence reads as
+  prose, not a wall of chips. Private-scope person badges resolve only in the subscriber's RLS context
+  (§12 — no cross-tenant avatar).
+
+This is the §3.4 faithfulness gate, extended one level: it already forbids unsupported numbers/dates;
+the closed-`enum` ref makes the same guarantee for *entity references*, structurally.
 
 ---
 
@@ -360,9 +430,9 @@ layer uses.
   builds, content-hashed; the extract-then-summarize pass + the faithfulness gate. Fills `item_summary`
   from the representative cluster; the lead becomes a **deterministic** compose. *Biggest single win —
   retires the per-item summary and the big-picture lorem.*
-- **Phase B — Thread label + delta (the kicker).** Readable `thread.label`, which becomes the per-item
-  **kicker** (§1.1, retiring the `item_category` lorem and folding in the existing chip); the §5.2
-  `delta` line in `thread_maintenance`, watermarked by last-delivered, beneath it.
+- **Phase B — Thread label + delta (the context eyebrow).** Readable `thread.label`, which becomes the
+  per-item **context eyebrow** (§1.1/§6.1, retiring the `item_category` lorem and folding in the existing
+  chip); the §5.2 `delta` flag in `thread_maintenance`, watermarked by last-delivered, on the same line.
 - **Phase C — Story cross-source synthesis.** `story.summary` cached by member-sig in
   `thread_maintenance`; upgrades `item_summary` from the representative-cluster fallback to a fused
   multi-source rewrite for recurring stories.
@@ -386,15 +456,17 @@ layer uses.
   on any unsupported entity/number; uncertainty renders as a band, not hidden; `digest.lead` joins
   `digest.decisions` in the debug trace.
 - **Graceful degradation.** Disable the cargo feature and the digest is exactly today's: greeting lead,
-  no category/summary sections, no delta — the deterministic baseline, intact.
+  no eyebrow/summary, no delta, raw titles — the deterministic baseline, intact.
 
 ---
 
 ## 9. Open questions (tuning surface)
 
-- **Kicker for un-threaded stories** — with the Thread label as the kicker (§1.1), do we keep the
-  optional cluster `category` fallback at all, or just omit the kicker until a thread is assigned? (If
-  kept: the right ~8–12 buckets, evolved via `summary_model` re-sweep.) Leaning omit-and-cut.
+- **Entity-badge budget** (§6.2) — how many mentions to badge per summary before it reads as chips not
+  prose; whether `repo:`/`cve:` tags count against the same budget as person chips; the exact treatment
+  of a Probable (vs Confirmed/Uncertain) identity inline.
+- **Un-threaded items** — confirmed: no eyebrow (the topic category is dropped, §1.1). Revisit only if
+  un-threaded items feel context-starved in practice.
 - **Faithfulness gate strictness** — exact-token vs normalized entity/number matching; the
   reject-rate vs coverage trade-off; whether to band-and-ship `probable` rather than reject outright.
 - **Input budgets** — token caps for cluster `body` truncation and the story member-summary fan-in,
