@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bulletin — item row redesign</title>
+</head>
+<!--
+  ROUGH MOCKUP (not wired to render.rs). Palette/type from digest/render.rs consts.
+  A redesigned item row built around the LLM summary. Four quiet zones, lots of air:
+    1. CONTEXT eyebrow  — thread + what's new (the "we remember your life" signal). Omitted if un-threaded.
+    2. HEADLINE         — the editor-grade abstractive headline (cluster summary, gated; raw title on fallback).
+    3. SUMMARY          — one grounded sentence with real specifics (the trust workhorse).
+    4. PROVENANCE       — the sources that corroborate + when (the M3 cross-source value, made calm).
+  No category kicker, no relevance float, no "Why ·" jargon, no amber debug block.
+  Confidence is budgeted: identity doubt shows as a quiet "possibly"; the summary is true by construction
+  (faithfulness gate → deterministic fallback), so it carries no hedge.
+-->
+<body style="margin:0;padding:0;background-color:#fefbf3;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#fefbf3;">
+<tr><td align="center" style="padding:36px 12px;">
+<table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="width:600px;max-width:100%;background-color:#fffdf8;border:1px solid #ddd4c2;border-radius:4px;">
+
+<!-- masthead + big-picture lead -->
+<tr><td style="padding:52px 48px 0 48px;">
+  <div style="font-family:'Helvetica Neue',Arial,sans-serif;font-size:12px;font-weight:600;letter-spacing:0.12em;text-transform:uppercase;color:#a0927b;text-align:center;">Bulletin</div>
+  <h1 style="margin:18px 0 30px 0;font-family:Georgia,serif;font-size:34px;font-weight:700;line-height:1.25;color:#2c1810;text-align:center;">Your Digest</h1>
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:0 0 8px 0;"><tr>
+    <td width="40%" style="border-bottom:1px solid #ddd4c2;font-size:0;line-height:0;">&nbsp;</td>
+    <td style="padding:0 14px;white-space:nowrap;font-family:'Helvetica Neue',Arial,sans-serif;font-size:12px;letter-spacing:0.1em;text-transform:uppercase;color:#a0927b;text-align:center;">Monday, June 15, 2026</td>
+    <td width="40%" style="border-bottom:1px solid #ddd4c2;font-size:0;line-height:0;">&nbsp;</td>
+  </tr></table>
+  <div style="font-family:Georgia,serif;font-size:17px;line-height:1.75;color:#3d2e22;margin:30px 0 6px 0;"><strong style="color:#2c1810;font-weight:700;">Good morning.</strong> The Acme auth migration dominated the night — a token-rotation rollout broke logins before a clean rollback — and a high-severity CVE landed on billing. Three quieter threads moved too.</div>
+</td></tr>
+
+<tr><td style="padding:40px 0 0 0;"><div style="height:1px;background-color:#ddd4c2;margin:0 48px;"></div></td></tr>
+
+<!-- ITEM 1 — multi-source story, Confirmed thread -->
+<tr><td style="padding:34px 48px 0 48px;">
+  <!-- 1 · CONTEXT eyebrow: thread + delta, one quiet line -->
+  <div style="font-family:'Helvetica Neue',Arial,sans-serif;font-size:12px;letter-spacing:0.02em;color:#a0927b;">
+    <span style="color:#d35327;font-weight:600;">Acme auth migration</span> &nbsp;·&nbsp; staging cutover landed, 2 follow-ups now yours
+  </div>
+  <!-- 2 · HEADLINE: editor-grade -->
+  <a href="#" style="display:block;margin-top:10px;font-family:Georgia,serif;font-size:22px;font-weight:700;line-height:1.32;color:#2c1810;text-decoration:none;">Auth outage traced to the token-rotation deploy</a>
+  <!-- 3 · SUMMARY: one grounded sentence, upright body ink (confident, not a muted aside) -->
+  <div style="margin-top:11px;font-family:Georgia,serif;font-size:17px;line-height:1.6;color:#3d2e22;">A bad config in the 14:02 rollout broke token validation; ~12% of logins failed for 40&nbsp;minutes until a rollback restored service.</div>
+  <!-- 4 · PROVENANCE: corroboration + time, calm -->
+  <div style="margin-top:14px;font-family:'Helvetica Neue',Arial,sans-serif;font-size:12px;line-height:1.6;color:#a0927b;">
+    Corroborated across
+    <span style="color:#d35327;">GitHub</span> ·
+    <span style="color:#d35327;">a CVE advisory</span> ·
+    <span style="color:#d35327;">Slack</span>
+    &nbsp;—&nbsp; 2 hours ago
+  </div>
+</td></tr>
+
+<tr><td style="padding:34px 0 0 0;"><div style="height:1px;background-color:#ddd4c2;margin:0 48px;"></div></td></tr>
+
+<!-- ITEM 2 — single-source story, Probable thread (identity doubt → quiet "possibly") -->
+<tr><td style="padding:34px 48px 0 48px;">
+  <div style="font-family:'Helvetica Neue',Arial,sans-serif;font-size:12px;letter-spacing:0.02em;color:#a0927b;">
+    <span style="font-style:italic;">possibly</span> <span style="color:#d35327;font-weight:600;">Billing rewrite</span> &nbsp;·&nbsp; first activity in 3 weeks
+  </div>
+  <a href="#" style="display:block;margin-top:10px;font-family:Georgia,serif;font-size:22px;font-weight:700;line-height:1.32;color:#2c1810;text-decoration:none;">SSRF advisory lands on the invoice PDF renderer</a>
+  <div style="margin-top:11px;font-family:Georgia,serif;font-size:17px;line-height:1.6;color:#3d2e22;">CVE-2026-2200 (high) affects billing's PDF path; no patch yet — the mitigation is to disable remote asset fetching.</div>
+  <div style="margin-top:14px;font-family:'Helvetica Neue',Arial,sans-serif;font-size:12px;line-height:1.6;color:#a0927b;">
+    <span style="color:#d35327;">CVE feed</span> &nbsp;—&nbsp; 4 hours ago
+  </div>
+</td></tr>
+
+<tr><td style="padding:34px 0 0 0;"><div style="height:1px;background-color:#ddd4c2;margin:0 48px;"></div></td></tr>
+
+<!-- ITEM 3 — un-threaded story: NO eyebrow at all (graceful) -->
+<tr><td style="padding:34px 48px 0 48px;">
+  <a href="#" style="display:block;font-family:Georgia,serif;font-size:22px;font-weight:700;line-height:1.32;color:#2c1810;text-decoration:none;">Postgres 18.2 fixes three logical-replication bugs</a>
+  <div style="margin-top:11px;font-family:Georgia,serif;font-size:17px;line-height:1.6;color:#3d2e22;">A patch release closing three logical-replication bugs and a planner regression; no breaking changes.</div>
+  <div style="margin-top:14px;font-family:'Helvetica Neue',Arial,sans-serif;font-size:12px;line-height:1.6;color:#a0927b;">
+    <span style="color:#d35327;">RSS</span> &nbsp;—&nbsp; yesterday
+  </div>
+</td></tr>
+
+<tr><td style="padding:34px 0 0 0;"><div style="height:1px;background-color:#ddd4c2;margin:0 48px;"></div></td></tr>
+
+<!-- ITEM 4 — a Note: the same grammar, even terser (no summary line) -->
+<tr><td style="padding:30px 48px 0 48px;">
+  <div style="font-family:'Helvetica Neue',Arial,sans-serif;font-size:12px;letter-spacing:0.02em;color:#a0927b;">
+    <span style="color:#d35327;font-weight:600;">On-call rotation</span>
+  </div>
+  <a href="#" style="display:block;margin-top:8px;font-family:Georgia,serif;font-size:17px;font-weight:700;line-height:1.4;color:#2c1810;text-decoration:none;">You're on call from Friday 18:00</a>
+  <div style="margin-top:8px;font-family:'Helvetica Neue',Arial,sans-serif;font-size:12px;color:#a0927b;"><span style="color:#d35327;">PagerDuty</span> &nbsp;—&nbsp; 1 hour ago</div>
+</td></tr>
+
+<tr><td style="padding:40px 0 0 0;"><div style="height:1px;background-color:#ddd4c2;margin:0 48px;"></div></td></tr>
+
+<tr><td style="padding:24px 48px 52px 48px;">
+  <div style="font-family:'Helvetica Neue',Arial,sans-serif;font-size:12px;line-height:1.7;color:#a0927b;text-align:center;">Bulletin · the full timeline and "why am I seeing this" live behind each headline.</div>
+</td></tr>
+
+</table>
+</td></tr>
+</table>
+</body>
+</html>
