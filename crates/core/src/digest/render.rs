@@ -34,10 +34,16 @@ fn reason_line(reason: &ItemReason) -> String {
 /// summarization feature off too. Empty for an empty item list (the caller renders the empty digest).
 fn compose_lead(items: &[RenderItem]) -> String {
     // The dominant line is the top-ranked item's headline (selection is in priority order); fall to
-    // the next non-blank one only if it is somehow empty. `is_empty()`-guarded so an all-blank set
-    // yields no lead. The "N more" count is over **all** rendered items, so it can never disagree with
-    // the rows below (a blank headline still counts as a row).
-    let Some(lead) = items.iter().map(|i| i.headline.trim()).find(|h| !h.is_empty()) else {
+    // the next one only if it has no real content. The predicate is `trim_sentence_end(h)` non-empty,
+    // not just `h` non-empty, so a punctuation-only title ("???", "...") is skipped rather than
+    // producing an empty clause — and it guarantees the clause below (and `end_sentence`) gets text.
+    // An all-blank set yields no lead. The "N more" count is over **all** rendered items, so it can
+    // never disagree with the rows below (a blank/skipped headline still counts as a row).
+    let Some(lead) = items
+        .iter()
+        .map(|i| i.headline.trim())
+        .find(|h| !trim_sentence_end(h).is_empty())
+    else {
         return String::new();
     };
     let rest = items.len() - 1;
@@ -334,9 +340,14 @@ fn render_html(
         .to_string();
     let preheader = format!("{count} new item{plural} in your digest");
     let greeting = escape(greeting);
-    // The big-picture lead is composed once by the caller (§2.4) — deterministic, no model, no lorem;
-    // empty only when there are no items (the empty digest path).
-    let summary = escape(lead);
+    // The big-picture lead is composed once by the caller (§2.4) — deterministic, no model, no lorem.
+    // Prefix it with a single space only when present, so an empty lead leaves no stray gap after the
+    // greeting (mirrors the plaintext join).
+    let lead_html = if lead.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", escape(lead))
+    };
 
     // The category placeholder is identical across items today, so escape it once and reuse.
     let category = escape(content.item_category);
@@ -360,7 +371,7 @@ fn render_html(
     let masthead = format!(
         r#"{head}<div style="font-family:{SERIF};font-size:15px;font-style:italic;font-weight:700;color:{ACCENT};margin:34px 0 12px 0;">The big picture</div>
 <!-- Lead: a time-of-day greeting (real) opens the paragraph, then the deterministic big-picture summary composed from the selected items' headlines (§2.4). -->
-<div class="lead" style="font-family:{SERIF};font-size:17px;line-height:1.75;color:{INK_BODY};margin:0;"><strong style="color:{INK};font-weight:700;">{greeting}</strong> {summary}</div>
+<div class="lead" style="font-family:{SERIF};font-size:17px;line-height:1.75;color:{INK_BODY};margin:0;"><strong style="color:{INK};font-weight:700;">{greeting}</strong>{lead_html}</div>
 <div style="font-family:{SERIF};font-size:15px;font-style:italic;font-weight:700;color:{ACCENT};margin:40px 0 0 0;">In this digest &middot; {count} item{plural}</div>
 "#,
         head = masthead_head(content, &date),
@@ -927,6 +938,16 @@ mod tests {
             compose_lead(&[mk("Top story"), blank]),
             "Leading this digest: Top story, with 1 more update below."
         );
+
+        // A punctuation-only top headline ("???", "...") has no real content: it is skipped for the
+        // lead text (falling through to the next), but still counts as a rendered row. It must never
+        // produce an empty clause like "Leading this digest: , with …".
+        assert_eq!(
+            compose_lead(&[mk("???"), mk("Real headline")]),
+            "Leading this digest: Real headline, with 1 more update below."
+        );
+        // ...and when it is the only item, there is simply no lead (not "Leading this digest: ???").
+        assert!(compose_lead(&[mk("...")]).is_empty());
     }
 
     #[test]
