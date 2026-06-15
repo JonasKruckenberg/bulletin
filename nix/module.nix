@@ -35,13 +35,13 @@ let
   # role) is separate, so a runtime credential can never alter the schema or disable RLS.
   databaseUrl =
     if cfg.database.createLocally then
-      "postgres://${runtimeRole}@/${dbName}?host=/run/postgresql"
+      "postgres:///${dbName}?host=/run/postgresql&user=${runtimeRole}"
     else
       cfg.database.url;
 
   migrationUrl =
     if cfg.database.createLocally then
-      "postgres://${ownerRole}@/${dbName}?host=/run/postgresql"
+      "postgres:///${dbName}?host=/run/postgresql&user=${ownerRole}"
     else if cfg.database.migrationUrl != null then
       cfg.database.migrationUrl
     else
