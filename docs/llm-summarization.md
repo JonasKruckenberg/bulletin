@@ -257,6 +257,72 @@ no-egress invariant. Scope discipline is preserved end-to-end:
   the model never sees two tenants' content in one context (system-design §12 #1/#6: stateless workers,
   no shared buffers).
 
+### 3.6 The prompt — calm, grounded, honestly hedged
+
+The schema (§3.3) constrains *shape*; the **prompt** sets *voice*. The editorial target is a sharp
+colleague briefing you in one breath — **calm, plain, specific; confident where the source is settled,
+hedged where the source is tentative, never the reverse.** The load-bearing idea is that the model
+handles the **two uncertainties oppositely**:
+
+- **Identity uncertainty is not the model's to voice.** Whether "Dana" is *the* Dana is the resolver's
+  call, rendered as the badge band / "possibly" (§6.2, §10.4). The prompt forbids the model from
+  hedging about *who/what* an entity is — it just references the token; the interface shows the doubt.
+- **Factual / state uncertainty is inherited from the source.** Whether the cause is confirmed or the
+  incident resolved lives in the extracted `facts` (`state: detected | investigating | resolved`) and
+  the source's own words. The prompt makes the model **mirror that stance** — state settled facts
+  plainly, keep the source's hedges ("suspected", "appears to", "proposed", "investigating"), and never
+  upgrade a guess to a fact or add cause/blame/outcome the source doesn't state.
+
+A single **system prompt** (constant ⇒ prefix-cached by llama.cpp, so it's near-free per call) carries
+the house style; a short **user prompt** per task carries the structured input. Sketch:
+
+```text
+SYSTEM (shared, cached)
+You write the lines for one person's work digest — short, grounded summaries of what
+happened in the tools and feeds they follow (GitHub, Slack, CVE advisories, releases, RSS).
+
+Voice
+• Calm and plain. Active voice, concrete nouns, exact numbers. A colleague briefing you in
+  one breath — not a press release.
+• Lead with what happened and who it affects. Cut filler ("it's worth noting", "this means").
+• No hype, no magnitude adjectives ("massive", "critical") unless the source uses them, no
+  exclamation, no second person, no calls to action.
+
+Honesty about certainty — match the source, never manufacture it
+• State settled facts plainly: if the source confirms a cause or outcome, say it directly.
+• Preserve the source's hedge when it is tentative — "suspected", "appears to", "proposed",
+  an investigating/unresolved state stays unresolved. Never upgrade a guess to a fact.
+• Add no cause, blame, or consequence the source does not state. If it isn't in the facts, omit it.
+• Do not comment on whether a name or identity is correct — just refer to the entity you are
+  given, by its id. The interface shows certainty about identity; that is not your job.
+
+Grounding
+• Use only the facts and source text provided. Every entity, number, and date you write must
+  appear in the input. Drop anything unsupported; never invent.
+• Refer to people, repos, services, and CVEs only through the entity references provided.
+
+Output
+• Return only the JSON the schema asks for. No preamble.
+```
+
+Per-task **user** prompts (all over the §4 inputs — pre-distilled, short):
+
+- **Cluster** — `facts` + the allowed-entity enum + budgeted source text → *"Write `headline` (≤90 chars,
+  the single most important thing) and `tldr` (1–2 sentences: what happened, the impact, the current
+  state). Reference entities by id where natural."*
+- **Story synthesis** — the member cluster summaries + shared entities + thread label (for tone only) →
+  *"These items are the same happening, seen across {sources}. Write one fused headline + tldr that says
+  what the cross-source picture is. Don't re-list each source — that list renders beneath your line."*
+- **Thread delta** — the thread label + the new stories' summaries since `delta_through` → *"Name what
+  newly changed in ≤ ~6 words — a flag, not a sentence ('staging cutover landed', 'reactivated', '3
+  follow-ups assigned'). No trailing punctuation."*
+- **Digest lead** (Phase D) — the selected items' headlines → *"Write a 1–2 sentence opening: what
+  dominated, what else moved. Name the one or two threads that mattered. Don't list every item."*
+
+The **extraction** pass that produces `facts` is a separate, *non-editorial* prompt (event-type, state,
+entities, numbers, dates only) run scratchpad-then-constrained (§3.2) — it feeds this voice, it doesn't
+share it.
+
 ---
 
 ## 4. Q3 — What we feed, and yes: incremental pre-summarization
@@ -467,6 +533,9 @@ layer uses.
   of a Probable (vs Confirmed/Uncertain) identity inline.
 - **Un-threaded items** — confirmed: no eyebrow (the topic category is dropped, §1.1). Revisit only if
   un-threaded items feel context-starved in practice.
+- **Voice calibration** (§3.6) — does a 3–4B model reliably *inherit* the source's hedge rather than
+  flatten it, and resist hype, with prompt alone, or do we need a few-shot exemplar set / light DPO
+  against hyped + over-confident negatives? Eval read-only via `digest-explain` on real clusters.
 - **Faithfulness gate strictness** — exact-token vs normalized entity/number matching; the
   reject-rate vs coverage trade-off; whether to band-and-ship `probable` rather than reject outright.
 - **Input budgets** — token caps for cluster `body` truncation and the story member-summary fan-in,
