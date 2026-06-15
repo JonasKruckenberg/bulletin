@@ -31,6 +31,38 @@ use token::TokenProvider;
 /// Default REST API root; overridable so tests can point at a local mock server.
 pub const DEFAULT_API_BASE: &str = "https://api.github.com";
 
+/// The header set every GitHub REST call carries: the JSON media type, the pinned API version, and
+/// the UA GitHub requires. Auth (`bearer_auth`) is applied by the caller, which holds the token.
+pub(super) fn github_headers(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    req.header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header(reqwest::header::USER_AGENT, "bulletin")
+}
+
+/// Send a prepared request, error on a non-success status (status only — an error body can carry
+/// sensitive context), and deserialize the JSON body. The shared send/check/parse path for the
+/// GitHub REST calls that don't need conditional-GET (ETag/304) handling.
+pub(super) async fn fetch_json<T: serde::de::DeserializeOwned>(
+    req: reqwest::RequestBuilder,
+    what: &str,
+) -> Result<T, SourceError> {
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| SourceError::Request(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(SourceError::Request(format!(
+            "{what}: HTTP {}",
+            resp.status()
+        )));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| SourceError::Request(e.to_string()))?;
+    serde_json::from_slice(&bytes).map_err(|e| SourceError::Parse(format!("{what}: {e}")))
+}
+
 /// Per-connection config persisted in `connection.config`. The `installation_id` is the App
 /// installation this connection ingests + the webhook routing key (Phase 2) — **not a secret**
 /// (design §3A). An explicit `repos` allowlist is optional; absent, we reconcile every repo the
@@ -91,10 +123,7 @@ impl GithubConnection {
     /// Common header set: bearer auth, the JSON media type, the pinned API version, and the UA
     /// GitHub requires. The installation token is short-lived and never logged.
     fn authed(&self, req: reqwest::RequestBuilder, token: &str) -> reqwest::RequestBuilder {
-        req.bearer_auth(token)
-            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .header(reqwest::header::USER_AGENT, "bulletin")
+        github_headers(req.bearer_auth(token))
     }
 
     /// The repos to reconcile, each tagged with its visibility. Discovery via
@@ -113,23 +142,11 @@ impl GithubConnection {
                 .collect());
         }
         let url = format!("{}/installation/repositories", self.base_url);
-        let resp = self
-            .authed(self.client.get(&url), token)
-            .send()
-            .await
-            .map_err(|e| SourceError::Request(e.to_string()))?;
-        if !resp.status().is_success() {
-            return Err(SourceError::Request(format!(
-                "list repositories: HTTP {}",
-                resp.status()
-            )));
-        }
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| SourceError::Request(e.to_string()))?;
-        let parsed: InstallationRepos = serde_json::from_slice(&bytes)
-            .map_err(|e| SourceError::Parse(format!("installation repositories: {e}")))?;
+        let parsed: InstallationRepos = fetch_json(
+            self.authed(self.client.get(&url), token),
+            "installation repositories",
+        )
+        .await?;
         Ok(parsed
             .repositories
             .into_iter()

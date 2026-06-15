@@ -103,30 +103,8 @@ impl GithubAppTokens {
             "{}/app/installations/{}/access_tokens",
             self.app.base_url, self.installation_id
         );
-        let resp = self
-            .app
-            .client
-            .post(&url)
-            .bearer_auth(jwt)
-            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .header(reqwest::header::USER_AGENT, "bulletin")
-            .send()
-            .await
-            .map_err(|e| SourceError::Request(e.to_string()))?;
-        if !resp.status().is_success() {
-            // Don't echo the body — an error response can carry sensitive context; the status is enough.
-            return Err(SourceError::Request(format!(
-                "installation token exchange: HTTP {}",
-                resp.status()
-            )));
-        }
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| SourceError::Request(e.to_string()))?;
-        let parsed: TokenResponse = serde_json::from_slice(&bytes)
-            .map_err(|e| SourceError::Parse(format!("installation token response: {e}")))?;
+        let req = super::github_headers(self.app.client.post(&url).bearer_auth(jwt));
+        let parsed: TokenResponse = super::fetch_json(req, "installation token exchange").await?;
         Ok(Token {
             secret: parsed.token,
             expires_at: parsed.expires_at,
