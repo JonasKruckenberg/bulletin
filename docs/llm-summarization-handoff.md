@@ -2,9 +2,9 @@
 
 **Status:** Implemented 2026-06-15. The **foundation** of `llm-summarization.md` Phase A — the schema,
 the write-side summarization pipeline, the local-sidecar client, and the llama.cpp deployment — is
-built, behind the `llm-summarization` cargo feature and a runtime flag, **off by default**. The render
-consumption (filling the email's summary slots) and the per-subscriber/private wiring are the *next
-phase*; this doc hands them off.
+built, behind the `llm-summarization` cargo feature as the **sole, compile-time** kill switch (no
+runtime flag), **off by default**. The render consumption (filling the email's summary slots) and the
+per-subscriber/private wiring are the *next phase*; this doc hands them off.
 **Reads against:** `llm-summarization.md` (the design), `local-ml-options.md` (the serving stack),
 `thread-layer.md` §3.1 (the "fall behind, never wrong" contract this inherits).
 
@@ -66,17 +66,19 @@ rejection all degrade to the deterministic baseline.
 ### 1.4 Worker integration — `crates/bulletin/src/worker.rs`
 
 `summarize_public(&pool)` is called **after a successful `public_build`** (the natural
-`summary_hash`-invalidation point, §5), best-effort: it reads `SummarizationConfig::from_env()`, no-ops
-unless `BULLETIN_LLM_ENABLED` is set, and never propagates an error. Compiled out without the binary's
-forwarded `llm-summarization` feature.
+`summary_hash`-invalidation point, §5), best-effort: it reads `SummarizationConfig::from_env()` for the
+sidecar address/model and never propagates an error. The binary's forwarded `llm-summarization` feature
+is the only switch — without it `summarize_public` is an empty no-op and no summarization code exists.
 
 ### 1.5 Deployment — `flake.nix` + `nix/module.nix`
 
-- The `bulletin` package is now built **with** `--features llm-summarization` (no new deps; rides the
-  existing `reqwest`), so the feature can be toggled by config without a rebuild.
-- `services.bulletin.llm`: `enable` (sets `BULLETIN_LLM_ENABLED=1` + the `BASE_URL`/`MODEL`/
-  `PROMPT_VERSION` env), `baseUrl`, `model`, `promptVersion`, `serveLocally` (provisions
-  `services.llama-cpp` on the port parsed from `baseUrl`), `package`, `modelPath`.
+- The flake exposes two builds: `bulletin` (plain, no summarization) and `bulletin-llm` (the
+  `--features llm-summarization` build; no new deps — rides the existing `reqwest`). The kill switch is
+  the **build choice**, not a runtime flag: the off build has no summarization code.
+- `services.bulletin.llm`: `enable` (selects the `bulletin-llm` package + sets the `BASE_URL`/`MODEL`/
+  `PROMPT_VERSION` *config* env — not an enable flag), `baseUrl`, `model`, `promptVersion`,
+  `serveLocally` (provisions `services.llama-cpp` on the port parsed from `baseUrl`), `package`,
+  `modelPath`.
 - The worker is `wants`/`after` (not `requires`) the sidecar — summarization is best-effort, so a
   down/slow sidecar never blocks the worker or a digest.
 
@@ -116,7 +118,8 @@ forwarded `llm-summarization` feature.
   surface as fast-moving). The module was not `nix`-evaluated in CI (no nix in the build env).
 - **The model path is never exercised in CI** (no sidecar). All *pure* logic is unit-tested (11 tests
   in `summarize::tests`); the network round-trip needs a live `llama-server`. To smoke-test locally:
-  run a llama.cpp server, set `BULLETIN_LLM_ENABLED=1` + `BULLETIN_LLM_BASE_URL`, ingest, build.
+  run a llama.cpp server, build with `--features llm-summarization`, set `BULLETIN_LLM_BASE_URL`,
+  ingest, build (cluster pass).
 - **No metrics yet** for the sweep (the worker logs `summarized`/`skipped`). Add a counter when wiring
   consumption.
 

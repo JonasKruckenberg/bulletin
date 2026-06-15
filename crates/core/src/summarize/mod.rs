@@ -30,16 +30,14 @@ use crate::common::event::Event;
 
 // ── Config + kill switch (docs/llm-summarization.md §2.5) ──────────────────────────────────────
 
-/// Tuning surface + the runtime kill switch for summarization, held as a struct like
+/// Tuning surface for summarization, held as a struct like
 /// [`thread::MaintenanceConfig`](crate::thread::MaintenanceConfig) — a `summarization_config` row
-/// when per-deployment tuning bites. The runtime `enabled` flag pairs with the compile-time
-/// `llm-summarization` feature: **both** must be on for any model call. Defaults are off + a local
-/// sidecar, so a stray build never reaches out.
+/// when per-deployment tuning bites. **There is no runtime kill switch here:** the *only* switch is
+/// the compile-time `llm-summarization` feature (mirroring `thread-weighting`), so a build without it
+/// has no summarization code at all. This struct is pure config — the sidecar address, the model, and
+/// the generation knobs — never a guard.
 #[derive(Debug, Clone)]
 pub struct SummarizationConfig {
-    /// Runtime kill switch. `false` ⇒ the sweep is an immediate no-op (the deterministic baseline
-    /// stands). Pairs with the compile-time feature.
-    pub enabled: bool,
     /// The 100%-local sidecar's OpenAI-compatible base URL (no egress, §3.5), e.g.
     /// `http://127.0.0.1:8080/v1`. The summary request POSTs to `{base_url}/chat/completions`.
     pub base_url: String,
@@ -72,7 +70,6 @@ pub struct SummarizationConfig {
 impl Default for SummarizationConfig {
     fn default() -> Self {
         SummarizationConfig {
-            enabled: false,
             base_url: "http://127.0.0.1:8080/v1".to_string(),
             model: "qwen3.5-4b-instruct".to_string(),
             prompt_version: 1,
@@ -96,15 +93,13 @@ impl SummarizationConfig {
         format!("{}@{}", self.model, self.prompt_version)
     }
 
-    /// Build a config from the `BULLETIN_LLM_*` environment (the binary's runtime config seam). The
-    /// runtime side is intentionally minimal — `ENABLED`, `BASE_URL`, `MODEL`, `PROMPT_VERSION` —
-    /// with everything else left at the conservative defaults. Unset/unparseable ⇒ default (and
-    /// `ENABLED` defaults `false`, so an unconfigured deployment never calls a model).
+    /// Build a config from the `BULLETIN_LLM_*` environment (the binary's runtime config seam) — the
+    /// sidecar `BASE_URL`, `MODEL`, and `PROMPT_VERSION` only; everything else stays at the
+    /// conservative defaults. These are *config, not a kill switch* — whether summarization runs at
+    /// all is the compile-time feature's call (this code only exists in a feature build). Reached only
+    /// from the gated worker step, so it never executes in a default build.
     pub fn from_env() -> Self {
         let mut cfg = SummarizationConfig::default();
-        if let Ok(v) = std::env::var("BULLETIN_LLM_ENABLED") {
-            cfg.enabled = matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes");
-        }
         if let Ok(v) = std::env::var("BULLETIN_LLM_BASE_URL") {
             if !v.trim().is_empty() {
                 cfg.base_url = v.trim().trim_end_matches('/').to_string();
@@ -660,7 +655,8 @@ pub struct SummarizeStats {
 
 /// Run a best-effort cluster-summarization sweep over **public** clusters, in the no-subscriber RLS
 /// context (so it can only touch shared rows, §3.5). Public summaries are generated once and shared by
-/// every subscriber (the §5 multiplier saving). A no-op when `cfg.enabled` is false.
+/// every subscriber (the §5 multiplier saving). Only exists in a `llm-summarization` build — the
+/// feature is the kill switch.
 ///
 /// Best-effort by contract (`thread-layer.md` §3.1): a per-cluster failure degrades that cluster to
 /// its deterministic baseline and the sweep continues; nothing here ever blocks or fails a digest.
@@ -673,8 +669,8 @@ pub async fn sweep_public(
 }
 
 /// Run a best-effort cluster-summarization sweep over one subscriber's **private** clusters, in their
-/// RLS context (per-unit, stateless — no cross-tenant content in one call, §3.5). A no-op when
-/// `cfg.enabled` is false.
+/// RLS context (per-unit, stateless — no cross-tenant content in one call, §3.5). Only exists in a
+/// `llm-summarization` build — the feature is the kill switch.
 #[cfg(feature = "llm-summarization")]
 pub async fn sweep_private(
     pool: &sqlx::PgPool,
@@ -707,9 +703,6 @@ async fn sweep(
     use crate::common::db::with_scope;
     use anyhow::Context;
 
-    if !cfg.enabled {
-        return Ok(SummarizeStats::default());
-    }
     let model = cfg.summary_model();
     let scope = scope.clone();
     let cfg = cfg.clone();
@@ -976,9 +969,8 @@ mod tests {
     }
 
     #[test]
-    fn summary_model_string_and_env_default_off() {
+    fn summary_model_string() {
         let cfg = SummarizationConfig::default();
-        assert!(!cfg.enabled);
         assert_eq!(cfg.summary_model(), "qwen3.5-4b-instruct@1");
     }
 }

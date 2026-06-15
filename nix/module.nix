@@ -125,9 +125,13 @@ in
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = self.packages.${pkgs.stdenv.hostPlatform.system}.bulletin;
-      defaultText = lib.literalExpression "bulletin.packages.\${system}.bulletin";
-      description = "The `bulletin` package to run.";
+      # The compile-time kill switch in action: `llm.enable` selects the summarization-enabled build
+      # (`bulletin-llm`) over the plain `bulletin`. There is no runtime flag — off genuinely ships a
+      # binary with no summarization code. Override this to pin a specific build.
+      default =
+        self.packages.${pkgs.stdenv.hostPlatform.system}.${if cfg.llm.enable then "bulletin-llm" else "bulletin"};
+      defaultText = lib.literalExpression "bulletin.packages.\${system}.\${if llm.enable then \"bulletin-llm\" else \"bulletin\"}";
+      description = "The `bulletin` package to run. Defaults to the LLM-enabled build when `llm.enable`.";
     };
 
     database = {
@@ -252,12 +256,13 @@ in
         type = lib.types.bool;
         default = false;
         description = ''
-          Turn on LLM cluster summarization (docs/llm-summarization.md, Phase A). Sets
-          `BULLETIN_LLM_ENABLED=1` for the worker, which runs a best-effort, off-the-punctual-path
-          summarization sweep after each public build, calling the local sidecar at `llm.baseUrl`.
-          Off ⇒ the deterministic digest baseline ships unchanged (the package already compiles the
-          feature in, so toggling this needs no rebuild). Pair with `llm.serveLocally` to also run the
-          sidecar on this host. No data egress: the sidecar is 100% local (design §12).
+          Turn on LLM cluster summarization (docs/llm-summarization.md, Phase A). This is a
+          **compile-time** switch: it selects the `bulletin-llm` build (the `llm-summarization` cargo
+          feature) over the plain `bulletin`, whose worker runs a best-effort, off-the-punctual-path
+          summarization sweep after each public build against the sidecar at `llm.baseUrl`. Off ⇒ a
+          binary with **no** summarization code at all (the deterministic digest baseline) — there is
+          no runtime flag. Pair with `llm.serveLocally` to also run the sidecar on this host. No data
+          egress: the sidecar is 100% local (design §12).
         '';
       };
       baseUrl = lib.mkOption {
@@ -434,9 +439,8 @@ in
         BULLETIN_EMAIL_FILE_DIR = "%S/bulletin/outbox";
       }
       // lib.optionalAttrs cfg.llm.enable {
-        # Flip on the worker's summarization sweep + point it at the sidecar. The package already
-        # compiles the feature in, so this is a pure runtime toggle.
-        BULLETIN_LLM_ENABLED = "1";
+        # Configure (not enable — the feature build is the switch) the worker's summarization sidecar:
+        # where it lives, which model, which prompt version.
         BULLETIN_LLM_BASE_URL = cfg.llm.baseUrl;
         BULLETIN_LLM_MODEL = cfg.llm.model;
         BULLETIN_LLM_PROMPT_VERSION = toString cfg.llm.promptVersion;

@@ -195,14 +195,12 @@ async fn public_build(
 /// Best-effort public cluster-summarization sweep, hung off a completed PublicBuild (the natural
 /// `summary_hash`-invalidation point, docs/llm-summarization.md §5). Runs in the no-subscriber RLS
 /// context inside `core`; shared public summaries are generated once for everybody (the §5 multiplier
-/// saving). Compiled in only with `llm-summarization` and a no-op until `BULLETIN_LLM_ENABLED` + a
-/// reachable sidecar are configured. Never propagates an error — summarization is not the deliverable.
+/// saving). The `llm-summarization` cargo feature is the **sole** kill switch — without it this is the
+/// empty no-op below and no summarization code is compiled. The `BULLETIN_LLM_*` env only *configures*
+/// the sidecar (URL/model). Never propagates an error — summarization is not the deliverable.
 #[cfg(feature = "llm-summarization")]
 async fn summarize_public(pool: &PgPool) {
     let cfg = bulletin_core::summarize::SummarizationConfig::from_env();
-    if !cfg.enabled {
-        return;
-    }
     match bulletin_core::summarize::sweep_public(pool, &cfg).await {
         Ok(stats) => tracing::info!(
             summarized = stats.summarized,
