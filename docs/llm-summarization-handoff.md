@@ -149,13 +149,24 @@ is the only switch — without it `summarize_public` is an empty no-op and no su
    **Still open:** the `tldr` run-list → inline entity **badges** (§6.2, needs identity resolution at
    render), and the full §6 four-zone redesign (context eyebrow, deterministic provenance line replacing
    the "Related"/"Why" captions, deleting the amber debug block) — the flat `tldr_text` ships first.
-2. **Wire the comprehension pass into `extract_facts`** (Phase 2, `local-ml-options.md` §6): GLiNER
-   spans + a tiny constrained LLM for `event_type` / `state` / per-fact `certainty`. This is what makes
-   the hedge rule (§3.6) and the numeric gate actually sharp. Until then the summarizer is honest but
-   blunt.
-3. **Wire the private sweep.** Add a best-effort `summarize_private` step (a new apalis job, or fold
-   into `thread_maintenance` which already walks the subscriber's stories) calling
-   `summarize::sweep_private`. Keep it off `generate()`.
+2. ~~**Wire the comprehension pass into `extract_facts`**~~ **Done (2026-06-16).** A tiny
+   grammar-constrained comprehension call now runs **before** the summarizer
+   (`summarize::client::comprehend_cluster`), classifying `event_type` / `state` / `certainty` and
+   folding them onto the deterministic `Facts` skeleton via `apply_comprehension` (closed-vocab
+   re-validated against `EVENT_TYPES` / `STATES`, defense-in-depth). Reasoning is free (an `analysis`
+   scratchpad — CRANE, avoid the "grammar tax"), only the classification is enum-constrained. The
+   summarizer's hedge rule (§3.6) is now a mechanical branch on `facts.certainty`, not an inference.
+   It is itself best-effort: off (`comprehend = false`) or unavailable ⇒ neutral defaults (asserted,
+   plain), the safe direction. **Deviation from the design's GLiNER + tiny-LLM split:** the entity-span
+   half is already served by M3's namespaced entity tokens (`facts.entities` from ground truth), so
+   only the *reasoning* half (type/state/stance) is an LLM call — no separate span model deployed.
+   `prompt_version` bumped to `2` (code + nix module) so the corpus re-summarizes with the richer facts.
+3. ~~**Wire the private sweep.**~~ **Done (2026-06-16).** `summarize_private` (the private mirror of
+   `summarize_public`) is folded into the `thread_maintenance` worker job — the per-subscriber,
+   due-gated, best-effort pass that already walks the subscriber's content — calling
+   `summarize::sweep_private` in the owner's RLS context. It runs regardless of the maintenance outcome
+   and never fails the job; kept off `generate()`. (It therefore rides `thread-weighting`'s cadence;
+   the realistic `llm-summarization` build keeps `thread-weighting` on by default, so both run.)
 4. **Phase B — thread label + delta eyebrow** (§2.3, §6.1): the migration's thread columns +
    `thread_maintenance` producing the readable label and the watermarked delta.
 5. **Phase C — story synthesis** (§2.2): the story columns + member-signature-cached cross-source

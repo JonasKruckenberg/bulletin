@@ -11,8 +11,9 @@ use serde::Deserialize;
 
 use crate::common::event::Event;
 use crate::summarize::{
-    baseline, extract_facts, faithful, response_schema, source_corpus, user_prompt, Band,
-    ClusterSummary, Facts, SummarizationConfig, TldrRun, SYSTEM_PROMPT,
+    apply_comprehension, baseline, comprehend_user_prompt, comprehension_schema, extract_facts,
+    faithful, response_schema, source_corpus, user_prompt, Band, ClusterSummary, Comprehension,
+    Facts, SummarizationConfig, TldrRun, COMPREHEND_SYSTEM_PROMPT, SYSTEM_PROMPT,
 };
 
 /// Summarize one cluster: extract-then-summarize (§3.2) — hand the model the pre-extracted facts +
@@ -32,8 +33,17 @@ pub async fn summarize_cluster(
     title: &str,
     events: &[Event],
 ) -> Option<ClusterSummary> {
-    let facts = extract_facts(events);
+    let mut facts = extract_facts(events);
     let source = source_corpus(events, cfg.max_source_chars);
+
+    // Extract-then-summarize (§3.2): run the comprehension pass first so the summarizer's hedge rule
+    // (§3.6) is a mechanical branch on `facts.certainty`/`state`, not an inference. Best-effort — a
+    // failed/disabled comprehension leaves the neutral defaults (asserted, plain), the safe direction.
+    if cfg.comprehend {
+        if let Some(comp) = comprehend_cluster(cfg, http, &facts, &source).await {
+            apply_comprehension(&mut facts, &comp);
+        }
+    }
 
     let candidate = match call_model(cfg, http, &facts, &source).await {
         Ok(c) => c,
@@ -67,6 +77,47 @@ pub async fn summarize_cluster(
     Some(summary)
 }
 
+/// Run the comprehension pass for one cluster (§3.2, `local-ml-options.md` §6): a constrained chat
+/// completion that classifies `event_type` / `state` / `certainty` over the deterministically-extracted
+/// grounding + source text. Reasoning is free (the `analysis` scratchpad), only the classification is
+/// grammar-constrained (CRANE — avoid the reasoning "grammar tax").
+///
+/// Returns `None` on any failure (transport, non-2xx, malformed JSON) — comprehension is itself
+/// best-effort, so the caller proceeds with the neutral facts rather than blocking the summary.
+async fn comprehend_cluster(
+    cfg: &SummarizationConfig,
+    http: &reqwest::Client,
+    facts: &Facts,
+    source: &str,
+) -> Option<Comprehension> {
+    match call_comprehension(cfg, http, facts, source).await {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::debug!(error = %e, "comprehension call failed; summarizing with neutral facts");
+            None
+        }
+    }
+}
+
+/// POST one grammar-constrained comprehension completion and parse the classified output. Errors
+/// bubble up to [`comprehend_cluster`], which degrades to neutral facts.
+async fn call_comprehension(
+    cfg: &SummarizationConfig,
+    http: &reqwest::Client,
+    facts: &Facts,
+    source: &str,
+) -> anyhow::Result<Comprehension> {
+    chat_json(
+        cfg,
+        http,
+        COMPREHEND_SYSTEM_PROMPT,
+        comprehend_user_prompt(facts, source),
+        cfg.comprehension_max_tokens,
+        comprehension_schema(),
+    )
+    .await
+}
+
 /// The source-kind labels a cluster's events came from, in event order (the baseline tldr sorts +
 /// dedups them, so no need to here).
 fn source_labels(events: &[Event]) -> Vec<&'static str> {
@@ -83,28 +134,49 @@ struct ModelOutput {
     tldr: Vec<TldrRun>,
 }
 
-/// POST one grammar-constrained chat completion to the local sidecar and parse the structured output.
-/// Errors (transport, non-success status, malformed envelope/JSON) bubble up to the caller, which
-/// degrades to baseline.
+/// POST one grammar-constrained summarization completion and parse the structured output. Errors
+/// bubble up to the caller, which degrades to baseline.
 async fn call_model(
     cfg: &SummarizationConfig,
     http: &reqwest::Client,
     facts: &Facts,
     source: &str,
 ) -> anyhow::Result<ModelOutput> {
-    use serde_json::json;
+    chat_json(
+        cfg,
+        http,
+        SYSTEM_PROMPT,
+        user_prompt(facts, source),
+        cfg.headline_max_tokens + cfg.tldr_max_tokens + 64,
+        response_schema(&facts.entities),
+    )
+    .await
+}
 
-    let body = json!({
+/// The shared chat-completion plumbing every summarization call routes through (the summarizer, the
+/// comprehension pass, and Phase C's story synthesis later): build the OpenAI-compatible body with the
+/// `response_format: json_schema` (llama.cpp's GBNF token-masking → structurally valid JSON), POST to
+/// the local sidecar, and deserialize `choices[0].message.content` into `T`. Errors (transport,
+/// non-success status, malformed envelope/JSON) bubble up to the caller, which degrades to its
+/// deterministic fallback.
+async fn chat_json<T: serde::de::DeserializeOwned>(
+    cfg: &SummarizationConfig,
+    http: &reqwest::Client,
+    system: &str,
+    user: String,
+    max_tokens: u32,
+    schema: serde_json::Value,
+) -> anyhow::Result<T> {
+    let body = serde_json::json!({
         "model": cfg.model,
         "messages": [
-            { "role": "system", "content": SYSTEM_PROMPT },
-            { "role": "user", "content": user_prompt(facts, source) }
+            { "role": "system", "content": system },
+            { "role": "user", "content": user }
         ],
         "temperature": cfg.temperature,
         "seed": cfg.seed,
-        "max_tokens": cfg.headline_max_tokens + cfg.tldr_max_tokens + 64,
-        // llama.cpp turns this JSON schema into a GBNF grammar → structurally valid JSON guaranteed.
-        "response_format": { "type": "json_schema", "json_schema": response_schema(&facts.entities) }
+        "max_tokens": max_tokens,
+        "response_format": { "type": "json_schema", "json_schema": schema }
     });
 
     let resp = http

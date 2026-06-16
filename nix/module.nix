@@ -72,6 +72,23 @@ let
   llmPort = lib.toInt (lib.last (lib.splitString ":" llmAuthority));
   llmPackage = if cfg.llm.package != null then cfg.llm.package else pkgs.llama-cpp;
 
+  # Where the GGUF the sidecar serves lives. An explicit `modelPath` wins (the manual / `fetchurl`
+  # paths); otherwise, when `modelUrl` is set, it is derived into a dedicated, world-readable dir
+  # (`/var/lib/bulletin-models`, *not* under the 0700 state dir — the llama-cpp sidecar runs as its
+  # own user and must be able to read the file). `null` when neither is configured.
+  llmModelBasename = lib.last (lib.splitString "/" cfg.llm.modelUrl);
+  llmModelDir = "/var/lib/bulletin-models";
+  llmModelPath =
+    if cfg.llm.modelPath != null then
+      toString cfg.llm.modelPath
+    else if cfg.llm.modelUrl != null then
+      "${llmModelDir}/${llmModelBasename}"
+    else
+      null;
+  # Whether the module provisions the fetch-on-activation oneshot (declarative URL + hash → /var/lib).
+  # Independent of `modelPath`: with both set, it fetches into the explicit path.
+  llmFetchModel = cfg.llm.serveLocally && cfg.llm.modelUrl != null;
+
   # Root-readable secret env files loaded via systemd `EnvironmentFile` (SMTP creds + the sealed
   # GitHub App credentials), so neither enters the Nix store.
   envSecretFiles =
@@ -282,17 +299,18 @@ in
       };
       promptVersion = lib.mkOption {
         type = lib.types.int;
-        default = 1;
+        default = 2;
         description = "Prompt/schema version; bump to invalidate + re-summarize the whole corpus.";
       };
       serveLocally = lib.mkOption {
         type = lib.types.bool;
         default = false;
         description = ''
-          Provision a local `llama-server` (llama.cpp) sidecar via `services.llama-cpp`, serving
-          `llm.modelPath` on the port parsed from `llm.baseUrl`. The bulletin worker is ordered after
-          it. Requires `llm.modelPath`. On Apple-silicon/Asahi, set `llm.package` to a Vulkan build and
-          mind the shader-cache env (`local-ml-options.md` §2/§4).
+          Provision a local `llama-server` (llama.cpp) sidecar via `services.llama-cpp`, serving the
+          GGUF on the port parsed from `llm.baseUrl`. The bulletin worker is ordered after it. Requires
+          a model — either `llm.modelPath` or `llm.modelUrl` + `llm.modelSha256` (see `modelPath`). On
+          Apple-silicon/Asahi, set `llm.package` to a Vulkan build and mind the shader-cache env
+          (`local-ml-options.md` §2/§4).
         '';
       };
       package = lib.mkOption {
@@ -304,8 +322,40 @@ in
       modelPath = lib.mkOption {
         type = lib.types.nullOr lib.types.path;
         default = null;
-        example = "/var/lib/bulletin/models/qwen3.5-4b-instruct-q4_k_m.gguf";
-        description = "Path to the GGUF model file served by the local sidecar. Required when `llm.serveLocally = true`.";
+        example = "/var/lib/bulletin-models/qwen3.5-4b-instruct-q4_k_m.gguf";
+        description = ''
+          Path to the GGUF model file the local sidecar serves. With `llm.serveLocally = true` you must
+          supply the model one of three ways: set `modelPath` to a file you place out of band; set it
+          to a `pkgs.fetchurl { … }` store path (declarative + reproducible, but the multi-GB blob then
+          rides your Nix store / binary cache); or — the recommended hybrid — leave it unset and give
+          `llm.modelUrl` + `llm.modelSha256`, and the module fetches + verifies the GGUF into
+          `/var/lib/bulletin-models` on activation (declarative reference, no store/cache bloat). When
+          both `modelPath` and `modelUrl` are set, the fetch writes into `modelPath`.
+        '';
+      };
+      modelUrl = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "https://huggingface.co/.../qwen3.5-4b-instruct-q4_k_m.gguf";
+        description = ''
+          URL of the GGUF model to fetch on activation (the recommended hybrid for `serveLocally`): a
+          `bulletin-model-fetch` oneshot downloads it into `modelPath` (default
+          `/var/lib/bulletin-models/<basename>`) if absent or hash-mismatched, ordered before the
+          sidecar so a missing/corrupt model fails loudly rather than degrading silently to baselines.
+          Idempotent — a present, verified file is a no-op. Requires `llm.modelSha256`. The model is not
+          secret (it never needs agenix); keep it out of the 0700 state dir so the sidecar's user can
+          read it (the default dir is world-readable).
+        '';
+      };
+      modelSha256 = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        description = ''
+          The expected SHA-256 of `llm.modelUrl`, as the hex digest `sha256sum` prints (64 hex chars —
+          *not* the SRI / nix-base32 form). The fetch oneshot rejects a download whose hash differs.
+          Required whenever `llm.modelUrl` is set.
+        '';
       };
     };
 
@@ -327,8 +377,12 @@ in
         message = ''services.bulletin: email.transport = "smtp" requires email.smtpSecretFile.'';
       }
       {
-        assertion = !cfg.llm.serveLocally || cfg.llm.modelPath != null;
-        message = "services.bulletin: llm.serveLocally = true requires llm.modelPath (a GGUF file).";
+        assertion = !cfg.llm.serveLocally || llmModelPath != null;
+        message = "services.bulletin: llm.serveLocally = true requires a model — set llm.modelPath, or llm.modelUrl + llm.modelSha256.";
+      }
+      {
+        assertion = cfg.llm.modelUrl == null || cfg.llm.modelSha256 != null;
+        message = "services.bulletin: llm.modelUrl requires llm.modelSha256 (the hex sha256 to verify the download against).";
       }
     ];
 
@@ -377,9 +431,61 @@ in
     services.llama-cpp = lib.mkIf cfg.llm.serveLocally {
       enable = true;
       package = llmPackage;
-      model = cfg.llm.modelPath;
+      model = llmModelPath;
       host = "127.0.0.1";
       port = llmPort;
+    };
+
+    # When the model is fetched declaratively, gate the sidecar on a verified file: chain
+    # model-fetch → llama-cpp → bulletin so a missing/corrupt GGUF fails at activation (and, under
+    # deploy-rs, rolls the generation back) rather than the worker silently degrading to baselines.
+    systemd.services.llama-cpp = lib.mkIf llmFetchModel {
+      after = [ "bulletin-model-fetch.service" ];
+      requires = [ "bulletin-model-fetch.service" ];
+    };
+
+    # Fetch-on-activation oneshot (docs/llm-summarization.md): download `llm.modelUrl` into the model
+    # path and verify its sha256, only when missing or mismatched (idempotent — a present, verified
+    # file is a no-op, so a rebuild doesn't re-pull a 2.5 GB blob). The download stays out of the Nix
+    # store / binary cache; only the URL + hash are declarative. Runs as root, writes a world-readable
+    # file the sidecar's own user can read.
+    systemd.services.bulletin-model-fetch = lib.mkIf llmFetchModel {
+      description = "Fetch + verify the Bulletin summarization model (GGUF)";
+      # Pulled in + ordered by llama-cpp's `requires`/`after` above — no wantedBy/before needed here.
+      path = [
+        pkgs.curl
+        pkgs.coreutils
+      ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+      };
+      script = ''
+        set -euo pipefail
+        dest=${lib.escapeShellArg llmModelPath}
+        url=${lib.escapeShellArg cfg.llm.modelUrl}
+        want=${lib.escapeShellArg (lib.toLower (toString cfg.llm.modelSha256))}
+
+        if [ -f "$dest" ] && [ "$(sha256sum "$dest" | cut -d' ' -f1)" = "$want" ]; then
+          echo "model present and verified: $dest"
+          exit 0
+        fi
+
+        mkdir -p "$(dirname "$dest")"
+        tmp="$dest.partial"
+        echo "fetching summarization model: $url"
+        curl -fL --retry 3 --retry-delay 5 -o "$tmp" "$url"
+
+        got="$(sha256sum "$tmp" | cut -d' ' -f1)"
+        if [ "$got" != "$want" ]; then
+          rm -f "$tmp"
+          echo "sha256 mismatch for $url: got $got, want $want" >&2
+          exit 1
+        fi
+        mv -f "$tmp" "$dest"
+        chmod 0644 "$dest"
+        echo "model ready: $dest"
+      '';
     };
 
     networking.firewall.allowedTCPPorts = lib.mkIf cfg.openFirewall [ httpPort ];
