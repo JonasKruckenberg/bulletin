@@ -207,10 +207,14 @@ fn render_plain(
     items: &[RenderItem],
 ) -> String {
     // Join the lead onto the greeting only when there is one, so an empty lead leaves no dangling space.
+    // Both are untrusted: the greeting carries the subscriber-set name, and the lead is composed from
+    // item headlines — which are LLM output, and an LLM is steerable by indirect prompt injection
+    // through the feed content it summarized. The HTML view escapes them; the plaintext view has no
+    // markup to escape but still strips control/bidi characters so neither can mangle the line.
     let opening = if lead.is_empty() {
-        greeting.to_string()
+        clean(greeting)
     } else {
-        format!("{greeting} {lead}")
+        format!("{} {}", clean(greeting), clean(lead))
     };
     let mut body = format!(
         "{opening}\n\nYour digest for the window ending {}\n\n",
@@ -271,6 +275,8 @@ fn render_plain(
 /// Plaintext fallback for the empty digest: the cheerful counterpart to [`render_plain`], opened
 /// with the time-of-day salutation so it matches the populated digest's voice.
 fn render_empty_plain(window_end: DateTime<Utc>, tz: Tz, salutation: &str) -> String {
+    // The salutation carries the subscriber-set name — strip control/bidi chars for the plaintext view.
+    let salutation = clean(salutation);
     format!(
         "{salutation}. You're all caught up!\n\n\
          No new items in the window ending {}.\n\
@@ -1370,5 +1376,101 @@ mod tests {
 
         assert!(plain.starts_with("Good evening. You're all caught up!"));
         assert!(plain.contains("2026-06-13 09:00 UTC"));
+    }
+
+    // ── Untrusted-input hardening (feed text AND LLM output) ─────────────────────────────────────
+    //
+    // The headline/tldr/label/surface fields are LLM output, and an LLM is steerable by *indirect
+    // prompt injection* through the feed content it summarized — so they are exactly as untrusted as
+    // the raw feed, and the faithfulness gate (grounding/voice/length) is not an injection defense.
+    // The renderer is the trust boundary: it escapes/cleans every interpolated string by sink,
+    // regardless of provenance. These tests pin that down.
+
+    #[test]
+    fn llm_and_feed_text_is_escaped_and_stripped_in_html() {
+        // A prompt-injected summary tries to smuggle script markup and Trojan-Source spoofing chars
+        // (a bidi override + a zero-width space) through the headline and the tldr.
+        let evil_headline = "Safe news\u{202E}<script>alert(1)</script>\u{200B}";
+        let evil_tldr = "A summary with <img src=x onerror=alert(1)> then \u{202E}reversed.";
+        let item = summarized(
+            "raw",
+            evil_headline,
+            evil_tldr,
+            Some("https://example.com"),
+            SourceKind::Rss,
+        );
+        let html = render_one(&item);
+
+        // No live markup survives from either field; the angle brackets are entitized.
+        assert!(!html.contains("<script>"));
+        assert!(!html.contains("<img"));
+        assert!(html.contains("&lt;script&gt;"));
+        // The bidi-override and zero-width characters are stripped entirely.
+        assert!(!html.contains('\u{202E}'));
+        assert!(!html.contains('\u{200B}'));
+    }
+
+    #[test]
+    fn unsafe_link_schemes_drop_to_plain_text() {
+        // A javascript:/data:/vbscript: feed link must never become a live href — HTML-escaping does
+        // not stop the scheme. The item renders unlinked instead, and the payload never appears.
+        for scheme in [
+            "javascript:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "vbscript:msgbox(1)",
+        ] {
+            let item = summarized("raw", "H", "S", Some(scheme), SourceKind::Rss);
+            let html = render_one(&item);
+            assert!(!html.contains(r#"href="javascript:"#));
+            assert!(!html.contains(r#"href="data:"#));
+            assert!(!html.contains(r#"href="vbscript:"#));
+            assert!(!html.contains("<script>"));
+            // Unlinked: the headline is a span, not an anchor.
+            assert!(html.contains(r#"<span class="headline""#));
+        }
+        // A legitimate https link is still emitted as a live href.
+        let ok = summarized("raw", "H", "S", Some("https://example.com/x"), SourceKind::Rss);
+        assert!(render_one(&ok).contains(r#"href="https://example.com/x""#));
+    }
+
+    #[test]
+    fn malicious_entity_badge_surface_is_escaped() {
+        // The model chooses each entity badge's `surface` display text — escape it like any other run.
+        let item = RenderItem {
+            summary: "x".to_string(),
+            summary_runs: vec![TldrRun::Ref {
+                entity: "repo:acme/auth".to_string(),
+                surface: "<script>alert(1)</script>".to_string(),
+            }],
+            summary_band: Band::Confirmed,
+            ..item("t", None, SourceKind::Github)
+        };
+        let html = render_one(&item);
+        assert!(!html.contains("<script>"));
+        assert!(html.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn plaintext_lead_and_fields_are_stripped_of_control_chars() {
+        // The plaintext lead is composed from (LLM) headlines and has no markup to escape, but bidi /
+        // zero-width characters must still be stripped so they can't reorder or hide the line.
+        let items = vec![summarized(
+            "raw",
+            "Headline\u{202E}flip\u{200B}",
+            "Body\u{202E}text",
+            Some("javascript:alert(1)"),
+            SourceKind::Rss,
+        )];
+        let plain = render_plain(
+            Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
+            Tz::UTC,
+            "Good morning.",
+            &compose_lead(&items),
+            &items,
+        );
+        assert!(!plain.contains('\u{202E}'));
+        assert!(!plain.contains('\u{200B}'));
+        // The unsafe-schemed link is dropped from the plaintext view too (never shown, even as text).
+        assert!(!plain.contains("javascript:"));
     }
 }
