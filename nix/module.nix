@@ -434,11 +434,21 @@ in
       model = llmModelPath;
       host = "127.0.0.1";
       port = llmPort;
-      # `--jinja` makes llama-server honour the model's chat template and the worker's
-      # `chat_template_kwargs` — notably `enable_thinking: false`, which stops a reasoning model
-      # (Qwen3 et al.) from spending the small summary token budget on a `<think>` block and returning
-      # an empty completion (the "EOF while parsing a value at line 1 column 0" / timeout symptoms).
-      extraFlags = [ "--jinja" ];
+      # Stop a reasoning model (Qwen3 et al.) from spending the small summary token budget on a
+      # `<think>` block and returning an empty completion — the "EOF while parsing a value at line 1
+      # column 0" / timeout symptoms. Two llama.cpp knobs from the server README, belt-and-suspenders:
+      #   --jinja             enables the template path the worker's `chat_template_kwargs`
+      #                       (`enable_thinking: false`) and reasoning parsing both need.
+      #   --reasoning-budget 0  "immediate end" of thinking, enforced server-side for *every* request
+      #                       regardless of the model's template — the reliable switch, since
+      #                       `enable_thinking: false` is template-dependent and not always honoured
+      #                       (llama.cpp#13189). Requires a recent llama.cpp; verify against the pinned
+      #                       nixpkgs (this surface is fast-moving — see the handoff doc).
+      extraFlags = [
+        "--jinja"
+        "--reasoning-budget"
+        "0"
+      ];
     };
 
     # When the model is fetched declaratively, gate the sidecar on a verified file: chain

@@ -142,15 +142,24 @@ is the only switch — without it `summarize_public` is an empty no-op and no su
   against current nixpkgs — **verify against the pinned nixpkgs** before deploying
   (`local-ml-options.md` §9 flags this surface as fast-moving). The module was not `nix`-evaluated in CI
   (no nix in the build env). The module passes `extraFlags = [ "--jinja" ]` so the sidecar honours the
-  worker's `chat_template_kwargs` (the `enable_thinking: false` thinking toggle, below).
+  worker's `chat_template_kwargs` and `--reasoning-budget 0` (the thinking switches, below).
 - **Reasoning models / empty completions.** A reasoning model (Qwen3 et al.) left in "thinking" mode
-  spends the short `max_tokens` budget on a `<think>` block and returns an **empty** `content` — which
-  surfaces as `EOF while parsing a value at line 1 column 0` — or blows the request timeout producing
-  it. Mitigated in three layers: the request sends `chat_template_kwargs: {enable_thinking: false}`
-  (config `disable_thinking`, default on; needs `--jinja`); `client::strip_reasoning` drops any leading
-  `<think>…</think>` still inlined into `content`; and an empty completion now bails with a clear,
-  classifiable message (`failure_kind = "response"`) carrying `finish_reason`, instead of a bare serde
-  EOF. The cluster then degrades to baseline / retries, as for any other sidecar failure.
+  spends the short `max_tokens` budget on a `<think>` block; llama.cpp's default
+  `--reasoning-format auto`/`deepseek` then routes the thoughts to `message.reasoning_content` and
+  leaves `content` **empty** — which serde reports as `EOF while parsing a value at line 1 column 0` —
+  or the thinking blows the request timeout outright. Mitigated in layers, grounded in the
+  [llama.cpp server README](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md):
+  - **Server (the reliable switch):** the module runs the sidecar with `--jinja --reasoning-budget 0`
+    ("immediate end" of thinking, enforced for every request regardless of the model template —
+    `enable_thinking: false` alone is template-dependent and not always honoured, llama.cpp#13189).
+  - **Request:** every call sends `chat_template_kwargs: {enable_thinking: false}` (config
+    `disable_thinking`, default on; honoured on the `--jinja` path) as a second layer for templates
+    that respect it.
+  - **Client (defense in depth):** `client::strip_reasoning` drops any leading `<think>…</think>` still
+    inlined into `content` (the `--reasoning-format none` shape), and an empty completion now bails with
+    a clear, classifiable message (`failure_kind = "response"`) carrying `finish_reason` and naming the
+    `reasoning_content`-only case, instead of a bare serde EOF. The cluster then degrades to baseline /
+    retries, as for any other sidecar failure.
 - **Operational knobs are env-tunable** (no recompile): `BULLETIN_LLM_REQUEST_TIMEOUT_SECS` (raise on
   slow hardware — default `120`), `BULLETIN_LLM_COMPREHEND` (`false` drops the extra per-cluster
   comprehension call to halve sidecar load when timeouts bite), and `BULLETIN_LLM_DISABLE_THINKING`

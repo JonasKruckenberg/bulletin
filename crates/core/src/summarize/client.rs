@@ -382,17 +382,33 @@ async fn chat_json<T: serde::de::DeserializeOwned>(
         .next()
         .ok_or_else(|| anyhow::anyhow!("sidecar response had no choices"))?;
 
-    // Drop a leading `<think>…</think>` block a reasoning model may still inline into `content` (when
-    // the sidecar isn't masking it itself), then require a non-empty remainder. An empty completion
-    // means the model produced no JSON for us to parse — a clear, classifiable message beats the
-    // downstream serde EOF, and the caller degrades the cluster to baseline / retries it.
+    // Drop a leading `<think>…</think>` block a reasoning model may still inline into `content` (the
+    // llama.cpp `--reasoning-format none` shape), then require a non-empty remainder. When a reasoning
+    // model is left thinking, llama.cpp's default `--reasoning-format auto`/`deepseek` instead routes
+    // the thoughts to `message.reasoning_content` and leaves `content` empty — the exact source of the
+    // downstream serde "EOF while parsing a value at line 1 column 0". Name which case it is so the
+    // operator can act; the caller then degrades the cluster to baseline / retries it.
+    let finish_reason = choice
+        .finish_reason
+        .unwrap_or_else(|| "unknown".to_string());
+    let reasoning_len = choice
+        .message
+        .reasoning_content
+        .as_deref()
+        .map_or(0, |r| r.trim().len());
     let content = strip_reasoning(&choice.message.content);
     if content.is_empty() {
+        if reasoning_len > 0 {
+            anyhow::bail!(
+                "sidecar returned only reasoning and no content (finish_reason: {finish_reason}, \
+                 reasoning_content: {reasoning_len} bytes) — the model is thinking instead of \
+                 answering. Disable thinking server-side (`--reasoning-budget 0`) or per-request \
+                 (`chat_template_kwargs.enable_thinking=false`), or raise max_tokens"
+            );
+        }
         anyhow::bail!(
-            "sidecar returned an empty completion (finish_reason: {}); the model produced no content \
-             to parse — often a reasoning model spending its max_tokens on thinking, or max_tokens set \
-             too low",
-            choice.finish_reason.as_deref().unwrap_or("unknown")
+            "sidecar returned an empty completion (finish_reason: {finish_reason}); the model produced \
+             no content to parse — raise max_tokens, or check the sidecar"
         );
     }
     serde_json::from_str(content)
@@ -445,6 +461,12 @@ struct ChatChoice {
 struct ChatMessage {
     #[serde(default)]
     content: String,
+    /// The thoughts a reasoning model emits when llama.cpp parses them out of `content` (the
+    /// `--reasoning-format deepseek`/`auto` shape, per the server README). Captured only to tell an
+    /// empty-`content` completion that *was* reasoning (the thinking-overran-the-budget case) from one
+    /// that was genuinely empty — it is never used as the answer.
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 #[cfg(test)]
