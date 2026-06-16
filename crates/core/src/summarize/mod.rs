@@ -471,31 +471,30 @@ out: {"analysis":"A deploy broke logins and was rolled back; the source states i
 source: A high-severity advisory appears to affect billing's PDF path; no patch yet, still under investigation.
 out: {"analysis":"A security advisory that may affect billing; the source hedges and is still investigating.","certainty":"tentative","event_type":"advisory","state":"investigating"}"#;
 
+/// Format a fact list for a prompt line: comma-joined, or the literal `(none)` for an empty list (so
+/// the model is *told* a category is empty rather than left to infer it from a blank value). Shared by
+/// the comprehension and summarization prompts.
+fn list_or_none(items: &[String]) -> String {
+    if items.is_empty() {
+        "(none)".to_string()
+    } else {
+        items.join(", ")
+    }
+}
+
 /// The per-cluster comprehension user prompt: the deterministically-extracted grounding (entities,
 /// numbers, dates) + the budgeted source text + the concrete ask. Short and concrete over the §4
 /// pre-distilled inputs, like [`user_prompt`].
 pub fn comprehend_user_prompt(facts: &Facts, source_text: &str) -> String {
-    let entity_list = if facts.entities.is_empty() {
-        "(none)".to_string()
-    } else {
-        facts.entities.join(", ")
-    };
-    let numbers = if facts.numbers.is_empty() {
-        "(none)".to_string()
-    } else {
-        facts.numbers.join(", ")
-    };
-    let dates = if facts.dates.is_empty() {
-        "(none)".to_string()
-    } else {
-        facts.dates.join(", ")
-    };
     format!(
-        "entities: {entity_list}\n\
-         numbers: {numbers}\n\
-         dates: {dates}\n\
+        "entities: {}\n\
+         numbers: {}\n\
+         dates: {}\n\
          source:\n{source_text}\n\n\
-         Classify this event: analysis first, then event_type, state, certainty."
+         Classify this event: analysis first, then event_type, state, certainty.",
+        list_or_none(&facts.entities),
+        list_or_none(&facts.numbers),
+        list_or_none(&facts.dates),
     )
 }
 
@@ -725,11 +724,7 @@ out: {"headline":"Suspected SSRF in the invoice PDF renderer",
 /// The per-cluster user prompt (§3.6): the extracted facts + the closed entity-id set + the budgeted
 /// source text, with the concrete ask. Short and concrete, over the §4 pre-distilled inputs.
 pub fn user_prompt(facts: &Facts, source_text: &str) -> String {
-    let entity_list = if facts.entities.is_empty() {
-        "(none)".to_string()
-    } else {
-        facts.entities.join(", ")
-    };
+    let entity_list = list_or_none(&facts.entities);
     let facts_json = serde_json::to_string(facts).unwrap_or_else(|_| "{}".to_string());
     format!(
         "facts: {facts_json}\n\

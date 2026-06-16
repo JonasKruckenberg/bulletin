@@ -209,21 +209,38 @@ async fn public_build(
 #[cfg(feature = "llm-summarization")]
 async fn summarize_public(pool: &PgPool) {
     let cfg = bulletin_core::summarize::SummarizationConfig::from_env();
-    match bulletin_core::summarize::sweep_public(pool, &cfg).await {
+    report_sweep(
+        None,
+        bulletin_core::summarize::sweep_public(pool, &cfg).await,
+    );
+}
+
+#[cfg(not(feature = "llm-summarization"))]
+async fn summarize_public(_: &PgPool) {}
+
+/// Shared logging for a best-effort summarization sweep (public or private) — the one piece the two
+/// entry points actually share (their core calls differ in scope/arguments). `subscriber_id` is
+/// `Some` for a private sweep, `None` for the shared public one.
+#[cfg(feature = "llm-summarization")]
+fn report_sweep(
+    subscriber_id: Option<Uuid>,
+    result: anyhow::Result<bulletin_core::summarize::SummarizeStats>,
+) {
+    match result {
         Ok(stats) => tracing::info!(
+            ?subscriber_id,
             summarized = stats.summarized,
             skipped = stats.skipped,
             unavailable = stats.unavailable,
             "cluster summarization sweep complete"
         ),
-        Err(e) => {
-            tracing::warn!(error = %format!("{e:#}"), "cluster summarization sweep failed (non-fatal)")
-        }
+        Err(e) => tracing::warn!(
+            ?subscriber_id,
+            error = %format!("{e:#}"),
+            "cluster summarization sweep failed (non-fatal)"
+        ),
     }
 }
-
-#[cfg(not(feature = "llm-summarization"))]
-async fn summarize_public(_: &PgPool) {}
 
 async fn generate_digest(
     job: GenerateDigestJob,
@@ -310,20 +327,10 @@ async fn thread_maintenance(
 #[cfg(feature = "llm-summarization")]
 async fn summarize_private(pool: &PgPool, subscriber_id: Uuid) {
     let cfg = bulletin_core::summarize::SummarizationConfig::from_env();
-    match bulletin_core::summarize::sweep_private(pool, subscriber_id, &cfg).await {
-        Ok(stats) => tracing::info!(
-            subscriber_id = %subscriber_id,
-            summarized = stats.summarized,
-            skipped = stats.skipped,
-            unavailable = stats.unavailable,
-            "private cluster summarization sweep complete"
-        ),
-        Err(e) => tracing::warn!(
-            subscriber_id = %subscriber_id,
-            error = %format!("{e:#}"),
-            "private cluster summarization sweep failed (non-fatal)"
-        ),
-    }
+    report_sweep(
+        Some(subscriber_id),
+        bulletin_core::summarize::sweep_private(pool, subscriber_id, &cfg).await,
+    );
 }
 
 #[cfg(not(feature = "llm-summarization"))]

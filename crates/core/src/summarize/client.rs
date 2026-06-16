@@ -107,41 +107,15 @@ async fn call_comprehension(
     facts: &Facts,
     source: &str,
 ) -> anyhow::Result<Comprehension> {
-    use serde_json::json;
-
-    let body = json!({
-        "model": cfg.model,
-        "messages": [
-            { "role": "system", "content": COMPREHEND_SYSTEM_PROMPT },
-            { "role": "user", "content": comprehend_user_prompt(facts, source) }
-        ],
-        "temperature": cfg.temperature,
-        "seed": cfg.seed,
-        "max_tokens": cfg.comprehension_max_tokens,
-        "response_format": { "type": "json_schema", "json_schema": comprehension_schema() }
-    });
-
-    let resp = http
-        .post(format!("{}/chat/completions", cfg.base_url))
-        .header("content-type", "application/json")
-        .body(serde_json::to_string(&body)?)
-        .send()
-        .await?;
-
-    let status = resp.status();
-    let text = resp.text().await?;
-    if !status.is_success() {
-        anyhow::bail!("sidecar returned {status}: {text}");
-    }
-
-    let envelope: ChatResponse = serde_json::from_str(&text)?;
-    let content = envelope
-        .choices
-        .into_iter()
-        .next()
-        .map(|c| c.message.content)
-        .ok_or_else(|| anyhow::anyhow!("sidecar response had no choices"))?;
-    Ok(serde_json::from_str(&content)?)
+    chat_json(
+        cfg,
+        http,
+        COMPREHEND_SYSTEM_PROMPT,
+        comprehend_user_prompt(facts, source),
+        cfg.comprehension_max_tokens,
+        comprehension_schema(),
+    )
+    .await
 }
 
 /// The source-kind labels a cluster's events came from, in event order (the baseline tldr sorts +
@@ -160,28 +134,49 @@ struct ModelOutput {
     tldr: Vec<TldrRun>,
 }
 
-/// POST one grammar-constrained chat completion to the local sidecar and parse the structured output.
-/// Errors (transport, non-success status, malformed envelope/JSON) bubble up to the caller, which
-/// degrades to baseline.
+/// POST one grammar-constrained summarization completion and parse the structured output. Errors
+/// bubble up to the caller, which degrades to baseline.
 async fn call_model(
     cfg: &SummarizationConfig,
     http: &reqwest::Client,
     facts: &Facts,
     source: &str,
 ) -> anyhow::Result<ModelOutput> {
-    use serde_json::json;
+    chat_json(
+        cfg,
+        http,
+        SYSTEM_PROMPT,
+        user_prompt(facts, source),
+        cfg.headline_max_tokens + cfg.tldr_max_tokens + 64,
+        response_schema(&facts.entities),
+    )
+    .await
+}
 
-    let body = json!({
+/// The shared chat-completion plumbing every summarization call routes through (the summarizer, the
+/// comprehension pass, and Phase C's story synthesis later): build the OpenAI-compatible body with the
+/// `response_format: json_schema` (llama.cpp's GBNF token-masking → structurally valid JSON), POST to
+/// the local sidecar, and deserialize `choices[0].message.content` into `T`. Errors (transport,
+/// non-success status, malformed envelope/JSON) bubble up to the caller, which degrades to its
+/// deterministic fallback.
+async fn chat_json<T: serde::de::DeserializeOwned>(
+    cfg: &SummarizationConfig,
+    http: &reqwest::Client,
+    system: &str,
+    user: String,
+    max_tokens: u32,
+    schema: serde_json::Value,
+) -> anyhow::Result<T> {
+    let body = serde_json::json!({
         "model": cfg.model,
         "messages": [
-            { "role": "system", "content": SYSTEM_PROMPT },
-            { "role": "user", "content": user_prompt(facts, source) }
+            { "role": "system", "content": system },
+            { "role": "user", "content": user }
         ],
         "temperature": cfg.temperature,
         "seed": cfg.seed,
-        "max_tokens": cfg.headline_max_tokens + cfg.tldr_max_tokens + 64,
-        // llama.cpp turns this JSON schema into a GBNF grammar → structurally valid JSON guaranteed.
-        "response_format": { "type": "json_schema", "json_schema": response_schema(&facts.entities) }
+        "max_tokens": max_tokens,
+        "response_format": { "type": "json_schema", "json_schema": schema }
     });
 
     let resp = http
