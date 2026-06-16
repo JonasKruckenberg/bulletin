@@ -877,6 +877,7 @@ async fn sweep(
 ) -> anyhow::Result<SummarizeStats> {
     use crate::common::db::with_scope;
     use anyhow::Context;
+    use tracing::Instrument;
 
     let ctx = ScopeCtx::for_scope(scope);
     let model = cfg.summary_model();
@@ -896,6 +897,16 @@ async fn sweep(
                 store::clusters_needing_summary(&mut *conn, &scope, &model, cfg.max_per_sweep)
                     .await
                     .context("load clusters needing summary")?;
+            // Record which sidecar this sweep targets and how much work it found, so an operator can
+            // correlate any per-cluster `connect`/`timeout` warnings below with the configured endpoint
+            // (a misconfigured `BULLETIN_LLM_BASE_URL` looks exactly like a down sidecar otherwise).
+            tracing::debug!(
+                base_url = %cfg.base_url,
+                model = %model,
+                request_timeout_s = cfg.request_timeout.as_secs(),
+                due = due.len(),
+                "summarization sweep starting"
+            );
             for c in due {
                 let events = crate::cluster::store::list_group_events(
                     &mut *conn,
@@ -920,7 +931,18 @@ async fn sweep(
                 // `summarized_at`) so a later sweep retries once the sidecar recovers, rather than
                 // freezing it at a baseline until its content next changes. A gate rejection still
                 // returns `Some(baseline)` — that is a stable, content-derived result worth caching.
-                match client::summarize_cluster(&cfg, &http, &c.title, &events).await {
+                // A span so the best-effort warnings inside `summarize_cluster` (model/comprehension
+                // call failed) carry *which* cluster they were for — the failure is logged at the call
+                // site where the error type is known, but the identity lives out here.
+                let span = tracing::debug_span!(
+                    "summarize_cluster",
+                    cluster_id = %c.id,
+                    source = c.source.as_str(),
+                );
+                match client::summarize_cluster(&cfg, &http, &c.title, &events)
+                    .instrument(span)
+                    .await
+                {
                     Some(summary) => {
                         store::store_summary(&mut *conn, c.id, &summary, &hash, &model)
                             .await

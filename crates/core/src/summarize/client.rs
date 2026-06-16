@@ -48,7 +48,13 @@ pub async fn summarize_cluster(
     let candidate = match call_model(cfg, http, &facts, &source).await {
         Ok(c) => c,
         Err(e) => {
-            tracing::warn!(error = %e, "summarization model call failed; leaving cluster unsummarized for retry");
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                kind = failure_kind(&e),
+                base_url = %cfg.base_url,
+                model = %cfg.model,
+                "summarization model call failed; leaving cluster unsummarized for retry"
+            );
             return None;
         }
     };
@@ -93,9 +99,31 @@ async fn comprehend_cluster(
     match call_comprehension(cfg, http, facts, source).await {
         Ok(c) => Some(c),
         Err(e) => {
-            tracing::debug!(error = %e, "comprehension call failed; summarizing with neutral facts");
+            tracing::debug!(
+                error = %format!("{e:#}"),
+                kind = failure_kind(&e),
+                "comprehension call failed; summarizing with neutral facts"
+            );
             None
         }
+    }
+}
+
+/// Classify a failed sidecar call into a coarse, *static* reason for the logs, so an operator can tell
+/// the sidecar being **down** (`connect`) from **slow** (`timeout`) from **erroring** (`status`) from a
+/// **malformed response** (`response`) at a glance — without grepping the wrapped error text. The full
+/// chain is still logged via `error`; this is just the field you filter/alert on. Best-effort: anything
+/// we can't place lands in `transport`/`other`.
+fn failure_kind(err: &anyhow::Error) -> &'static str {
+    match err.downcast_ref::<reqwest::Error>() {
+        Some(e) if e.is_timeout() => "timeout",
+        Some(e) if e.is_connect() => "connect",
+        Some(e) if e.is_status() => "status",
+        Some(e) if e.is_decode() => "decode",
+        Some(_) => "transport",
+        // The explicit non-2xx `bail!` and the malformed-envelope / bad-JSON parse errors are plain
+        // `anyhow` errors (not `reqwest`), so they land here: the sidecar answered, but unusably.
+        None => "response",
     }
 }
 
