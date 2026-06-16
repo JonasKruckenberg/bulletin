@@ -1485,8 +1485,7 @@ pub async fn sweep_stories(
             continue;
         }
 
-        let hashes: Vec<Option<Vec<u8>>> =
-            members.iter().map(|m| m.summary_hash.clone()).collect();
+        let hashes: Vec<Option<Vec<u8>>> = members.iter().map(|m| m.summary_hash.clone()).collect();
         let sig = story_summary_sig(&hashes);
         // Exact re-check behind the cheap SQL gate: signature unchanged *and* same model ⇒ the cached
         // synthesis still holds, so just advance the watermark and skip the model call.
