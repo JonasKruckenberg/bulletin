@@ -130,14 +130,13 @@ impl EmailConfig {
     }
 
     /// The digest's configurable chrome, borrowed as the core renderer wants it. The branding
-    /// (brand/title/footer) comes from the flags above; the lead and per-item summaries are now fed
-    /// by the data model, leaving only `item_category` at its placeholder `DigestContent` default.
+    /// (brand/title/footer) comes from the flags above; every per-item slot (eyebrow, headline,
+    /// summary, provenance) is fed by the data model now — no placeholders remain.
     pub fn content(&self) -> DigestContent<'_> {
         DigestContent {
             brand: &self.brand,
             title: &self.title,
             footer: &self.footer,
-            ..DigestContent::default()
         }
     }
 

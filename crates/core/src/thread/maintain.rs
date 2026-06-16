@@ -347,6 +347,10 @@ fn build_upsert(
         id,
         origin,
         pinned,
+        // The deterministic auto-label baseline (top entities), recomputed from the spine every pass —
+        // the readable context eyebrow even with `llm-summarization` off; the Phase-B sweep upgrades it
+        // onto `thread.summary` (`llm-summarization.md` §2.3).
+        label: crate::summarize::auto_label(entities),
         entities: entities.to_vec(),
         affinity,
         state,

@@ -621,8 +621,11 @@ pub async fn explain(pool: &PgPool, subscriber_id: Uuid) -> Result<Vec<ExplainRo
         .into_iter()
         .map(|d| {
             let reason = reason_of(&d, &story_entities);
+            // Explain is a dry-run over the in-memory linking: no persisted `story.summary` to read,
+            // so render falls back to the representative cluster summary (Phase A), same as a digest
+            // whose story synthesis hasn't run yet.
             let item = by_id.get(&d.id).and_then(|s| {
-                build_render_item(&s.clusters, &cards).map(|mut item| {
+                build_render_item(&s.clusters, &cards, None).map(|mut item| {
                     item.reason = reason.clone();
                     item
                 })

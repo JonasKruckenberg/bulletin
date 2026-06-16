@@ -117,6 +117,10 @@ pub struct ThreadUpsert {
     pub id: Option<Uuid>,
     pub origin: ThreadOrigin,
     pub pinned: bool,
+    /// The deterministic auto-label (top entities → "acme/auth +3", `summarize::auto_label`) written
+    /// every pass — the baseline the Phase-B LLM label (`thread.summary`) upgrades at render
+    /// (`llm-summarization.md` §2.3). Recomputed from the spine, so it stays in sync with the entities.
+    pub label: String,
     pub entities: Vec<CanonicalId>,
     pub affinity: f32,
     pub state: ThreadState,
@@ -145,7 +149,7 @@ pub async fn save_threads(
                     "UPDATE thread SET
                         entities = $2, affinity = $3, state = $4, story_count = $5,
                         source_diversity = $6, baseline_rate = $7, last_story_time = $8,
-                        confidence = $10
+                        confidence = $10, label = $11
                      WHERE id = $1 AND subscriber_id = $9",
                 )
                 .bind(id)
@@ -158,6 +162,7 @@ pub async fn save_threads(
                 .bind(u.last_story_time)
                 .bind(subscriber_id)
                 .bind(u.confidence.as_str())
+                .bind(&u.label)
                 .execute(&mut *conn)
                 .await?;
                 id
@@ -165,8 +170,8 @@ pub async fn save_threads(
             None => sqlx::query(
                 "INSERT INTO thread
                     (subscriber_id, origin, pinned, entities, affinity, state, confidence,
-                     story_count, source_diversity, baseline_rate, first_seen, last_story_time)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                     story_count, source_diversity, baseline_rate, first_seen, last_story_time, label)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                  RETURNING id",
             )
             .bind(subscriber_id)
@@ -181,6 +186,7 @@ pub async fn save_threads(
             .bind(u.baseline_rate)
             .bind(u.first_seen)
             .bind(u.last_story_time)
+            .bind(&u.label)
             .fetch_one(&mut *conn)
             .await?
             .get("id"),

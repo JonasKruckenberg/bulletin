@@ -7,7 +7,7 @@ use crate::digest::select::{
 };
 use crate::identity::ConfidenceBand;
 use crate::link::ClusterRef;
-use crate::summarize::ClusterSummary;
+use crate::summarize::{ClusterSummary, ThreadSummary, TldrRun};
 use chrono::{DateTime, Utc};
 use sqlx::{postgres::PgRow, PgConnection, PgPool, Row};
 use uuid::Uuid;
@@ -147,20 +147,35 @@ pub struct RenderItem {
     /// debug trace. Empty for a pure-recency selection.
     pub reason: ItemReason,
     /// The editor-grade headline shown above the item (`llm-summarization.md` §6.1 zone 2): the
-    /// representative cluster's `summary.headline`, falling back to the raw cluster `title` when no
-    /// summary has run or the faithfulness gate rejected one. Always non-empty (it degrades to
+    /// **story** summary's `headline` (the Phase-C cross-source rewrite) when one has been synthesized,
+    /// else the representative cluster's `summary.headline`, falling back to the raw cluster `title`
+    /// when no summary has run or the faithfulness gate rejected one. Always non-empty (it degrades to
     /// `title`), so the renderer never has a blank headline.
     pub headline: String,
-    /// The one grounded TL;DR sentence beneath the headline (§6.1 zone 3): the representative
-    /// cluster's `summary.tldr_text`. Empty until a summary has run — the renderer then omits the
-    /// summary line entirely (no placeholder), so a pre-summarization digest simply has no TL;DR.
+    /// The one grounded TL;DR sentence beneath the headline (§6.1 zone 3), flat text for the plaintext
+    /// fallback + inbox preview: the story (or representative cluster) summary's `tldr_text`. Empty
+    /// until a summary has run — the renderer then omits the summary line entirely (no placeholder).
     pub summary: String,
+    /// The same TL;DR as the structured run-list (§6.2): text runs interleaved with grounded entity
+    /// `ref`s, so the HTML view can render inline entity **badges** (repo tag / CVE pill / person chip)
+    /// and the plaintext view falls back to [`summary`](Self::summary). Empty until a summary has run.
+    pub summary_runs: Vec<TldrRun>,
+    /// The faithfulness band (§3.4) of the rendered summary — surfaced in the debug trace as the
+    /// confidence the headline/tldr carry (`confirmed`/`probable`/`uncertain`).
+    pub summary_band: crate::summarize::Band,
+    /// Whether the rendered summary is the Phase-C **story** synthesis (`true`) or the Phase-A
+    /// representative-cluster fallback / raw title (`false`) — a debug-trace provenance flag.
+    pub synthesized: bool,
 }
 
-/// The thread chip on a rendered item: the thread's label and identity confidence band.
+/// The thread chip / context eyebrow on a rendered item (`llm-summarization.md` §6.1 zone 1): the
+/// thread's readable label, its identity confidence band (rendered as a "possibly" qualifier), and the
+/// terse §5.2 delta flag ("staging cutover landed") that tails the label on one line.
 pub struct ThreadTag {
     pub label: String,
     pub confidence: ConfidenceBand,
+    /// The "what newly changed" delta flag (§5.2). `None` ⇒ the eyebrow shows the label alone.
+    pub delta: Option<String>,
 }
 
 /// A non-representative member of a story, rendered beneath the headline as "connected" context.
@@ -222,9 +237,16 @@ pub(crate) async fn cluster_cards(
 /// the latest member (tie-broken by cluster id for determinism); the rest become `connections`,
 /// newest-first, carrying their `link_reason`. Returns `None` if no member resolves to a card (a
 /// tombstoned/empty story).
+///
+/// `story_summary` is the Phase-C cross-source synthesis (`story.summary`, §2.2) when one has been
+/// computed — preferred over the representative cluster's summary for the headline + tldr. A `None`
+/// (or inert empty) story summary degrades to the representative cluster summary (Phase A), which
+/// itself degrades to the raw title — so the item is correct at every phase (§6.1 "precomputed-or-omit
+/// fallback at each phase").
 pub(crate) fn build_render_item(
     members: &[ClusterRef],
     cards: &HashMap<Uuid, ClusterCard>,
+    story_summary: Option<&ClusterSummary>,
 ) -> Option<RenderItem> {
     // Resolve members to cards, keeping the ref alongside (for link_reason), newest-first.
     let mut resolved: Vec<(&ClusterRef, &ClusterCard)> = members
@@ -248,15 +270,20 @@ pub(crate) fn build_render_item(
         })
         .collect();
 
-    // Prefer the representative's abstractive `summary.headline`; degrade to the raw cluster `title`
-    // when no summary has run or the gate rejected one (`llm-summarization.md` §6.1). The `tldr_text`
-    // rides through as-is — empty until a summary lands, which the renderer treats as "no TL;DR".
-    let headline = if rep.summary.headline.trim().is_empty() {
+    // Choose the summary to render: the story's cross-source synthesis (Phase C) when present and
+    // non-empty, else the representative cluster's summary (Phase A). Then prefer its abstractive
+    // `headline`, degrading to the raw cluster `title` when neither has run or the gate rejected one
+    // (`llm-summarization.md` §6.1). The `tldr` (flat + structured) rides through — empty until a
+    // summary lands, which the renderer treats as "no TL;DR".
+    let synthesized = story_summary.is_some_and(|s| !s.is_empty());
+    let chosen = story_summary
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&rep.summary);
+    let headline = if chosen.headline.trim().is_empty() {
         rep.title.clone()
     } else {
-        rep.summary.headline.clone()
+        chosen.headline.clone()
     };
-    let summary = rep.summary.tldr_text.clone();
 
     Some(RenderItem {
         title: rep.title.clone(),
@@ -267,7 +294,10 @@ pub(crate) fn build_render_item(
         thread: None,
         reason: ItemReason::default(),
         headline,
-        summary,
+        summary: chosen.tldr_text.clone(),
+        summary_runs: chosen.tldr.clone(),
+        summary_band: chosen.band,
+        synthesized,
     })
 }
 
@@ -352,8 +382,10 @@ pub async fn render_items(
         .map(|d| (d.story_id, d.reason))
         .collect();
 
-    let stories: Vec<(Uuid, Vec<ClusterRef>, Option<ThreadTag>)> = sqlx::query(
-        "SELECT di.story_id, s.clusters, t.label AS thread_label, t.confidence AS thread_confidence
+    let stories: Vec<(Uuid, Vec<ClusterRef>, Option<ThreadTag>, ClusterSummary)> = sqlx::query(
+        "SELECT di.story_id, s.clusters, s.summary AS story_summary,
+                t.label AS thread_label, t.summary AS thread_summary,
+                t.confidence AS thread_confidence, t.delta AS thread_delta
          FROM digest_item di
          JOIN digest d ON d.id = di.digest_id
          JOIN story s  ON s.id = di.story_id
@@ -366,28 +398,53 @@ pub async fn render_items(
         let clusters: serde_json::Value = row.get("clusters");
         let members: Vec<ClusterRef> =
             serde_json::from_value(clusters).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
-        let tag = row
-            .get::<Option<String>, _>("thread_label")
-            .map(|label| ThreadTag {
-                label,
-                confidence: ConfidenceBand::parse(&row.get::<String, _>("thread_confidence")),
-            });
-        Ok((row.get::<Uuid, _>("story_id"), members, tag))
+        // The story synthesis is a best-effort cache (§2.2): decode tolerantly to the inert default,
+        // which makes the render fall back to the representative cluster — never failing the digest.
+        let story_summary: ClusterSummary =
+            serde_json::from_value(row.try_get("story_summary")?).unwrap_or_default();
+        let tag = thread_tag_from_row(&row)?;
+        Ok((row.get::<Uuid, _>("story_id"), members, tag, story_summary))
     })
     .fetch_all(&mut *conn)
     .await?;
 
     let stories = stories
         .into_iter()
-        .map(|(story_id, members, tag)| {
+        .map(|(story_id, members, tag, story_summary)| {
             (
                 members,
                 tag,
                 reason_by_story.get(&story_id).cloned().unwrap_or_default(),
+                story_summary,
             )
         })
         .collect();
     assemble_items(conn, stories).await
+}
+
+/// Build the context-eyebrow [`ThreadTag`] from a joined `thread` row: the **readable** label (the
+/// Phase-B `thread.summary.label` upgrade when present, else the deterministic `thread.label`), the
+/// identity confidence band, and the §5.2 delta flag. `None` when the item has no assigned thread (the
+/// left join produced a NULL `thread_label`), so an un-threaded item renders no eyebrow (§6.1).
+fn thread_tag_from_row(row: &PgRow) -> Result<Option<ThreadTag>, sqlx::Error> {
+    let Some(auto_label) = row.get::<Option<String>, _>("thread_label") else {
+        return Ok(None);
+    };
+    // The LLM-upgraded readable label lives on `thread.summary`; prefer it, fall back to the auto label.
+    let readable: ThreadSummary = row
+        .get::<Option<serde_json::Value>, _>("thread_summary")
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    let label = if readable.label.trim().is_empty() {
+        auto_label
+    } else {
+        readable.label
+    };
+    Ok(Some(ThreadTag {
+        label,
+        confidence: ConfidenceBand::parse(&row.get::<String, _>("thread_confidence")),
+        delta: row.get::<Option<String>, _>("thread_delta"),
+    }))
 }
 
 /// Render items for an explicit, ordered set of linked stories — the ad-hoc dispatch / preview path,
@@ -399,6 +456,9 @@ pub async fn render_items_for_stories(
     stories: &[crate::link::LinkedStory],
     reasons: &HashMap<Uuid, ItemReason>,
 ) -> Result<Vec<RenderItem>, sqlx::Error> {
+    // The ad-hoc preview/dispatch path links in-memory and persists nothing, so there is no cached
+    // `story.summary` to read — render falls back to the representative cluster summary (the empty
+    // default), exactly as a not-yet-synthesized story would.
     let stories = stories
         .iter()
         .map(|s| {
@@ -406,6 +466,7 @@ pub async fn render_items_for_stories(
                 s.clusters.clone(),
                 None,
                 reasons.get(&s.id).cloned().unwrap_or_default(),
+                ClusterSummary::default(),
             )
         })
         .collect();
@@ -413,21 +474,26 @@ pub async fn render_items_for_stories(
 }
 
 /// Shared assembler: fetch every referenced cluster's card once, then build a `RenderItem` per story
-/// (in input order), attaching its thread tag + decision-log reason. Stories that resolve to no card
-/// (tombstoned/empty) are skipped.
+/// (in input order), preferring the story's cross-source synthesis and attaching its thread tag +
+/// decision-log reason. Stories that resolve to no card (tombstoned/empty) are skipped.
 async fn assemble_items(
     conn: &mut PgConnection,
-    stories: Vec<(Vec<ClusterRef>, Option<ThreadTag>, ItemReason)>,
+    stories: Vec<(
+        Vec<ClusterRef>,
+        Option<ThreadTag>,
+        ItemReason,
+        ClusterSummary,
+    )>,
 ) -> Result<Vec<RenderItem>, sqlx::Error> {
     let ids: Vec<Uuid> = stories
         .iter()
-        .flat_map(|(members, _, _)| members.iter().map(|m| m.cluster_id))
+        .flat_map(|(members, _, _, _)| members.iter().map(|m| m.cluster_id))
         .collect();
     let cards = cluster_cards(conn, &ids).await?;
     Ok(stories
         .into_iter()
-        .filter_map(|(members, tag, reason)| {
-            build_render_item(&members, &cards).map(|mut item| {
+        .filter_map(|(members, tag, reason, story_summary)| {
+            build_render_item(&members, &cards, Some(&story_summary)).map(|mut item| {
                 item.thread = tag;
                 item.reason = reason;
                 item

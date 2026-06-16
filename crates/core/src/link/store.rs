@@ -152,7 +152,20 @@ pub async fn persist_assignment(
                 content_depth = EXCLUDED.content_depth,
                 max_severity = EXCLUDED.max_severity,
                 merged_into = NULL,
-                updated_at = now()",
+                -- Bump updated_at only when a synthesis-relevant field actually changed, so a no-op
+                -- re-upsert (identical membership + aggregates) leaves it untouched. This is what lets
+                -- the story-synthesis sweep's `updated_at > summarized_at` due-gate quiesce: without it
+                -- the blanket `now()` re-flagged every live story on every fire (membership/recency
+                -- moves still bump it, so a real content change is still caught next sweep).
+                updated_at = CASE
+                    WHEN (story.clusters, story.first_event_time, story.last_event_time,
+                          story.event_count, story.source_diversity, story.content_depth,
+                          story.max_severity, story.merged_into)
+                       IS DISTINCT FROM
+                         (EXCLUDED.clusters, EXCLUDED.first_event_time, EXCLUDED.last_event_time,
+                          EXCLUDED.event_count, EXCLUDED.source_diversity, EXCLUDED.content_depth,
+                          EXCLUDED.max_severity, NULL::uuid)
+                    THEN now() ELSE story.updated_at END",
         )
         .bind(story.id)
         .bind(subscriber_id)

@@ -8,8 +8,9 @@ use chrono_tz::Tz;
 use lettre::{message::MultiPart, Message};
 
 use crate::digest::select::{Format, ItemReason};
-use crate::digest::store::RenderItem;
+use crate::digest::store::{RenderItem, ThreadTag};
 use crate::identity::ConfidenceBand;
+use crate::summarize::TldrRun;
 
 /// The human-readable "why" for an item (design §10.2): its format, the richness phrase that chose
 /// that format, and its relevance. Rendered as a caption on every item and in the plaintext fallback,
@@ -93,9 +94,10 @@ pub trait Mailer {
 /// The configurable, non-item content of a digest email — everything that isn't the item list or
 /// the per-digest greeting. Lets the caller supply the brand, masthead title, and footer (e.g. from
 /// config) instead of baking them into the renderer, so the same layout can be re-skinned without
-/// touching this module. The big-picture lead and per-item summaries are now fed by the data model
-/// (composed deterministically from the items' summaries, `llm-summarization.md` §2.4/§6.1); the only
-/// remaining stand-in is the per-item `item_category`, HTML-marked for removal.
+/// touching this module. Every per-item slot is now fed by the data model (the §6.1 four-zone redesign
+/// — context eyebrow, headline, grounded summary, provenance — all composed from the items'
+/// cluster/story/thread summaries); **no lorem placeholders remain.** The per-item category kicker was
+/// retired by the Phase-B context eyebrow (`llm-summarization.md` §1.1/§6.1).
 #[derive(Clone, Copy)]
 pub struct DigestContent<'a> {
     /// Small-caps brand label at the very top (e.g. "Bulletin").
@@ -104,8 +106,6 @@ pub struct DigestContent<'a> {
     pub title: &'a str,
     /// Footer note rendered beneath the items.
     pub footer: &'a str,
-    /// Per-item category label (e.g. "Geopolitics/Diplomacy"). **Placeholder** until items carry one.
-    pub item_category: &'a str,
 }
 
 impl Default for DigestContent<'_> {
@@ -115,9 +115,6 @@ impl Default for DigestContent<'_> {
             title: "Your Digest",
             footer: "You're receiving this digest from Bulletin, \
                      gathered from the sources you subscribed to.",
-            // The last lorem-ipsum stand-in: a section the reference design has but our data model
-            // doesn't feed yet. Wrapped in `<!-- PLACEHOLDER … -->` markers in the rendered HTML.
-            item_category: "Lorem / Ipsum",
         }
     }
 }
@@ -226,6 +223,14 @@ fn render_plain(
             item.reason.format.as_str().to_uppercase(),
             item.headline
         ));
+        // The context eyebrow (§6.1 zone 1): the thread label + delta flag, when threaded. Plaintext
+        // shows the label regardless of band (no "possibly"/omit budgeting — that's a visual nicety).
+        if let Some(tag) = item.thread.as_ref().filter(|t| !t.label.trim().is_empty()) {
+            match tag.delta.as_deref().filter(|d| !d.trim().is_empty()) {
+                Some(delta) => body.push_str(&format!("   ~ {} · {delta}\n", tag.label)),
+                None => body.push_str(&format!("   ~ {}\n", tag.label)),
+            }
+        }
         // The grounded one-sentence tldr (§6.1 zone 3), when a summary has run; omitted otherwise.
         if !item.summary.trim().is_empty() {
             body.push_str(&format!("   {}\n", item.summary));
@@ -284,6 +289,11 @@ const ACCENT: &str = "#d35327"; // terracotta — brand, numbers, source labels
 const BORDER: &str = "#ddd4c2"; // hairline rules between items
 const SERIF: &str = "Georgia, 'Times New Roman', serif";
 const SANS: &str = "'Helvetica Neue', Helvetica, Arial, sans-serif";
+
+// Inline entity-badge tints (§6.2): a CVE pill reads as a severity chip — a warm tint of the accent,
+// distinct from running body copy but still on-palette.
+const BADGE_CVE_BG: &str = "#fbe6dd"; // pale terracotta pill background
+const BADGE_CVE_INK: &str = "#b23c12"; // deeper terracotta, the pill text
 
 // A deliberately off-palette "this is scaffolding" look for the debug block, so no reader mistakes
 // the selection trace for finished editorial content. Monospace type and a dashed amber callout read
@@ -349,9 +359,6 @@ fn render_html(
         format!(" {}", escape(lead))
     };
 
-    // The category placeholder is identical across items today, so escape it once and reuse.
-    let category = escape(content.item_category);
-
     // One divider, reused between every item and above the footer.
     let divider = soft_divider();
     let mut rows = String::new();
@@ -363,7 +370,7 @@ fn render_html(
         // Note as a compact one-liner (design §8.4/§9.5). The format is purely a richness-driven
         // rendering difference.
         rows.push_str(&match item.reason.format {
-            Format::Story => render_story_row(i, item, tz, &category),
+            Format::Story => render_story_row(i, item, tz),
             Format::Note => render_note_row(item, tz),
         });
     }
@@ -502,62 +509,145 @@ fn date_rule(date: &str) -> String {
     )
 }
 
-/// A **Story** row (design §8.4 richness → format): the rich editorial card — an optional thread
-/// chip, the editor-grade `headline` (a link when the cluster has one), a placeholder category, the
-/// grounded one-sentence summary (§6.1 zone 3 — the representative cluster's `tldr`, omitted when no
-/// summary has run), the fused cross-source connections, a human-readable reason caption, then the
-/// debug block. `category` is the last pre-escaped placeholder; the reason caption is the "why"
-/// (design §10.2); the debug block is debug-only — a monospace, dashed-amber callout (a `debug` tag
-/// so it reads as scaffolding) carrying the machine trace: priority position, ranking basis, recency
-/// key, source, fused-item count, thread assignment, entity spine, and raw link. `position` is the
-/// 0-based render slot (global priority order). Items are separated by [`soft_divider`], not a rule.
-fn render_story_row(position: usize, item: &RenderItem, tz: Tz, category: &str) -> String {
+/// A **Story** row, redesigned around the LLM summary (`llm-summarization.md` §6.1) into four quiet
+/// zones, the scaffolding moved off the email:
+///
+/// 1. **Context eyebrow** — the thread label + a terse delta flag, on one clamped line ([`render_eyebrow`]);
+///    omitted entirely for an un-threaded item.
+/// 2. **Headline** — the editor-grade `headline` (a link when the cluster has one).
+/// 3. **Summary** — the one grounded TL;DR sentence in upright body serif, with inline entity
+///    **badges** rendered from the structured run-list ([`render_summary_runs`]); omitted when no
+///    summary has run.
+/// 4. **Provenance** — `Across <source> · <source> — <when>` (multi-source) or `<source> — <when>`
+///    (single), the M3 cross-source value made calm ([`render_provenance`]) — this replaces *both* the
+///    verbose "Related" list and the `Why · relevance` caption on the email.
+///
+/// The amber **debug block is kept** (and enriched): everything the four zones shed — the fused
+/// connections, the relevance/priority "why", the thread/identity/delta trace, the summary provenance —
+/// now lives in the [`debug_trace_block`] so the selection + summarization trace stays inspectable.
+/// `position` is the 0-based render slot (global priority order). Items are separated by
+/// [`soft_divider`], not a rule.
+fn render_story_row(position: usize, item: &RenderItem, tz: Tz) -> String {
     let headline_text = escape(&item.headline);
     let headline = match &item.link {
         Some(link) => format!(
-            r#"<a class="headline" href="{}" style="font-family:{SERIF};font-size:21px;font-weight:700;line-height:1.3;color:{INK};text-decoration:none;">{headline_text}</a>"#,
+            r#"<a class="headline" href="{}" style="display:block;margin-top:10px;font-family:{SERIF};font-size:22px;font-weight:700;line-height:1.32;color:{INK};text-decoration:none;">{headline_text}</a>"#,
             escape(link)
         ),
         None => format!(
-            r#"<span class="headline" style="font-family:{SERIF};font-size:21px;font-weight:700;line-height:1.3;color:{INK};">{headline_text}</span>"#
+            r#"<span class="headline" style="display:block;margin-top:10px;font-family:{SERIF};font-size:22px;font-weight:700;line-height:1.32;color:{INK};">{headline_text}</span>"#
         ),
     };
 
-    // The grounded TL;DR sentence (§6.1): real content set in upright body serif (a confident
-    // statement, not a muted italic aside). Omitted entirely until a summary has run — no placeholder.
-    let summary = if item.summary.trim().is_empty() {
+    // Zone 3 — the grounded TL;DR sentence (§6.1/§6.2): real content set in upright body serif (a
+    // confident statement, not a muted italic aside), with inline entity badges from the run-list.
+    // Omitted entirely until a summary has run — no placeholder.
+    let summary = if item.summary_runs.is_empty() {
         String::new()
     } else {
         format!(
-            r#"<div class="meta" style="margin-top:12px;font-family:{SERIF};font-size:16px;line-height:1.65;color:{INK_BODY};">{}</div>
+            r#"<div class="related" style="margin-top:11px;font-family:{SERIF};font-size:17px;line-height:1.65;color:{INK_BODY};">{}</div>
 "#,
-            escape(&item.summary)
+            render_summary_runs(&item.summary_runs)
         )
     };
 
-    let connections = render_connections(&item.connections);
-    let thread_chip = render_thread_chip(item.thread.as_ref());
-    let reason = escape(&reason_line(&item.reason));
+    let eyebrow = render_eyebrow(item.thread.as_ref());
+    let provenance = render_provenance(item, tz);
     let debug = debug_trace_block(position, item, tz);
 
     format!(
         r#"<tr>
 <td class="bx" style="padding:30px 40px;">
-{thread_chip}{headline}
-<!-- PLACEHOLDER: per-item category — remove or replace once items carry a category -->
-<div class="meta" style="margin-top:9px;font-family:{SANS};font-size:13px;font-weight:500;letter-spacing:0.04em;color:{ACCENT};">{category}</div>
-<!-- /PLACEHOLDER -->
-{summary}{connections}<div class="meta" style="margin-top:16px;font-family:{SANS};font-size:12px;line-height:1.6;color:{INK_MUTED};"><span style="font-weight:600;color:{ACCENT};">Why</span> &middot; {reason}</div>
+{eyebrow}{headline}
+{summary}{provenance}
 {debug}</td>
 </tr>
 "#
     )
 }
 
-/// The debug-only selection trace beneath a story card: a monospace, dashed-amber callout carrying
-/// the machine trace (1-based rank, ranking basis, recency key, source, fused-item count, thread
-/// assignment, entity spine, raw link — design §10.2). Styled to read as scaffolding, and isolated
-/// in one function so it's a single block to strip before launch.
+/// Zone 4 — the **provenance** line (§6.1): the distinct sources the story fused, made calm. `Across
+/// <source> · <source> · <source> — <when>` for a multi-source story (surfacing the M3 cross-source
+/// value as the confidence line), or just `<source> — <when>` for a single source. Replaces both the
+/// verbose "Related" list and the machine "why" caption on the email (those move to the debug block).
+/// Sources are the representative's plus each connection's, de-duplicated in first-seen order.
+fn render_provenance(item: &RenderItem, tz: Tz) -> String {
+    let mut sources: Vec<&str> = Vec::new();
+    for s in std::iter::once(item.source.as_str())
+        .chain(item.connections.iter().map(|c| c.source.as_str()))
+    {
+        if !sources.contains(&s) {
+            sources.push(s);
+        }
+    }
+    let when = item
+        .last_event_time
+        .with_timezone(&tz)
+        .format("%Y-%m-%d %H:%M %Z");
+    let tagged: Vec<String> = sources
+        .iter()
+        .map(|s| format!(r#"<span style="color:{ACCENT};">{}</span>"#, escape(s)))
+        .collect();
+    let body = if tagged.len() > 1 {
+        format!("Across {}", tagged.join(" &middot; "))
+    } else {
+        tagged.join("")
+    };
+    format!(
+        r#"<div class="meta" style="margin-top:14px;font-family:{SANS};font-size:12px;line-height:1.6;color:{INK_MUTED};">{body} &nbsp;&mdash;&nbsp; {when}</div>
+"#
+    )
+}
+
+/// Zone 3 inner HTML — render the structured TL;DR run-list (§6.2): plain `text` runs escaped inline,
+/// and grounded entity `ref` runs as type-styled inline **badges** ([`render_entity_badge`]). The
+/// model can only reference an entity in the closed grounded set (the schema enum), so a badge can
+/// never name a thing that wasn't extracted from ground truth; an unrecognised namespace degrades to
+/// plain `surface` text — never a broken badge (the plaintext view uses the flat `tldr_text`).
+fn render_summary_runs(runs: &[TldrRun]) -> String {
+    let mut out = String::new();
+    for run in runs {
+        match run {
+            TldrRun::Text { text } => out.push_str(&escape(text)),
+            TldrRun::Ref { entity, surface } => out.push_str(&render_entity_badge(entity, surface)),
+        }
+    }
+    out
+}
+
+/// One inline entity badge, styled by the `ref` token's namespace (§6.2): a `repo:` dotted-underline
+/// tag, a `cve:` severity-tinted pill, a `user:` person chip, anything else plain. Rendering owns the
+/// treatment; the model only picks which grounded token to reference and its visible `surface` text.
+/// Identity resolution + avatars are a later layer — for now the badge is namespace-styled and the
+/// surface text is shown verbatim, degrading gracefully to plain text for an unknown namespace.
+fn render_entity_badge(entity: &str, surface: &str) -> String {
+    let s = escape(surface);
+    match crate::identity::namespace(entity).map(|(ns, _)| ns) {
+        Some("repo") => format!(
+            r#"<span style="border-bottom:1px dotted {ACCENT};font-weight:600;color:{INK_BODY};">{s}</span>"#
+        ),
+        Some("cve") => format!(
+            r#"<span style="font-family:{SANS};font-size:13px;font-weight:600;background:{BADGE_CVE_BG};color:{BADGE_CVE_INK};padding:1px 7px;border-radius:10px;">{s}</span>"#
+        ),
+        Some("user") => format!(r#"<span style="font-weight:600;color:{INK};">{s}</span>"#),
+        _ => s,
+    }
+}
+
+/// The debug-only selection + **summarization** trace beneath a story card: a monospace, dashed-amber
+/// callout carrying the machine trace the four editorial zones (§6.1) deliberately shed, so the audit
+/// detail stays inspectable. Kept (not deleted) and enriched for Phases B/C with:
+///
+/// - **selection** — 1-based rank, ranking basis (priority/richness), recency key, source, fused
+///   count, entity spine, raw link (design §10.2);
+/// - **summary** (Phase A/C) — the headline/tldr's provenance (story synthesis vs representative
+///   cluster vs raw title) and its faithfulness `band`;
+/// - **thread** (Phase B) — the assigned thread label, its identity band, and the §5.2 delta flag;
+/// - **related** — every fused cross-source connection with its `link_reason` (the §8.2 value that was
+///   on the email as the "Related" list, now here).
+///
+/// Styled to read as scaffolding and isolated in one function so it's a single block to strip later.
 fn debug_trace_block(position: usize, item: &RenderItem, tz: Tz) -> String {
     let rank = position + 1;
     let source = escape(item.source.as_str());
@@ -572,7 +662,7 @@ fn debug_trace_block(position: usize, item: &RenderItem, tz: Tz) -> String {
         .unwrap_or_else(|| "—".into());
     let related = item.connections.len();
     // priority is the ranking key (relevance + severity, recency-decayed); the entity spine is what
-    // relevance scored on; the thread line records the assignment + its identity band.
+    // relevance scored on; the thread line records the assignment + its identity band + delta.
     let basis = format!(
         "priority {:.3}, richness {}",
         item.reason.priority, item.reason.richness
@@ -585,125 +675,133 @@ fn debug_trace_block(position: usize, item: &RenderItem, tz: Tz) -> String {
             escape(&item.reason.entities.join(", "))
         )
     };
+
+    // Summary provenance (Phase A/C): where the rendered headline/tldr came from, and its band. The
+    // story cache (`item.synthesized`) may hold a true cross-source fusion *or* the representative
+    // cluster summary it fell back to on a gate rejection — render can't tell them apart, so the label
+    // is the honest "story.summary cache" rather than asserting a synthesis happened.
+    let summary_origin = if item.summary_runs.is_empty() {
+        "raw title (no summary)"
+    } else if item.synthesized {
+        "story.summary cache"
+    } else {
+        "cluster summary"
+    };
+    let summary_trace = format!(
+        r#"<div style="margin-top:4px;">summary <span style="font-weight:700;">{summary_origin}</span> &middot; band {}</div>"#,
+        item.summary_band.as_str(),
+    );
+
+    // Thread trace (Phase B): label · identity band · delta flag.
     let thread_trace = match &item.thread {
-        Some(t) => format!(
-            r#"<div style="margin-top:4px;">thread <span style="font-weight:700;">{}</span> &middot; identity {}</div>"#,
-            escape(&t.label),
-            t.confidence.as_str()
-        ),
+        Some(t) => {
+            let delta = t
+                .delta
+                .as_deref()
+                .filter(|d| !d.trim().is_empty())
+                .map(|d| format!(" &middot; delta &ldquo;{}&rdquo;", escape(d)))
+                .unwrap_or_default();
+            format!(
+                r#"<div style="margin-top:4px;">thread <span style="font-weight:700;">{}</span> &middot; identity {}{delta}</div>"#,
+                escape(&t.label),
+                t.confidence.as_str()
+            )
+        }
         None => String::new(),
     };
 
+    // Related (§8.2): the fused cross-source connections + each one's link_reason and click-through
+    // URL, moved off the editorial email into the trace (so the cross-source detail stays inspectable).
+    let mut related_trace = String::new();
+    for c in &item.connections {
+        let reason = c
+            .link_reason
+            .as_deref()
+            .map(|r| format!(" &mdash; {}", escape(r)))
+            .unwrap_or_default();
+        let link = c
+            .link
+            .as_deref()
+            .map(|l| format!(" &middot; {}", escape(l)))
+            .unwrap_or_default();
+        related_trace.push_str(&format!(
+            r#"<div style="margin-top:4px;word-break:break-word;">&#8627; {} [{}]{reason}{link}</div>"#,
+            escape(&c.title),
+            escape(c.source.as_str()),
+        ));
+    }
+
     format!(
-        r#"<!-- DEBUG: selection trace — debugging info, remove before launch -->
-<div style="margin-top:12px;padding:9px 12px;background-color:{DEBUG_BG};border:1px dashed {DEBUG_BORDER};border-radius:3px;font-family:{MONO};font-size:12px;line-height:1.6;color:{DEBUG_INK};">
+        r#"<!-- DEBUG: selection + summarization trace — debugging info, remove before launch -->
+<div style="margin-top:16px;padding:9px 12px;background-color:{DEBUG_BG};border:1px dashed {DEBUG_BORDER};border-radius:3px;font-family:{MONO};font-size:12px;line-height:1.6;color:{DEBUG_INK};">
 <span style="display:inline-block;padding:1px 6px;margin-right:8px;background-color:{DEBUG_BORDER};color:{DEBUG_BG};font-weight:700;text-transform:uppercase;letter-spacing:0.1em;border-radius:2px;">debug</span>
 <span style="font-weight:700;">selected #{rank}</span> <span>by {basis}</span>
 <div style="margin-top:4px;">key {recency_key} &middot; source <span style="font-weight:700;">{source}</span> &middot; related {related}</div>
-{thread_trace}{spine}<div style="margin-top:4px;word-break:break-all;">link {link}</div>
+{summary_trace}{thread_trace}{spine}{related_trace}<div style="margin-top:4px;word-break:break-all;">link {link}</div>
 </div>
 <!-- /DEBUG -->
 "#
     )
 }
 
-/// A **Note** row (design §8.4/§9.5): the compact one-liner for a thin, atomic item — an optional
-/// thread chip, a terracotta `Note` tag, the headline (linked when it has a URL), a source · time
-/// caption, the human reason, and any fused connections. No lorem placeholders or amber debug block;
-/// a Note is deliberately terse. Format is purely a richness-driven rendering difference — a Note can
-/// still out-rank a Story (it's interleaved in global priority order).
+/// A **Note** row (design §8.4/§9.5): the compact one-liner for a thin, atomic item — the same
+/// grammar as a Story but terser: an optional context eyebrow, a terracotta `Note` tag, the headline
+/// (linked when it has a URL), then the provenance line. No summary sentence (a Note is thin by
+/// definition) and no debug block. Format is purely a richness-driven rendering difference — a Note
+/// can still out-rank a Story (it's interleaved in global priority order).
 fn render_note_row(item: &RenderItem, tz: Tz) -> String {
     let headline_text = escape(&item.headline);
     let headline = match &item.link {
         Some(link) => format!(
-            r#"<a href="{}" style="font-family:{SERIF};font-size:17px;font-weight:700;line-height:1.4;color:{INK};text-decoration:none;">{headline_text}</a>"#,
+            r#"<a href="{}" style="display:block;margin-top:8px;font-family:{SERIF};font-size:17px;font-weight:700;line-height:1.4;color:{INK};text-decoration:none;">{headline_text}</a>"#,
             escape(link)
         ),
         None => format!(
-            r#"<span style="font-family:{SERIF};font-size:17px;font-weight:700;line-height:1.4;color:{INK};">{headline_text}</span>"#
+            r#"<span style="display:block;margin-top:8px;font-family:{SERIF};font-size:17px;font-weight:700;line-height:1.4;color:{INK};">{headline_text}</span>"#
         ),
     };
-    let source = escape(item.source.as_str());
-    let when = item
-        .last_event_time
-        .with_timezone(&tz)
-        .format("%Y-%m-%d %H:%M %Z");
-    let reason = escape(&reason_line(&item.reason));
-    let connections = render_connections(&item.connections);
-    let thread_chip = render_thread_chip(item.thread.as_ref());
+    let eyebrow = render_eyebrow(item.thread.as_ref());
+    let provenance = render_provenance(item, tz);
 
     format!(
         r#"<tr>
 <td class="bx" style="padding:18px 40px;">
-{thread_chip}<span style="display:inline-block;margin-bottom:6px;font-family:{SANS};font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:{ACCENT};">Note</span>
-<div>{headline}</div>
-<div class="meta" style="margin-top:6px;font-family:{SANS};font-size:12px;line-height:1.6;color:{INK_MUTED};">{source} &middot; {when}</div>
-<div class="meta" style="margin-top:4px;font-family:{SANS};font-size:12px;line-height:1.6;color:{INK_MUTED};"><span style="font-weight:600;color:{ACCENT};">Why</span> &middot; {reason}</div>
-{connections}</td>
+{eyebrow}<span style="display:inline-block;margin-top:6px;font-family:{SANS};font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:{ACCENT};">Note</span>
+{headline}
+{provenance}</td>
 </tr>
 "#
     )
 }
 
-/// The "Related" block: the cross-source clusters fused into a story (design §8.2), each a headline
-/// (linked when it has a URL), a source tag, and the `link_reason` for why it belongs — the M3 value
-/// made visible. Renders every fused sub-item (uncapped). Empty for a singleton story, so a lone item
-/// renders unchanged.
-fn render_connections(connections: &[crate::digest::store::Connection]) -> String {
-    if connections.is_empty() {
-        return String::new();
-    }
-    let mut rows = String::new();
-    for c in connections {
-        let title = escape(&c.title);
-        let head = match &c.link {
-            Some(link) => format!(
-                r#"<a href="{}" style="color:{INK_BODY};text-decoration:none;font-weight:700;">{title}</a>"#,
-                escape(link)
-            ),
-            None => format!(r#"<span style="color:{INK_BODY};font-weight:700;">{title}</span>"#),
-        };
-        let source = escape(c.source.as_str());
-        let reason = c
-            .link_reason
-            .as_deref()
-            .map(|r| {
-                format!(
-                    r#" <span style="color:{INK_MUTED};">— {}</span>"#,
-                    escape(r)
-                )
-            })
-            .unwrap_or_default();
-        rows.push_str(&format!(
-            r#"<div class="related" style="margin-top:8px;font-family:{SERIF};font-size:16px;line-height:1.5;color:{INK_BODY};">
-<span style="color:{ACCENT};">&#8627;</span> {head} <span style="font-family:{SANS};font-size:12px;text-transform:uppercase;letter-spacing:0.06em;color:{ACCENT};">{source}</span>{reason}</div>
-"#
-        ));
-    }
-    format!(
-        r#"<div style="margin-top:16px;padding-top:4px;">
-<div class="meta" style="font-family:{SANS};font-size:12px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:{INK_MUTED};">Related</div>
-{rows}</div>
-"#
-    )
-}
-
-/// The thread chip above a story's headline (design §5.2 thread-grouped render): the persistent
-/// thread it advances, prefixed "possibly" when the thread's identity is only `Probable`/`Uncertain`
-/// — confidence rendered as a product surface (§4). Empty when the story isn't assigned to a thread,
-/// so an un-threaded item renders exactly as before.
-fn render_thread_chip(thread: Option<&crate::digest::store::ThreadTag>) -> String {
+/// Zone 1 — the **context eyebrow** (§6.1/§1.1): the assigned thread label + a terse delta flag, on a
+/// single line that can never wrap (`white-space:nowrap; overflow:hidden; text-overflow:ellipsis`).
+/// This consolidates the old standalone thread chip (one thread reference per item, not two). Identity
+/// doubt is *budgeted* (§10.4): a `Probable` thread shows a quiet italic "possibly" before the label;
+/// an `Uncertain` one omits the eyebrow entirely (the doubt isn't worth a line). Empty for an
+/// un-threaded item — it simply renders no eyebrow, exactly as the mockup's item 3.
+fn render_eyebrow(thread: Option<&ThreadTag>) -> String {
     let Some(tag) = thread.filter(|t| !t.label.trim().is_empty()) else {
         return String::new();
     };
     let qualifier = match tag.confidence {
-        ConfidenceBand::Confirmed => "",
-        ConfidenceBand::Probable | ConfidenceBand::Uncertain => "possibly ",
+        ConfidenceBand::Confirmed => String::new(),
+        ConfidenceBand::Probable => {
+            r#"<span style="font-style:italic;">possibly</span> "#.to_string()
+        }
+        // Budget the doubt: an Uncertain thread isn't worth an eyebrow line at all (§6.1/§10.4).
+        ConfidenceBand::Uncertain => return String::new(),
+    };
+    let label = escape(&tag.label);
+    let delta = match &tag.delta {
+        Some(d) if !d.trim().is_empty() => {
+            format!(r#" &nbsp;&middot;&nbsp; {}"#, escape(d))
+        }
+        _ => String::new(),
     };
     format!(
-        r#"<div style="margin-bottom:8px;font-family:{SANS};font-size:11px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:{ACCENT};">&#9656;&nbsp;{qualifier}{}</div>
-"#,
-        escape(&tag.label)
+        r#"<div class="meta" style="font-family:{SANS};font-size:12px;letter-spacing:0.02em;color:{INK_MUTED};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{qualifier}<span style="color:{ACCENT};font-weight:600;">{label}</span>{delta}</div>
+"#
     )
 }
 
@@ -728,6 +826,8 @@ fn escape(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::common::kind::SourceKind;
+    use crate::digest::store::Connection;
+    use crate::summarize::Band;
     use chrono::TimeZone;
 
     fn item(title: &str, link: Option<&str>, source: SourceKind) -> RenderItem {
@@ -743,6 +843,38 @@ mod tests {
             // renderer then omits the summary line), matching a feature-off / not-yet-summarized item.
             headline: title.to_string(),
             summary: String::new(),
+            summary_runs: Vec::new(),
+            summary_band: Band::Uncertain,
+            synthesized: false,
+        }
+    }
+
+    /// A render item carrying a grounded summary (the flat text + a single text run), for the
+    /// summary-bearing render paths.
+    fn summarized(
+        title: &str,
+        headline: &str,
+        summary: &str,
+        link: Option<&str>,
+        source: SourceKind,
+    ) -> RenderItem {
+        RenderItem {
+            headline: headline.to_string(),
+            summary: summary.to_string(),
+            summary_runs: vec![TldrRun::Text {
+                text: summary.to_string(),
+            }],
+            summary_band: Band::Confirmed,
+            ..item(title, link, source)
+        }
+    }
+
+    /// A context-eyebrow thread tag with the given label, band, and optional delta.
+    fn tag(label: &str, confidence: ConfidenceBand, delta: Option<&str>) -> ThreadTag {
+        ThreadTag {
+            label: label.to_string(),
+            confidence,
+            delta: delta.map(str::to_string),
         }
     }
 
@@ -800,62 +932,63 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_and_debug_sections_are_marked() {
+    fn four_zones_render_with_no_lorem_and_a_kept_debug_block() {
         // A summarized item carries an editor-grade headline + a grounded tldr; render them as real
         // content (no lorem placeholders), and compose the lead from the headline deterministically.
-        let summarized = RenderItem {
-            headline: "EDITOR_HEADLINE".to_string(),
-            summary: "GROUNDED_TLDR_SENTENCE".to_string(),
-            ..item("RAW_TITLE", Some("https://example.com"), SourceKind::Rss)
-        };
+        let summarized = summarized(
+            "RAW_TITLE",
+            "EDITOR_HEADLINE",
+            "GROUNDED_TLDR_SENTENCE",
+            Some("https://example.com"),
+            SourceKind::Rss,
+        );
         let items = vec![summarized];
-        let content = DigestContent {
-            item_category: "CAT_TEXT",
-            ..DigestContent::default()
-        };
         let html = render_html(
             Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
             Tz::UTC,
             "GREETING_TEXT",
             &compose_lead(&items),
             &items,
-            &content,
+            &DigestContent::default(),
         );
 
-        // The greeting opens the lead as real content, ahead of the deterministic big-picture summary
-        // — which is composed from the item's headline (no model, no lorem).
+        // The greeting opens the lead, ahead of the deterministic big-picture summary (no lorem).
         assert!(html.contains("GREETING_TEXT"));
         let greeting_at = html.find("GREETING_TEXT").unwrap();
         let lead_at = html.find("Leading this digest: EDITOR_HEADLINE").unwrap();
         assert!(greeting_at < lead_at, "greeting must precede the lead");
-        // The editor-grade headline (not the raw title) leads the item, and the grounded tldr renders
-        // as real upright body content — no lorem, no big-picture placeholder.
+        // Zone 2 headline (the editor-grade one, not the raw title) + zone 3 grounded summary, as real
+        // content. The lorem category placeholder is gone entirely (retired by the eyebrow).
         assert!(html.contains("EDITOR_HEADLINE"));
         assert!(html.contains("GROUNDED_TLDR_SENTENCE"));
         assert!(!html.contains("RAW_TITLE"));
-        assert!(!html.contains("Lorem ipsum"));
-        // The only remaining placeholder is the per-item category.
-        assert!(html.contains("CAT_TEXT"));
-        assert_eq!(html.matches("<!-- PLACEHOLDER:").count(), 1);
-        assert!(html.contains("<!-- DEBUG: selection trace"));
+        assert!(!html.contains("Lorem"));
+        assert_eq!(html.matches("<!-- PLACEHOLDER:").count(), 0);
+        // Zone 4 provenance: a single-source story shows "<source> — <when>", not "Across".
+        assert!(html.contains(">rss<"));
+        assert!(!html.contains("Across"));
+        // The "Why ·" caption and the "Related" block are off the email (they move to the debug box).
+        assert!(!html.contains(">Why</span>"));
+        assert!(!html.contains(">Related</div>"));
+
+        // The amber DEBUG block is KEPT (not deleted) — styled unmistakably as scaffolding...
+        assert!(html.contains("<!-- DEBUG: selection + summarization trace"));
         assert!(html.contains("<!-- /DEBUG -->"));
-        // The debug block is styled to look unmistakably like scaffolding — a monospace,
-        // dashed-amber callout carrying a visible `debug` tag — so it can't pass for real content.
         assert!(html.contains(MONO));
         assert!(html.contains(DEBUG_BG));
         assert!(html.contains(&format!("border:1px dashed {DEBUG_BORDER}")));
         assert!(html.contains(">debug</span>"));
-        // ...and it carries the selection trace: rank, ranking basis, related count, link.
+        // ...and it carries the enriched trace: selection rank/basis/link + the summary provenance.
         assert!(html.contains("selected #1"));
         assert!(html.contains("by priority"));
         assert!(html.contains("related 0"));
         assert!(html.contains("link https://example.com"));
-        // The human-readable reason caption (non-debug) names format + richness + relevance.
-        assert!(html.contains(">Why</span>"));
+        assert!(html.contains("summary <span style=\"font-weight:700;\">cluster summary</span>"));
+        assert!(html.contains("band confirmed"));
     }
 
     #[test]
-    fn note_renders_compact_without_placeholders_or_debug() {
+    fn note_renders_compact_without_debug() {
         let note = RenderItem {
             reason: crate::digest::select::ItemReason {
                 format: Format::Note,
@@ -877,14 +1010,133 @@ mod tests {
             &items,
             &DigestContent::default(),
         );
-        // The Note tag + headline (degraded to the raw title) + reason are present...
+        // The Note tag + headline + provenance are present...
         assert!(html.contains(">Note</span>"));
         assert!(html.contains("A small ping"));
-        assert!(html.contains("Note · announcement"));
-        // ...and with the big-picture lead now composed (no lorem) and a Note carrying no per-item
-        // placeholders, there are no PLACEHOLDER markers at all and no amber debug block.
+        assert!(html.contains(">github<"));
+        // ...and a Note is deliberately terse: no placeholders and no amber debug block.
         assert_eq!(html.matches("<!-- PLACEHOLDER:").count(), 0);
         assert!(!html.contains("<!-- DEBUG:"));
+    }
+
+    #[test]
+    fn context_eyebrow_carries_thread_and_delta_with_budgeted_doubt() {
+        // A Confirmed thread with a delta: the label + the delta flag on one (nowrap) line, no "possibly".
+        let confirmed = render_eyebrow(Some(&tag(
+            "Acme auth migration",
+            ConfidenceBand::Confirmed,
+            Some("staging cutover landed"),
+        )));
+        assert!(confirmed.contains("Acme auth migration"));
+        assert!(confirmed.contains("staging cutover landed"));
+        assert!(confirmed.contains("white-space:nowrap")); // the one-line clamp (§6.1)
+        assert!(!confirmed.contains("possibly"));
+
+        // A Probable thread: a quiet italic "possibly" qualifies the label.
+        let probable = render_eyebrow(Some(&tag(
+            "Billing rewrite",
+            ConfidenceBand::Probable,
+            Some("reactivated"),
+        )));
+        assert!(probable.contains("possibly"));
+        assert!(probable.contains("Billing rewrite"));
+
+        // An Uncertain thread: the doubt isn't worth a line — the eyebrow is omitted entirely (§10.4).
+        let uncertain = render_eyebrow(Some(&tag(
+            "Shaky thread",
+            ConfidenceBand::Uncertain,
+            Some("moved"),
+        )));
+        assert!(uncertain.is_empty());
+
+        // ...but the label still appears in the kept debug block (the audit detail isn't budgeted away).
+        let item = RenderItem {
+            thread: Some(tag(
+                "Shaky thread",
+                ConfidenceBand::Uncertain,
+                Some("moved"),
+            )),
+            ..summarized("t", "H", "S", None, SourceKind::Github)
+        };
+        let html = render_one(&item);
+        assert!(html.contains("Shaky thread"));
+        assert!(html.contains("delta &ldquo;moved&rdquo;"));
+    }
+
+    #[test]
+    fn summary_runs_render_inline_entity_badges() {
+        let runs = vec![
+            TldrRun::Text {
+                text: "A bad config broke ".to_string(),
+            },
+            TldrRun::Ref {
+                entity: "repo:acme/auth".to_string(),
+                surface: "acme/auth".to_string(),
+            },
+            TldrRun::Text {
+                text: "; flagged in ".to_string(),
+            },
+            TldrRun::Ref {
+                entity: "cve:CVE-2026-2200".to_string(),
+                surface: "CVE-2026-2200".to_string(),
+            },
+            TldrRun::Text {
+                text: ".".to_string(),
+            },
+        ];
+        let item = RenderItem {
+            summary: "A bad config broke acme/auth; flagged in CVE-2026-2200.".to_string(),
+            summary_runs: runs,
+            summary_band: Band::Confirmed,
+            ..item("t", None, SourceKind::Github)
+        };
+        let html = render_one(&item);
+        // The repo ref renders as a dotted-underline tag; the CVE ref as a severity pill.
+        assert!(html.contains(&format!("border-bottom:1px dotted {ACCENT}")));
+        assert!(html.contains("acme/auth"));
+        assert!(html.contains(BADGE_CVE_BG));
+        assert!(html.contains("CVE-2026-2200"));
+    }
+
+    #[test]
+    fn provenance_lists_distinct_sources_for_a_multi_source_story() {
+        let item = RenderItem {
+            connections: vec![
+                Connection {
+                    title: "PR".to_string(),
+                    link: None,
+                    source: SourceKind::Github,
+                    link_reason: Some("same incident".to_string()),
+                },
+                Connection {
+                    title: "chatter".to_string(),
+                    link: None,
+                    source: SourceKind::Rss,
+                    link_reason: None,
+                },
+            ],
+            ..summarized("t", "H", "S", None, SourceKind::Github)
+        };
+        let html = render_one(&item);
+        // Multi-source provenance leads with "Across" and lists the distinct sources (github once).
+        assert!(html.contains("Across"));
+        assert_eq!(html.matches(">github<").count(), 1 + 1); // provenance + the debug source line
+        assert!(html.contains(">rss<"));
+        // The connection + its link_reason live in the debug block now, not on the email body.
+        assert!(html.contains("same incident"));
+    }
+
+    /// Render a single story item to HTML (a one-item digest), for the per-zone assertions.
+    fn render_one(item: &RenderItem) -> String {
+        let items = std::slice::from_ref(item);
+        render_html(
+            Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
+            Tz::UTC,
+            "Hi.",
+            &compose_lead(items),
+            items,
+            &DigestContent::default(),
+        )
     }
 
     #[test]
@@ -968,8 +1220,8 @@ mod tests {
         );
 
         assert!(html.contains("Just a title"));
-        // The body-serif summary line only appears when the item carries a tldr — none here.
-        let summary_style = format!("font-size:16px;line-height:1.65;color:{INK_BODY}");
+        // The body-serif summary line only appears when the item carries a tldr run-list — none here.
+        let summary_style = format!("font-size:17px;line-height:1.65;color:{INK_BODY}");
         assert!(!html.contains(&summary_style));
         // The lead still composes from the (title-derived) headline.
         assert!(html.contains("Leading this digest: Just a title."));
@@ -982,7 +1234,6 @@ mod tests {
             brand: "ACME",
             title: "Weekly Roundup",
             footer: "Sent by ACME.",
-            ..DigestContent::default()
         };
         let html = render_html(
             Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
@@ -1026,7 +1277,6 @@ mod tests {
             brand: "ACME",
             title: "Weekly Roundup",
             footer: "Sent by ACME.",
-            ..DigestContent::default()
         };
         let html = render_empty_html(
             Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
