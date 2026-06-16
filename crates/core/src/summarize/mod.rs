@@ -158,6 +158,18 @@ pub enum Band {
     Uncertain,
 }
 
+impl Band {
+    /// The lowercase string form (matching the serde rename), for the render debug trace — one source
+    /// of the token, mirroring [`ConfidenceBand::as_str`](crate::identity::ConfidenceBand::as_str).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Band::Confirmed => "confirmed",
+            Band::Probable => "probable",
+            Band::Uncertain => "uncertain",
+        }
+    }
+}
+
 /// One run of the `tldr` (§6.2): either literal `text`, or a grounded entity `ref` whose token is
 /// constrained (by the response grammar, §3.3) to the closed set of `facts.entities` — so the model
 /// can *reference* a grounded entity (for an inline badge) but can never *name* one that wasn't
@@ -833,16 +845,18 @@ pub fn source_corpus(events: &[Event], max_chars: usize) -> String {
 // ── Phase C — Story cross-source synthesis (§2.2) ────────────────────────────────────────────────
 
 /// The **member signature** that caches a story's synthesis (§2.2): SHA-256 over the *sorted* set of
-/// member-cluster `summary_hash`es plus the assigned `thread_id`. Stories are id-forwarded and stable
-/// across fires, so this sig is stable until membership/content actually moves — the synthesis is
-/// reused across fires for free and regenerated only when a source is added/dropped or a member's
-/// content changes. Sorting makes it order-independent of the caller. A member with no summary hash
-/// yet still contributes (its empty slot is part of the signature), so adding the missing summary
-/// later moves the sig and triggers a re-synthesis.
-pub fn story_summary_sig(
-    member_hashes: &[Option<Vec<u8>>],
-    thread_id: Option<uuid::Uuid>,
-) -> Vec<u8> {
+/// member-cluster `summary_hash`es. Stories are id-forwarded and stable across fires, so this sig is
+/// stable until membership/content actually moves — the synthesis is reused across fires for free and
+/// regenerated only when a source is added/dropped or a member's content changes. Sorting makes it
+/// order-independent of the caller. A member with no summary hash yet still contributes (its empty
+/// slot is part of the signature), so adding the missing summary later moves the sig and triggers a
+/// re-synthesis.
+///
+/// (The design's §2.2 sig also folds in the assigned `thread_id`; we key on member content alone —
+/// the thread context barely affects the synthesis and this keeps Phase C decoupled from fire-time
+/// thread-assignment, so a story moving threads does not itself force a re-synthesis. See the
+/// `sweep_stories` deviation note.)
+pub fn story_summary_sig(member_hashes: &[Option<Vec<u8>>]) -> Vec<u8> {
     const FIELD: u8 = 0x00;
     const NONE: u8 = 0x01; // marks a member with no summary hash yet, so it can't collide with empty
     let mut sorted: Vec<&Option<Vec<u8>>> = member_hashes.iter().collect();
@@ -854,9 +868,6 @@ pub fn story_summary_sig(
             None => h.update([NONE]),
         }
         h.update([FIELD]);
-    }
-    if let Some(t) = thread_id {
-        h.update(t.as_bytes());
     }
     h.finalize().to_vec()
 }
@@ -1011,9 +1022,10 @@ pub fn auto_label(entities: &[String]) -> String {
 }
 
 /// Render-order priority of an entity namespace for the auto-label head (lower = preferred): a repo or
-/// CVE names a thread better than a bare user or url. Unknown namespaces sort last.
+/// CVE names a thread better than a bare user or url. Unknown namespaces sort last. Splits the token
+/// through [`identity::namespace`](crate::identity::namespace), the one owner of the `kind:value` parse.
 fn entity_priority(token: &str) -> u8 {
-    match token.split_once(':').map(|(ns, _)| ns) {
+    match crate::identity::namespace(token).map(|(ns, _)| ns) {
         Some("repo") => 0,
         Some("cve") => 1,
         Some("user") => 2,
@@ -1025,8 +1037,9 @@ fn entity_priority(token: &str) -> u8 {
 
 /// The display value of a namespaced entity token: the part after the first `:` (so `repo:acme/auth` →
 /// `acme/auth`, `cve:CVE-2026-1234` → `CVE-2026-1234`), or the whole token if it carries no namespace.
+/// Uses [`identity::namespace`](crate::identity::namespace) so the `kind:value` parse lives in one place.
 fn entity_display(token: &str) -> &str {
-    token.split_once(':').map_or(token, |(_, v)| v)
+    crate::identity::namespace(token).map_or(token, |(_, v)| v)
 }
 
 /// The deterministic delta baseline (§5.2): a terse count flag of the stories that newly moved on this
@@ -1227,6 +1240,18 @@ pub async fn sweep_private(
 #[cfg(feature = "llm-summarization")]
 use crate::common::{db::ScopeCtx, scope::Scope};
 
+/// One HTTP client (connection pool / TLS cache / resolver) per sweep, reused across every model call
+/// in the pass rather than rebuilt per item — shared by all three sweeps (cluster / story / thread) so
+/// client construction lives in one place. `what` names the sweep for the error context.
+#[cfg(feature = "llm-summarization")]
+fn build_summarize_http(cfg: &SummarizationConfig, what: &str) -> anyhow::Result<reqwest::Client> {
+    use anyhow::Context;
+    reqwest::Client::builder()
+        .timeout(cfg.request_timeout)
+        .build()
+        .with_context(|| format!("build {what} summarization http client"))
+}
+
 /// The shared sweep body for both scopes (mirrors the public/private build split): find the clusters
 /// whose content changed since (or were never) summarized, recompute each one's hash, and — only if it
 /// actually moved — generate + gate + store a fresh summary. The model/prompt provenance gates a
@@ -1245,12 +1270,7 @@ async fn sweep(
     let model = cfg.summary_model();
     let scope = scope.clone();
     let cfg = cfg.clone();
-    // One HTTP client (connection pool / TLS cache / resolver) for the whole sweep, not one per
-    // cluster. Cheap to clone-share into each call.
-    let http = reqwest::Client::builder()
-        .timeout(cfg.request_timeout)
-        .build()
-        .context("build summarization http client")?;
+    let http = build_summarize_http(&cfg, "cluster")?;
 
     with_scope(pool, ctx, move |conn| {
         Box::pin(async move {
@@ -1322,10 +1342,7 @@ pub async fn sweep_stories(
 
     let model = cfg.summary_model();
     let cfg = cfg.clone();
-    let http = reqwest::Client::builder()
-        .timeout(cfg.request_timeout)
-        .build()
-        .context("build story-synthesis http client")?;
+    let http = build_summarize_http(&cfg, "story-synthesis")?;
 
     with_scope(pool, ScopeCtx::Subscriber(subscriber_id), move |conn| {
         Box::pin(async move {
@@ -1356,7 +1373,7 @@ pub async fn sweep_stories(
 
                 let hashes: Vec<Option<Vec<u8>>> =
                     members.iter().map(|m| m.summary_hash.clone()).collect();
-                let sig = story_summary_sig(&hashes, None);
+                let sig = story_summary_sig(&hashes);
                 // Exact re-check behind the cheap SQL gate: signature unchanged *and* same model ⇒ the
                 // cached synthesis still holds, so just advance the watermark and skip the model call.
                 if s.summary_sig.as_deref() == Some(sig.as_slice())
@@ -1403,15 +1420,16 @@ pub async fn sweep_thread_labels(
     use crate::common::db::with_scope;
     use anyhow::Context;
 
-    /// How many recent headlines feed the label, and the upper bound on the delta's new-story fan-in.
-    const RECENT_LIMIT: i64 = 6;
+    /// How far the per-thread story scan reaches — bounds the work *and* the accuracy of the delta's
+    /// new-story count: a thread with more new stories than this saturates the count (rendered "N+").
+    const STORY_SCAN_LIMIT: i64 = 30;
+    /// How many headlines actually feed a model call (label or delta) — the §4 short-input fan-in cap,
+    /// independent of the scan above.
+    const FANIN_LIMIT: usize = 6;
 
     let model = cfg.summary_model();
     let cfg = cfg.clone();
-    let http = reqwest::Client::builder()
-        .timeout(cfg.request_timeout)
-        .build()
-        .context("build thread-label http client")?;
+    let http = build_summarize_http(&cfg, "thread-label")?;
 
     with_scope(pool, ScopeCtx::Subscriber(subscriber_id), move |conn| {
         Box::pin(async move {
@@ -1425,54 +1443,77 @@ pub async fn sweep_thread_labels(
             .await
             .context("load threads needing label/delta")?;
             for t in due {
-                // The recent stories on this thread's spine (newest-first) — the label inputs, and
+                // The recent stories on this thread's spine (newest-first): the label inputs, and
                 // (filtered by the prior watermark) the delta's "what newly changed".
                 let recent = store::thread_recent_stories(
                     &mut *conn,
                     subscriber_id,
                     &t.entities,
-                    RECENT_LIMIT,
+                    STORY_SCAN_LIMIT,
                 )
                 .await
                 .context("load thread recent stories")?;
-                let recent_headlines: Vec<String> =
-                    recent.iter().map(|s| s.headline.clone()).collect();
                 let since = t
                     .delta_through
                     .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
-                let new_headlines: Vec<String> = recent
+                // All stories newer than the watermark (up to the scan limit), so the count is accurate
+                // for the deterministic delta; the LLM fan-in is capped separately to FANIN_LIMIT.
+                let new: Vec<&store::ThreadStory> = recent
                     .iter()
                     .filter(|s| s.last_event_time > since)
+                    .collect();
+                let new_count = new.len();
+                // The count is exact unless *every* scanned story is new (then more may lie beyond the
+                // scan window, so the deterministic delta renders "N+").
+                let saturated = new_count as i64 == STORY_SCAN_LIMIT;
+                let new_headlines: Vec<String> = new
+                    .iter()
+                    .take(FANIN_LIMIT)
                     .map(|s| s.headline.clone())
                     .collect();
 
-                // Label: upgrade only when missing or after a model change (a readable label is stable
-                // across the thread's life — don't re-call it on every new story). Keep the prior
+                // Label: (re)generate when missing, after a model change, *or* when new stories landed
+                // — the thread's subject can drift as its spine grows, so a label that never refreshes
+                // would go stale against the (always-recomputed) deterministic baseline. Keep the prior
                 // readable label on a gate/transport miss; never downgrade.
-                let need_label =
-                    t.summary.is_empty() || t.summary_model.as_deref() != Some(model.as_str());
+                let need_label = t.summary.is_empty()
+                    || t.summary_model.as_deref() != Some(model.as_str())
+                    || new_count > 0;
                 let mut summary = t.summary.clone();
-                if need_label && !recent_headlines.is_empty() {
-                    if let Some(label) =
-                        client::label_thread(&cfg, &http, &t.entities, &recent_headlines).await
-                    {
-                        summary = ThreadSummary { label };
+                if need_label {
+                    let label_headlines: Vec<String> = recent
+                        .iter()
+                        .take(FANIN_LIMIT)
+                        .map(|s| s.headline.clone())
+                        .collect();
+                    if !label_headlines.is_empty() {
+                        if let Some(label) =
+                            client::label_thread(&cfg, &http, &t.entities, &label_headlines).await
+                        {
+                            summary = ThreadSummary { label };
+                        }
                     }
                 }
 
-                // Delta: the LLM flag over the new stories, falling back to the deterministic count.
-                let new_count = new_headlines.len();
+                // Delta: the LLM flag over the new stories, falling back to the deterministic count
+                // ("N+" when the scan saturated). When *nothing* is new, keep the prior delta rather
+                // than clearing it — a model-only re-fire (no new stories) must not wipe a valid flag.
                 let delta = if new_headlines.is_empty() {
-                    None
+                    t.delta.clone()
                 } else {
                     let label_for_delta = if summary.label.trim().is_empty() {
                         auto_label(&t.entities)
                     } else {
                         summary.label.clone()
                     };
+                    let count_delta = if saturated {
+                        Some(format!("{new_count}+ updates"))
+                    } else {
+                        auto_delta(new_count)
+                    };
                     client::delta_thread(&cfg, &http, &label_for_delta, &new_headlines)
                         .await
-                        .or_else(|| auto_delta(new_count))
+                        .or(count_delta)
                 };
 
                 // The watermark the delta now covers = the thread's last story time (so an unchanged
@@ -1853,24 +1894,18 @@ mod tests {
     }
 
     #[test]
-    fn story_sig_is_order_independent_and_thread_sensitive() {
+    fn story_sig_is_order_independent_and_member_sensitive() {
         let a = Some(vec![1u8, 2, 3]);
         let b = Some(vec![4u8, 5, 6]);
-        let t = uuid::Uuid::from_u128(7);
         // Member order does not matter (the sig sorts).
         assert_eq!(
-            story_summary_sig(&[a.clone(), b.clone()], Some(t)),
-            story_summary_sig(&[b.clone(), a.clone()], Some(t)),
-        );
-        // The thread assignment is part of the signature.
-        assert_ne!(
-            story_summary_sig(&[a.clone(), b.clone()], Some(t)),
-            story_summary_sig(&[a.clone(), b.clone()], None),
+            story_summary_sig(&[a.clone(), b.clone()]),
+            story_summary_sig(&[b.clone(), a.clone()]),
         );
         // A member gaining its summary hash (None → Some) moves the sig → re-synthesis.
         assert_ne!(
-            story_summary_sig(&[a.clone(), None], None),
-            story_summary_sig(&[a, b], None),
+            story_summary_sig(&[a.clone(), None]),
+            story_summary_sig(&[a, b]),
         );
     }
 

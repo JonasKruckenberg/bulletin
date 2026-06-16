@@ -15,6 +15,12 @@
 -- A recomputable cache over the durable cluster summaries: lose it, rebuild it.
 
 ALTER TABLE story ADD COLUMN summary       jsonb NOT NULL DEFAULT '{}';  -- the fused cross-source item summary (headline + tldr run-list + facts + band), same shape as cluster.summary
-ALTER TABLE story ADD COLUMN summary_sig   bytea;        -- member signature: hash of (sorted member cluster.summary_hash[] ‖ thread_id) — the §2.2 staleness gate
+ALTER TABLE story ADD COLUMN summary_sig   bytea;        -- member signature: hash of the sorted member cluster.summary_hash[] — the §2.2 staleness gate (thread_id is not folded in; see story_summary_sig)
 ALTER TABLE story ADD COLUMN summary_model text;         -- "<model>@<prompt-version>" → a model/prompt upgrade re-synthesizes the corpus by a WHERE sweep, no data migration
 ALTER TABLE story ADD COLUMN summarized_at timestamptz;  -- when the synthesis was last written: staleness + the "due" gate
+
+-- The synthesis work queue, mirroring cluster_needs_summary (migration 027): the common "never
+-- synthesized" scan stays cheap (a content change is found at sweep time by `updated_at > summarized_at`
+-- — the upsert bumps `updated_at` only on a real change — plus an exact `summary_sig` re-check in Rust).
+CREATE INDEX story_needs_summary ON story (subscriber_id, last_event_time)
+  WHERE summarized_at IS NULL;

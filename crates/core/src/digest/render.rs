@@ -10,7 +10,7 @@ use lettre::{message::MultiPart, Message};
 use crate::digest::select::{Format, ItemReason};
 use crate::digest::store::{RenderItem, ThreadTag};
 use crate::identity::ConfidenceBand;
-use crate::summarize::{Band, TldrRun};
+use crate::summarize::TldrRun;
 
 /// The human-readable "why" for an item (design §10.2): its format, the richness phrase that chose
 /// that format, and its relevance. Rendered as a caption on every item and in the plaintext fallback,
@@ -623,7 +623,7 @@ fn render_summary_runs(runs: &[TldrRun]) -> String {
 /// surface text is shown verbatim, degrading gracefully to plain text for an unknown namespace.
 fn render_entity_badge(entity: &str, surface: &str) -> String {
     let s = escape(surface);
-    match entity.split_once(':').map(|(ns, _)| ns) {
+    match crate::identity::namespace(entity).map(|(ns, _)| ns) {
         Some("repo") => format!(
             r#"<span style="border-bottom:1px dotted {ACCENT};font-weight:600;color:{INK_BODY};">{s}</span>"#
         ),
@@ -676,17 +676,20 @@ fn debug_trace_block(position: usize, item: &RenderItem, tz: Tz) -> String {
         )
     };
 
-    // Summary provenance (Phase A/C): where the rendered headline/tldr came from, and its band.
+    // Summary provenance (Phase A/C): where the rendered headline/tldr came from, and its band. The
+    // story cache (`item.synthesized`) may hold a true cross-source fusion *or* the representative
+    // cluster summary it fell back to on a gate rejection — render can't tell them apart, so the label
+    // is the honest "story.summary cache" rather than asserting a synthesis happened.
     let summary_origin = if item.summary_runs.is_empty() {
         "raw title (no summary)"
     } else if item.synthesized {
-        "story synthesis"
+        "story.summary cache"
     } else {
         "cluster summary"
     };
     let summary_trace = format!(
         r#"<div style="margin-top:4px;">summary <span style="font-weight:700;">{summary_origin}</span> &middot; band {}</div>"#,
-        band_str(item.summary_band),
+        item.summary_band.as_str(),
     );
 
     // Thread trace (Phase B): label · identity band · delta flag.
@@ -707,7 +710,8 @@ fn debug_trace_block(position: usize, item: &RenderItem, tz: Tz) -> String {
         None => String::new(),
     };
 
-    // Related (§8.2): the fused cross-source connections + each one's link_reason, moved off the email.
+    // Related (§8.2): the fused cross-source connections + each one's link_reason and click-through
+    // URL, moved off the editorial email into the trace (so the cross-source detail stays inspectable).
     let mut related_trace = String::new();
     for c in &item.connections {
         let reason = c
@@ -715,8 +719,13 @@ fn debug_trace_block(position: usize, item: &RenderItem, tz: Tz) -> String {
             .as_deref()
             .map(|r| format!(" &mdash; {}", escape(r)))
             .unwrap_or_default();
+        let link = c
+            .link
+            .as_deref()
+            .map(|l| format!(" &middot; {}", escape(l)))
+            .unwrap_or_default();
         related_trace.push_str(&format!(
-            r#"<div style="margin-top:4px;word-break:break-word;">&#8627; {} [{}]{reason}</div>"#,
+            r#"<div style="margin-top:4px;word-break:break-word;">&#8627; {} [{}]{reason}{link}</div>"#,
             escape(&c.title),
             escape(c.source.as_str()),
         ));
@@ -733,15 +742,6 @@ fn debug_trace_block(position: usize, item: &RenderItem, tz: Tz) -> String {
 <!-- /DEBUG -->
 "#
     )
-}
-
-/// The faithfulness band as a debug-trace token (`confirmed`/`probable`/`uncertain`, §3.4).
-fn band_str(band: Band) -> &'static str {
-    match band {
-        Band::Confirmed => "confirmed",
-        Band::Probable => "probable",
-        Band::Uncertain => "uncertain",
-    }
 }
 
 /// A **Note** row (design §8.4/§9.5): the compact one-liner for a thin, atomic item — the same
@@ -827,6 +827,7 @@ mod tests {
     use super::*;
     use crate::common::kind::SourceKind;
     use crate::digest::store::Connection;
+    use crate::summarize::Band;
     use chrono::TimeZone;
 
     fn item(title: &str, link: Option<&str>, source: SourceKind) -> RenderItem {

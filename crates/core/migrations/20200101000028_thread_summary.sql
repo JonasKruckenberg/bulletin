@@ -15,3 +15,9 @@ ALTER TABLE thread ADD COLUMN delta         text;         -- the §5.2 delta fla
 ALTER TABLE thread ADD COLUMN delta_through timestamptz;  -- watermark the delta covers (the thread's last summarized appearance): no new stories since ⇒ delta is current, skip
 ALTER TABLE thread ADD COLUMN summary_model text;         -- "<model>@<prompt-version>" → a model/prompt upgrade re-summarizes the corpus by a WHERE sweep, no data migration
 ALTER TABLE thread ADD COLUMN summarized_at timestamptz;  -- when the label/delta were last (re)written: staleness + the "due" gate
+
+-- The label/delta work queue's cheap "never summarized" scan (a thread whose stories advanced is found
+-- at sweep time by `last_story_time IS DISTINCT FROM delta_through`). The per-subscriber thread set is
+-- small ("a life"), so this partial index mainly keeps the cold-start bulk pass off a seq scan.
+CREATE INDEX thread_needs_summary ON thread (subscriber_id, last_story_time)
+  WHERE summarized_at IS NULL;

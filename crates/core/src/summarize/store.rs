@@ -241,6 +241,9 @@ pub(crate) struct DueThread {
     pub id: Uuid,
     pub entities: Vec<String>,
     pub summary: ThreadSummary,
+    /// The prior delta flag — preserved when a pass finds no new stories (e.g. a model-only re-fire),
+    /// so a still-valid delta isn't cleared.
+    pub delta: Option<String>,
     pub delta_through: Option<DateTime<Utc>>,
     pub last_story_time: Option<DateTime<Utc>>,
     pub summary_model: Option<String>,
@@ -256,7 +259,7 @@ pub(crate) async fn threads_needing_summary(
     limit: i64,
 ) -> Result<Vec<DueThread>, sqlx::Error> {
     sqlx::query(
-        "SELECT id, entities, summary, delta_through, last_story_time, summary_model
+        "SELECT id, entities, summary, delta, delta_through, last_story_time, summary_model
          FROM thread
          WHERE subscriber_id = $1 AND merged_into IS NULL AND state <> 'archived'
            AND ( summarized_at IS NULL
@@ -275,6 +278,7 @@ pub(crate) async fn threads_needing_summary(
             id: row.get("id"),
             entities: row.get("entities"),
             summary,
+            delta: row.get("delta"),
             delta_through: row.get("delta_through"),
             last_story_time: row.get("last_story_time"),
             summary_model: row.get("summary_model"),
