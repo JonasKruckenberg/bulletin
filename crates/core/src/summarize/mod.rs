@@ -615,17 +615,27 @@ pub fn faithful(
     }
 
     // House-voice lint (§3.6 denylist), whole-word + case-insensitive.
-    let words_lc = output.to_lowercase();
-    for banned in BANNED_WORDS {
-        if contains_word(&words_lc, banned) {
-            return Err(GateViolation::BannedWord((*banned).to_string()));
-        }
-    }
-    if output.contains('!') {
-        return Err(GateViolation::BannedWord("!".to_string()));
+    if let Some(w) = banned_word_in(&output) {
+        return Err(GateViolation::BannedWord(w));
     }
 
     Ok(())
+}
+
+/// The §3.6 house-voice lint, factored out so the cluster gate, the story synthesis gate, and the
+/// Phase-B label/delta cleaners all reject the same hype/second-person vocabulary (and `!`). Returns
+/// the first banned token found (whole-word, case-insensitive), or `None` if the text is clean.
+pub fn banned_word_in(text: &str) -> Option<String> {
+    let lc = text.to_lowercase();
+    for banned in BANNED_WORDS {
+        if contains_word(&lc, banned) {
+            return Some((*banned).to_string());
+        }
+    }
+    if text.contains('!') {
+        return Some("!".to_string());
+    }
+    None
 }
 
 /// Whole-word, case-insensitive containment: `needle` (already lowercase) bounded by non-alphanumeric
@@ -820,6 +830,359 @@ pub fn source_corpus(events: &[Event], max_chars: usize) -> String {
     out
 }
 
+// ── Phase C — Story cross-source synthesis (§2.2) ────────────────────────────────────────────────
+
+/// The **member signature** that caches a story's synthesis (§2.2): SHA-256 over the *sorted* set of
+/// member-cluster `summary_hash`es plus the assigned `thread_id`. Stories are id-forwarded and stable
+/// across fires, so this sig is stable until membership/content actually moves — the synthesis is
+/// reused across fires for free and regenerated only when a source is added/dropped or a member's
+/// content changes. Sorting makes it order-independent of the caller. A member with no summary hash
+/// yet still contributes (its empty slot is part of the signature), so adding the missing summary
+/// later moves the sig and triggers a re-synthesis.
+pub fn story_summary_sig(
+    member_hashes: &[Option<Vec<u8>>],
+    thread_id: Option<uuid::Uuid>,
+) -> Vec<u8> {
+    const FIELD: u8 = 0x00;
+    const NONE: u8 = 0x01; // marks a member with no summary hash yet, so it can't collide with empty
+    let mut sorted: Vec<&Option<Vec<u8>>> = member_hashes.iter().collect();
+    sorted.sort();
+    let mut h = Sha256::new();
+    for m in sorted {
+        match m {
+            Some(bytes) => h.update(bytes),
+            None => h.update([NONE]),
+        }
+        h.update([FIELD]);
+    }
+    if let Some(t) = thread_id {
+        h.update(t.as_bytes());
+    }
+    h.finalize().to_vec()
+}
+
+/// Fuse the member clusters' grounding [`Facts`] into the story's facts (§3.2 one level up): the
+/// sorted union of their entities/numbers/dates (the closed `enum` the synthesis tldr's refs are still
+/// constrained to — a hallucinated entity stays structurally impossible). `certainty` is the *weakest*
+/// (any member `tentative` ⇒ the fused stance is `tentative`, so the synthesis keeps the hedge), and
+/// `event_type`/`state` take the first member that has one (callers pass members newest-first, so the
+/// freshest lifecycle wins). Pure + deterministic, unit-tested without a model.
+pub fn synthesize_facts(members: &[ClusterSummary]) -> Facts {
+    let mut entities: Vec<String> = Vec::new();
+    let mut numbers: Vec<String> = Vec::new();
+    let mut dates: Vec<String> = Vec::new();
+    let mut certainty = Certainty::Asserted;
+    let mut event_type: Option<String> = None;
+    let mut state: Option<String> = None;
+    for m in members {
+        entities.extend(m.facts.entities.iter().cloned());
+        numbers.extend(m.facts.numbers.iter().cloned());
+        dates.extend(m.facts.dates.iter().cloned());
+        if m.facts.certainty == Certainty::Tentative {
+            certainty = Certainty::Tentative;
+        }
+        if event_type.is_none() {
+            event_type.clone_from(&m.facts.event_type);
+        }
+        if state.is_none() {
+            state.clone_from(&m.facts.state);
+        }
+    }
+    dedup_sorted(&mut entities);
+    dedup_sorted(&mut numbers);
+    dedup_sorted(&mut dates);
+    Facts {
+        entities,
+        event_type,
+        state,
+        certainty,
+        numbers,
+        dates,
+    }
+}
+
+/// The concatenated grounding source for a story synthesis call (§4): the member clusters' precomputed
+/// `headline` + `tldr_text` — **a handful of short summaries, never their raw events again** (the §4
+/// "short inputs win" rule that keeps a 3–4B model in its faithful regime). The fused `Facts` are also
+/// passed; this is the prose the gate checks numbers/dates against, and what the model rephrases.
+pub fn story_member_corpus(members: &[ClusterSummary]) -> String {
+    let mut out = String::new();
+    for m in members {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(m.headline.trim());
+        let tldr = m.tldr_text.trim();
+        if !tldr.is_empty() {
+            out.push('\n');
+            out.push_str(tldr);
+        }
+    }
+    out
+}
+
+/// The story-synthesis system prompt (§3.6) — the cross-source sibling of [`SYSTEM_PROMPT`], engineered
+/// for a 3–4B model: it rewrites the *given member summaries* into one headline + tldr for the whole
+/// happening, fuses without listing the sources, and keeps the same grounding/voice rules. A constant
+/// ⇒ prefix-cached.
+pub const STORY_SYSTEM_PROMPT: &str = r#"You are given several short summaries that are all the SAME happening, seen across different sources.
+You write ONE headline and ONE tldr for the whole thing. You add nothing.
+
+1. These summaries describe one event from different angles. Fuse them into a single view.
+2. Use only the facts and text given. Every name, number, and date you write must be in the input.
+3. Refer to people, repos, services, and CVEs only by the entity ids listed. Nothing more.
+4. Do NOT list or name the sources ("across GitHub and Slack"). The interface shows them.
+5. Each fact has "certainty". tentative -> hedge (suspected, appears to). asserted -> say it plainly.
+6. Plain words. Active voice. Do not use: massive, huge, critical (unless in the source),
+   game-changing, exciting, "!", "you", "we".
+7. Output only the JSON the schema asks for. No preamble.
+
+EXAMPLE
+members:
+- A CVE advisory affects the billing PDF renderer.
+- An incident PR disables remote asset fetching in acme/billing.
+- Slack: "PDF export is down for some tenants".
+out: {"headline":"SSRF advisory forces a billing PDF mitigation",
+      "tldr":[{"text":"A high-severity advisory in "},
+              {"ref":"repo:acme/billing","surface":"acme/billing"},
+              {"text":"'s PDF path is being mitigated by disabling remote asset fetching."}]}"#;
+
+/// The per-story synthesis user prompt: the member summaries (the §4 short fan-in), the closed
+/// allowed-entity ids, and the thread label for context, with the concrete ask. Short and concrete
+/// over the pre-distilled inputs, like [`user_prompt`].
+pub fn story_user_prompt(facts: &Facts, members_text: &str, thread_label: Option<&str>) -> String {
+    let entity_list = list_or_none(&facts.entities);
+    let facts_json = serde_json::to_string(facts).unwrap_or_else(|_| "{}".to_string());
+    let context = match thread_label {
+        Some(l) if !l.trim().is_empty() => format!("thread: {}\n", l.trim()),
+        _ => String::new(),
+    };
+    format!(
+        "{context}facts: {facts_json}\n\
+         allowed entity ids (use only these for refs): {entity_list}\n\
+         member summaries:\n{members_text}\n\n\
+         These are the same happening across sources. Write one headline (<= 90 chars) and one \
+         tldr (1-2 sentences) for the whole thing. Do not list the sources."
+    )
+}
+
+// ── Phase B — Thread label + delta (the context eyebrow, §2.3/§6.1) ──────────────────────────────
+
+/// The readable "state of this thread" the LLM upgrade writes onto `thread.summary` (§2.3): just the
+/// human-readable **label** ("Acme auth migration") that supersedes the deterministic auto-label
+/// ("acme/auth +3") at render. The inert default (`'{}'` ⇒ [`is_empty`](Self::is_empty)) means no
+/// upgrade has run, so the renderer falls back to `thread.label` (the deterministic baseline).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ThreadSummary {
+    /// The LLM-upgraded readable label. Empty ⇒ render uses the deterministic `thread.label`.
+    #[serde(default)]
+    pub label: String,
+}
+
+impl ThreadSummary {
+    /// True for the inert default — no label upgrade has run.
+    pub fn is_empty(&self) -> bool {
+        self.label.trim().is_empty()
+    }
+}
+
+/// The deterministic thread auto-label (§2.3 baseline): a readable-ish name derived from the thread's
+/// entity spine — the highest-priority entity's display value plus a `+N` for the rest ("acme/auth
+/// +2"). Written every maintenance pass (cheap, recomputable), so the context eyebrow lights up even
+/// with the `llm-summarization` feature off; the gated label sweep upgrades it to a prose label. Empty
+/// for an empty spine (the eyebrow is then omitted, §6.1).
+pub fn auto_label(entities: &[String]) -> String {
+    if entities.is_empty() {
+        return String::new();
+    }
+    let mut sorted: Vec<&String> = entities.iter().collect();
+    sorted.sort_by(|a, b| {
+        entity_priority(a)
+            .cmp(&entity_priority(b))
+            .then_with(|| a.cmp(b))
+    });
+    let head = entity_display(sorted[0]);
+    let rest = entities.len() - 1;
+    if rest == 0 {
+        head.to_string()
+    } else {
+        format!("{head} +{rest}")
+    }
+}
+
+/// Render-order priority of an entity namespace for the auto-label head (lower = preferred): a repo or
+/// CVE names a thread better than a bare user or url. Unknown namespaces sort last.
+fn entity_priority(token: &str) -> u8 {
+    match token.split_once(':').map(|(ns, _)| ns) {
+        Some("repo") => 0,
+        Some("cve") => 1,
+        Some("user") => 2,
+        Some("domain") => 3,
+        Some("url") => 4,
+        _ => 5,
+    }
+}
+
+/// The display value of a namespaced entity token: the part after the first `:` (so `repo:acme/auth` →
+/// `acme/auth`, `cve:CVE-2026-1234` → `CVE-2026-1234`), or the whole token if it carries no namespace.
+fn entity_display(token: &str) -> &str {
+    token.split_once(':').map_or(token, |(_, v)| v)
+}
+
+/// The deterministic delta baseline (§5.2): a terse count flag of the stories that newly moved on this
+/// thread since the last summarized appearance — "3 updates" / "1 update". `None` for nothing new (the
+/// eyebrow then carries the label alone). The gated delta sweep upgrades this to a readable flag
+/// ("staging cutover landed"); this is the always-true fallback.
+pub fn auto_delta(new_story_count: usize) -> Option<String> {
+    match new_story_count {
+        0 => None,
+        1 => Some("1 update".to_string()),
+        n => Some(format!("{n} updates")),
+    }
+}
+
+/// Max chars for a readable thread label (the §6.1 one-line eyebrow head). Matches the schema
+/// `maxLength`; the cleaner clamps to it as defense in depth.
+const LABEL_MAX: usize = 48;
+/// Max chars for a delta flag (a few words, §6.1). Matches the schema `maxLength`.
+const DELTA_MAX: usize = 48;
+/// Max words for a delta flag (§3.6 "≤6 words: a flag, not a sentence").
+const DELTA_MAX_WORDS: usize = 6;
+
+/// Clean + gate a model-produced thread **label** (§3.6 backstop): trim, reject empties, over-length
+/// (> [`LABEL_MAX`]), and the house-voice denylist (hype / second-person / `!`). `None` ⇒ the caller
+/// keeps the deterministic auto-label. A label is a *name*, so there is no entity/number grounding
+/// check here — only voice + length (the resolver's confidence band carries the identity doubt, §6.1).
+pub fn clean_label(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() || s.chars().count() > LABEL_MAX {
+        return None;
+    }
+    if banned_word_in(s).is_some() {
+        return None;
+    }
+    Some(s.to_string())
+}
+
+/// Clean + gate a model-produced **delta** flag (§3.6): trim, strip any trailing end punctuation
+/// ("staging cutover landed." → "…landed", since the delta carries none), then reject empties,
+/// over-length (> [`DELTA_MAX`] chars or > [`DELTA_MAX_WORDS`] words), and the house-voice denylist.
+/// `None` ⇒ the caller keeps the deterministic count delta.
+pub fn clean_delta(raw: &str) -> Option<String> {
+    let s = raw
+        .trim()
+        .trim_end_matches(['.', '!', '?', ',', ';'])
+        .trim();
+    if s.is_empty()
+        || s.chars().count() > DELTA_MAX
+        || s.split_whitespace().count() > DELTA_MAX_WORDS
+    {
+        return None;
+    }
+    if banned_word_in(s).is_some() {
+        return None;
+    }
+    Some(s.to_string())
+}
+
+/// The thread-label system prompt (§3.6) — engineered for a 3–4B model: name the persistent thread of
+/// someone's work life in a few words, from the entity spine + a couple of recent headlines. A
+/// constant ⇒ prefix-cached.
+pub const LABEL_SYSTEM_PROMPT: &str = r#"You name a recurring thread of someone's work life in a few words.
+The name is a short noun phrase a colleague would recognize: "Acme auth migration", "On-call rotation", "Billing rewrite".
+
+1. 2-5 words. Title-style, no trailing punctuation.
+2. Base it on the entities and recent headlines given. Use only what is given.
+3. Plain words. Do not use: massive, huge, game-changing, exciting, "!", "you", "we".
+4. Output only the JSON the schema asks for. No preamble.
+
+EXAMPLES
+entities: repo:acme/auth, user:dlewis | recent: "Auth outage traced to the token rotation deploy"
+out: {"label":"Acme auth migration"}
+entities: service:pagerduty | recent: "You're on call from Friday 18:00"
+out: {"label":"On-call rotation"}"#;
+
+/// The thread-delta system prompt (§3.6 / §5.2) — engineered for a 3–4B model: compress what *newly*
+/// changed on a known thread into a terse flag, not a sentence.
+pub const DELTA_SYSTEM_PROMPT: &str = r#"You write a SHORT flag of what newly changed on a thread the reader already knows.
+It is a tag, not a sentence: "staging cutover landed", "reactivated", "3 follow-ups", "patch merged".
+
+1. <= 6 words. No end punctuation.
+2. Base it only on the new updates given. Use only what is given.
+3. Plain words. Do not use: massive, huge, game-changing, exciting, "!", "you", "we".
+4. Output only the JSON the schema asks for. No preamble.
+
+EXAMPLES
+thread: Acme auth migration | new: "Staging cutover completed; two follow-up tickets opened"
+out: {"delta":"staging cutover landed"}
+thread: Billing rewrite | new: "The dormant invoice-PDF work picked back up after the advisory"
+out: {"delta":"reactivated"}"#;
+
+/// The thread-label user prompt: the entity spine + a few recent headlines on the thread + the ask.
+pub fn label_user_prompt(entities: &[String], recent_headlines: &[String]) -> String {
+    format!(
+        "entities: {}\n\
+         recent headlines:\n{}\n\n\
+         Name this thread in 2-5 words.",
+        list_or_none(entities),
+        bullet_list(recent_headlines),
+    )
+}
+
+/// The thread-delta user prompt: the thread label + the new stories' headlines since the watermark.
+pub fn delta_user_prompt(label: &str, new_headlines: &[String]) -> String {
+    format!(
+        "thread: {label}\n\
+         new updates:\n{}\n\n\
+         In <= 6 words, what newly changed? A flag, not a sentence. No end punctuation.",
+        bullet_list(new_headlines),
+    )
+}
+
+/// A `- item` bullet list for a prompt, or `(none)` when empty — so the model is told a section is
+/// empty rather than inferring it from a blank.
+fn bullet_list(items: &[String]) -> String {
+    if items.is_empty() {
+        return "(none)".to_string();
+    }
+    items
+        .iter()
+        .map(|h| format!("- {}", h.trim()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The thread-label response schema — a single length-capped `label` string (no enums; a label is a
+/// free phrase, gated for voice by [`clean_label`]).
+pub fn label_schema() -> serde_json::Value {
+    use serde_json::json;
+    json!({
+        "name": "thread_label",
+        "strict": true,
+        "schema": {
+            "type": "object",
+            "properties": { "label": { "type": "string", "maxLength": LABEL_MAX } },
+            "required": ["label"],
+            "additionalProperties": false
+        }
+    })
+}
+
+/// The thread-delta response schema — a single length-capped `delta` string, gated by [`clean_delta`].
+pub fn delta_schema() -> serde_json::Value {
+    use serde_json::json;
+    json!({
+        "name": "thread_delta",
+        "strict": true,
+        "schema": {
+            "type": "object",
+            "properties": { "delta": { "type": "string", "maxLength": DELTA_MAX } },
+            "required": ["delta"],
+            "additionalProperties": false
+        }
+    })
+}
+
 // ── The sweep (gated) — walk the work queue, summarize best-effort ───────────────────────────────
 
 /// What a summarization sweep did, for logs / metrics.
@@ -929,6 +1292,202 @@ async fn sweep(
                     }
                     None => stats.unavailable += 1,
                 }
+            }
+            Ok(stats)
+        })
+    })
+    .await
+}
+
+/// Run a best-effort **story cross-source synthesis** pass (Phase C, §2.2) for one subscriber, in
+/// their RLS context. Walks the stories whose membership/content changed, recomputes each one's member
+/// signature from the member clusters' `summary_hash`es, and — only if it moved (or a model upgrade) —
+/// synthesizes a fused summary from the **member cluster summaries** (never their raw events, §4),
+/// cached by the signature so a stable story is reused for free across fires. Best-effort by contract:
+/// a per-story failure leaves it un-synthesized (fire-time falls back to the representative cluster,
+/// §2.2 cold-start) and the pass continues. Only exists in a `llm-summarization` build.
+///
+/// (Deviation from §2.2: the member signature is keyed on member content alone — `thread_id` is not
+/// folded in, so a story moving threads doesn't itself force a re-synthesis. The synthesis quality
+/// barely depends on the thread context, and this keeps Phase C decoupled from fire-time
+/// thread-assignment. Revisit if cross-thread restatement proves valuable.)
+#[cfg(feature = "llm-summarization")]
+pub async fn sweep_stories(
+    pool: &sqlx::PgPool,
+    subscriber_id: uuid::Uuid,
+    cfg: &SummarizationConfig,
+) -> anyhow::Result<SummarizeStats> {
+    use crate::common::db::with_scope;
+    use anyhow::Context;
+
+    let model = cfg.summary_model();
+    let cfg = cfg.clone();
+    let http = reqwest::Client::builder()
+        .timeout(cfg.request_timeout)
+        .build()
+        .context("build story-synthesis http client")?;
+
+    with_scope(pool, ScopeCtx::Subscriber(subscriber_id), move |conn| {
+        Box::pin(async move {
+            let mut stats = SummarizeStats::default();
+            let due = store::stories_needing_summary(
+                &mut *conn,
+                subscriber_id,
+                &model,
+                cfg.max_per_sweep,
+            )
+            .await
+            .context("load stories needing synthesis")?;
+            for s in due {
+                let members = store::load_member_summaries(&mut *conn, &s.cluster_ids)
+                    .await
+                    .context("load story member summaries")?;
+                // A cross-source synthesis needs ≥2 members *and* at least one with a real cluster
+                // summary to fuse; otherwise fire-time already renders the representative cluster
+                // identically — skip the model call, just advance the watermark so it isn't re-flagged.
+                let has_content = members.iter().any(|m| !m.summary.is_empty());
+                if members.len() < 2 || !has_content {
+                    store::touch_story_summarized(&mut *conn, s.id, &model)
+                        .await
+                        .ok();
+                    stats.skipped += 1;
+                    continue;
+                }
+
+                let hashes: Vec<Option<Vec<u8>>> =
+                    members.iter().map(|m| m.summary_hash.clone()).collect();
+                let sig = story_summary_sig(&hashes, None);
+                // Exact re-check behind the cheap SQL gate: signature unchanged *and* same model ⇒ the
+                // cached synthesis still holds, so just advance the watermark and skip the model call.
+                if s.summary_sig.as_deref() == Some(sig.as_slice())
+                    && s.summary_model.as_deref() == Some(model.as_str())
+                {
+                    store::touch_story_summarized(&mut *conn, s.id, &model)
+                        .await
+                        .ok();
+                    stats.skipped += 1;
+                    continue;
+                }
+
+                let summaries: Vec<ClusterSummary> =
+                    members.into_iter().map(|m| m.summary).collect();
+                match client::synthesize_story(&cfg, &http, &summaries, None).await {
+                    Some(summary) => {
+                        store::store_story_summary(&mut *conn, s.id, &summary, &sig, &model)
+                            .await
+                            .context("store story summary")?;
+                        stats.summarized += 1;
+                    }
+                    None => stats.unavailable += 1,
+                }
+            }
+            Ok(stats)
+        })
+    })
+    .await
+}
+
+/// Run a best-effort **thread label + delta** pass (Phase B, §2.3/§5.2) for one subscriber, in their
+/// RLS context. For each non-archived thread due for a pass, it upgrades the deterministic auto-label
+/// to a readable one (stored on `thread.summary`, leaving `thread.label` as the baseline beneath) and
+/// composes the §5.2 delta flag from the stories that newly landed since `delta_through` — both from
+/// the precomputed story/cluster headlines, never raw events (§4). Best-effort: a per-thread failure
+/// keeps the deterministic label/count-delta and the pass continues. Only exists in a
+/// `llm-summarization` build.
+#[cfg(feature = "llm-summarization")]
+pub async fn sweep_thread_labels(
+    pool: &sqlx::PgPool,
+    subscriber_id: uuid::Uuid,
+    cfg: &SummarizationConfig,
+) -> anyhow::Result<SummarizeStats> {
+    use crate::common::db::with_scope;
+    use anyhow::Context;
+
+    /// How many recent headlines feed the label, and the upper bound on the delta's new-story fan-in.
+    const RECENT_LIMIT: i64 = 6;
+
+    let model = cfg.summary_model();
+    let cfg = cfg.clone();
+    let http = reqwest::Client::builder()
+        .timeout(cfg.request_timeout)
+        .build()
+        .context("build thread-label http client")?;
+
+    with_scope(pool, ScopeCtx::Subscriber(subscriber_id), move |conn| {
+        Box::pin(async move {
+            let mut stats = SummarizeStats::default();
+            let due = store::threads_needing_summary(
+                &mut *conn,
+                subscriber_id,
+                &model,
+                cfg.max_per_sweep,
+            )
+            .await
+            .context("load threads needing label/delta")?;
+            for t in due {
+                // The recent stories on this thread's spine (newest-first) — the label inputs, and
+                // (filtered by the prior watermark) the delta's "what newly changed".
+                let recent = store::thread_recent_stories(
+                    &mut *conn,
+                    subscriber_id,
+                    &t.entities,
+                    RECENT_LIMIT,
+                )
+                .await
+                .context("load thread recent stories")?;
+                let recent_headlines: Vec<String> =
+                    recent.iter().map(|s| s.headline.clone()).collect();
+                let since = t
+                    .delta_through
+                    .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
+                let new_headlines: Vec<String> = recent
+                    .iter()
+                    .filter(|s| s.last_event_time > since)
+                    .map(|s| s.headline.clone())
+                    .collect();
+
+                // Label: upgrade only when missing or after a model change (a readable label is stable
+                // across the thread's life — don't re-call it on every new story). Keep the prior
+                // readable label on a gate/transport miss; never downgrade.
+                let need_label =
+                    t.summary.is_empty() || t.summary_model.as_deref() != Some(model.as_str());
+                let mut summary = t.summary.clone();
+                if need_label && !recent_headlines.is_empty() {
+                    if let Some(label) =
+                        client::label_thread(&cfg, &http, &t.entities, &recent_headlines).await
+                    {
+                        summary = ThreadSummary { label };
+                    }
+                }
+
+                // Delta: the LLM flag over the new stories, falling back to the deterministic count.
+                let new_count = new_headlines.len();
+                let delta = if new_headlines.is_empty() {
+                    None
+                } else {
+                    let label_for_delta = if summary.label.trim().is_empty() {
+                        auto_label(&t.entities)
+                    } else {
+                        summary.label.clone()
+                    };
+                    client::delta_thread(&cfg, &http, &label_for_delta, &new_headlines)
+                        .await
+                        .or_else(|| auto_delta(new_count))
+                };
+
+                // The watermark the delta now covers = the thread's last story time (so an unchanged
+                // thread isn't re-flagged); stored as-is (including NULL) to keep the due-gate stable.
+                store::store_thread_summary(
+                    &mut *conn,
+                    t.id,
+                    &summary,
+                    delta.as_deref(),
+                    t.last_story_time,
+                    &model,
+                )
+                .await
+                .context("store thread summary")?;
+                stats.summarized += 1;
             }
             Ok(stats)
         })
@@ -1265,5 +1824,166 @@ mod tests {
     fn summary_model_string() {
         let cfg = SummarizationConfig::default();
         assert_eq!(cfg.summary_model(), "qwen3.5-4b-instruct@2");
+    }
+
+    // ── Phase C — story synthesis ────────────────────────────────────────────────────────────────
+
+    fn member(
+        headline: &str,
+        entities: &[&str],
+        numbers: &[&str],
+        certainty: Certainty,
+    ) -> ClusterSummary {
+        let mut m = ClusterSummary {
+            headline: headline.to_string(),
+            tldr: vec![TldrRun::Text {
+                text: format!("{headline} body."),
+            }],
+            facts: Facts {
+                entities: entities.iter().map(|s| s.to_string()).collect(),
+                numbers: numbers.iter().map(|s| s.to_string()).collect(),
+                certainty,
+                ..Facts::default()
+            },
+            band: Band::Confirmed,
+            ..Default::default()
+        };
+        m.rebuild_tldr_text();
+        m
+    }
+
+    #[test]
+    fn story_sig_is_order_independent_and_thread_sensitive() {
+        let a = Some(vec![1u8, 2, 3]);
+        let b = Some(vec![4u8, 5, 6]);
+        let t = uuid::Uuid::from_u128(7);
+        // Member order does not matter (the sig sorts).
+        assert_eq!(
+            story_summary_sig(&[a.clone(), b.clone()], Some(t)),
+            story_summary_sig(&[b.clone(), a.clone()], Some(t)),
+        );
+        // The thread assignment is part of the signature.
+        assert_ne!(
+            story_summary_sig(&[a.clone(), b.clone()], Some(t)),
+            story_summary_sig(&[a.clone(), b.clone()], None),
+        );
+        // A member gaining its summary hash (None → Some) moves the sig → re-synthesis.
+        assert_ne!(
+            story_summary_sig(&[a.clone(), None], None),
+            story_summary_sig(&[a, b], None),
+        );
+    }
+
+    #[test]
+    fn synthesize_facts_unions_and_weakens_certainty() {
+        let members = [
+            member(
+                "Advisory",
+                &["cve:CVE-2026-1", "repo:acme/billing"],
+                &["high"],
+                Certainty::Asserted,
+            ),
+            member(
+                "Incident PR",
+                &["repo:acme/billing"],
+                &["12%"],
+                Certainty::Tentative,
+            ),
+        ];
+        let facts = synthesize_facts(&members);
+        // Entities/numbers are the sorted, deduped union.
+        assert_eq!(facts.entities, vec!["cve:CVE-2026-1", "repo:acme/billing"]);
+        assert!(facts.numbers.contains(&"12%".to_string()));
+        // Any tentative member ⇒ the fused stance is tentative (keeps the hedge).
+        assert_eq!(facts.certainty, Certainty::Tentative);
+    }
+
+    #[test]
+    fn story_member_corpus_and_prompt_carry_summaries() {
+        let members = [
+            member(
+                "First headline",
+                &["repo:acme/auth"],
+                &[],
+                Certainty::Asserted,
+            ),
+            member("Second headline", &[], &[], Certainty::Asserted),
+        ];
+        let corpus = story_member_corpus(&members);
+        assert!(corpus.contains("First headline"));
+        assert!(corpus.contains("Second headline"));
+        let facts = synthesize_facts(&members);
+        let p = story_user_prompt(&facts, &corpus, Some("Acme auth migration"));
+        assert!(p.contains("Acme auth migration"));
+        assert!(p.contains("repo:acme/auth"));
+        assert!(p.contains("Do not list the sources"));
+    }
+
+    // ── Phase B — thread label + delta ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn auto_label_picks_highest_priority_and_counts_rest() {
+        // repo outranks user/cve; the head shows its display value, the rest a "+N".
+        assert_eq!(
+            auto_label(&[
+                "user:dlewis".to_string(),
+                "repo:acme/auth".to_string(),
+                "cve:CVE-2026-1".to_string()
+            ]),
+            "acme/auth +2"
+        );
+        // A single entity: just its display value, no "+N".
+        assert_eq!(auto_label(&["cve:CVE-2026-9".to_string()]), "CVE-2026-9");
+        // Empty spine ⇒ empty label (eyebrow omitted).
+        assert_eq!(auto_label(&[]), "");
+    }
+
+    #[test]
+    fn auto_delta_is_a_count_flag() {
+        assert_eq!(auto_delta(0), None);
+        assert_eq!(auto_delta(1).as_deref(), Some("1 update"));
+        assert_eq!(auto_delta(4).as_deref(), Some("4 updates"));
+    }
+
+    #[test]
+    fn clean_label_gates_voice_and_length() {
+        assert_eq!(
+            clean_label("  Acme auth migration  ").as_deref(),
+            Some("Acme auth migration")
+        );
+        assert!(clean_label("").is_none());
+        assert!(clean_label("a massive incident sprawling thread").is_none()); // banned word
+        assert!(clean_label(&"x".repeat(LABEL_MAX + 1)).is_none()); // over length
+    }
+
+    #[test]
+    fn clean_delta_strips_punctuation_and_caps_words() {
+        // Trailing punctuation is stripped (a delta carries none).
+        assert_eq!(
+            clean_delta("staging cutover landed.").as_deref(),
+            Some("staging cutover landed")
+        );
+        assert_eq!(clean_delta("reactivated").as_deref(), Some("reactivated"));
+        // > 6 words is a sentence, not a flag → rejected.
+        assert!(clean_delta("the staging cutover finally landed after a long delay").is_none());
+        // Hype / second person rejected.
+        assert!(clean_delta("huge change").is_none());
+        assert!(clean_delta("").is_none());
+    }
+
+    #[test]
+    fn label_and_delta_schemas_constrain_length() {
+        let l = serde_json::to_string(&label_schema()).unwrap();
+        assert!(l.contains("thread_label") && l.contains("\"maxLength\":48"));
+        let d = serde_json::to_string(&delta_schema()).unwrap();
+        assert!(d.contains("thread_delta") && d.contains("\"maxLength\":48"));
+        // The prompts carry the grounding inputs.
+        let lp = label_user_prompt(
+            &["repo:acme/auth".to_string()],
+            &["Auth outage".to_string()],
+        );
+        assert!(lp.contains("repo:acme/auth") && lp.contains("Auth outage"));
+        let dp = delta_user_prompt("Acme auth migration", &["Cutover landed".to_string()]);
+        assert!(dp.contains("Acme auth migration") && dp.contains("Cutover landed"));
     }
 }

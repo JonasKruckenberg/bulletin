@@ -108,11 +108,21 @@ is the only switch — without it `summarize_public` is an empty no-op and no su
    `title`) and `summary` (the grounded `tldr_text`, omitted when no summary has run). `render.rs` fills
    the §6.1 zone-2 headline and zone-3 summary line from these, and composes the big-picture **lead
    deterministically** from the selected items' headlines (§2.4 — no model call). The per-item summary +
-   big-picture lorem are retired (only `item_category` remains a placeholder). The flat `tldr_text` ships
-   first; the run-list → inline entity **badges** (§6.2) and the full §6 four-zone redesign
-   (eyebrow/provenance, deleting the debug block) are still follow-ups. With the feature off, `summary` is
+   big-picture lorem are retired. With the feature off, `summary` is
    the inert `'{}'` default, so the headline/lead degrade to the cluster titles — a real deterministic
    lead, no lorem.
+   **Update (2026-06-16): the full §6 four-zone redesign landed** — the item row is now (1) the
+   **context eyebrow** (`render_eyebrow`: thread label + delta on one nowrap line; "possibly" for a
+   Probable thread, omitted for Uncertain; the standalone chip + `item_category` lorem are retired),
+   (2) the **headline**, (3) the **grounded summary** rendered from the structured run-list with inline
+   entity **badges** (`render_summary_runs`/`render_entity_badge`: repo dotted-tag / CVE pill / person
+   chip, degrading to plain `surface`), and (4) the deterministic **provenance** line
+   (`render_provenance`: `Across <source> · <source> — <when>` / `<source> — <when>`, replacing the
+   "Related" list + the "Why" caption on the email). **The amber debug block is KEPT — not deleted**
+   (a deliberate deviation from §6.1's "delete the debug block") — and **enriched** for Phases B/C: it
+   now carries the summary provenance (story-synthesis vs cluster vs raw title + faithfulness band),
+   the thread label/identity/**delta**, and the fused connections + `link_reason`s the email shed — so
+   the full selection + summarization trace stays inspectable.
 
 ---
 
@@ -167,10 +177,25 @@ is the only switch — without it `summarize_public` is an empty no-op and no su
    `summarize::sweep_private` in the owner's RLS context. It runs regardless of the maintenance outcome
    and never fails the job; kept off `generate()`. (It therefore rides `thread-weighting`'s cadence;
    the realistic `llm-summarization` build keeps `thread-weighting` on by default, so both run.)
-4. **Phase B — thread label + delta eyebrow** (§2.3, §6.1): the migration's thread columns +
-   `thread_maintenance` producing the readable label and the watermarked delta.
-5. **Phase C — story synthesis** (§2.2): the story columns + member-signature-cached cross-source
-   rewrite in `thread_maintenance`.
+4. ~~**Phase B — thread label + delta eyebrow**~~ **Done (2026-06-16).** Migration `028` adds the
+   thread tier (`summary`/`delta`/`delta_through`/`summary_model`/`summarized_at`). `thread_maintenance`
+   now writes a **deterministic auto-label** (`summarize::auto_label`, top entities → "acme/auth +3")
+   onto `thread.label` every pass — so the context eyebrow lights up even with the feature off — and a
+   gated **label/delta sweep** (`summarize::sweep_thread_labels`) upgrades the label to a readable
+   prose name (stored on `thread.summary`, the auto-label stays the baseline beneath) and composes the
+   §5.2 delta flag from the new stories since `delta_through` (deterministic count `summarize::auto_delta`
+   as the fallback). The label uses the lighter `clean_label` voice/length gate (a name, not a grounded
+   claim); the delta uses `clean_delta` (≤6 words, no end punctuation).
+5. ~~**Phase C — story synthesis**~~ **Done (2026-06-16).** Migration `029` adds the story tier
+   (`summary`/`summary_sig`/`summary_model`/`summarized_at`). `summarize::sweep_stories` (folded into
+   the per-subscriber pass, after the cluster sweep so member summaries exist) fuses the member cluster
+   summaries into one cross-source headline + tldr (`synthesize_story` → `synthesize_facts` union +
+   `STORY_SYSTEM_PROMPT`, the same faithfulness gate), **cached by the member signature**
+   (`story_summary_sig` over the sorted member `summary_hash`es). Fire-time prefers `story.summary` and
+   degrades to the representative cluster (cold-start). **Deviation:** the signature is keyed on member
+   content alone — `thread_id` is *not* folded in (decoupling Phase C from fire-time thread-assignment);
+   a story moving threads doesn't itself force a re-synthesis. Singleton/all-unsummarized stories are
+   skipped (render already shows the representative cluster identically).
 6. **Eval hook (`digest-explain`).** Run the faithfulness gate read-only over historical clusters to
    measure the Vectara-style entity/number accuracy rate before any summary touches a delivered digest
    (§3.4, §7).

@@ -319,17 +319,31 @@ async fn thread_maintenance(
     .await
 }
 
-/// Best-effort **private** cluster-summarization sweep for one subscriber, in their RLS context
+/// Best-effort **per-subscriber** summarization sweeps for one subscriber, in their RLS context
 /// (per-unit, stateless — no cross-tenant content in one call, `docs/llm-summarization.md` §3.5). The
-/// private mirror of [`summarize_public`]: the `llm-summarization` cargo feature is the **sole** kill
-/// switch — without it this is the empty no-op below. Never propagates an error — summarization is not
-/// the deliverable.
+/// private mirror of [`summarize_public`], run in the dependency order the hierarchy needs (§4): the
+/// **private cluster** summaries first (Phase A), then **story cross-source synthesis** over the
+/// member cluster summaries (Phase C), then the **thread label + delta** over the recent story
+/// headlines (Phase B). The `llm-summarization` cargo feature is the **sole** kill switch — without it
+/// this is the empty no-op below. Each sweep is independently best-effort and never propagates an
+/// error — summarization is not the deliverable.
 #[cfg(feature = "llm-summarization")]
 async fn summarize_private(pool: &PgPool, subscriber_id: Uuid) {
     let cfg = bulletin_core::summarize::SummarizationConfig::from_env();
+    // Phase A (private clusters) → Phase C (story synthesis) → Phase B (thread label/delta): each tier
+    // reads the precomputed summaries of the tier below, so cluster summaries must land before the
+    // story synthesis that fuses them, and before the thread pass that reads story/cluster headlines.
     report_sweep(
         Some(subscriber_id),
         bulletin_core::summarize::sweep_private(pool, subscriber_id, &cfg).await,
+    );
+    report_sweep(
+        Some(subscriber_id),
+        bulletin_core::summarize::sweep_stories(pool, subscriber_id, &cfg).await,
+    );
+    report_sweep(
+        Some(subscriber_id),
+        bulletin_core::summarize::sweep_thread_labels(pool, subscriber_id, &cfg).await,
     );
 }
 

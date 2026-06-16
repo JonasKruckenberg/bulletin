@@ -1,11 +1,16 @@
 # Digest System — LLM Summarization
 
-**Status:** Design doc (2026-06-15). **Phase A foundation implemented** (2026-06-15) — the cluster-tier
-schema, the write-side summarization pipeline (content hash → grammar-constrained sidecar → faithfulness
-gate → deterministic baseline), the local llama.cpp deployment, behind the `llm-summarization` cargo
-feature as the **sole, compile-time** kill switch (no runtime flag — §2.5's "+ runtime flag" was dropped
-in build), off by default. The render consumption + phases B–D remain. See
-[`llm-summarization-handoff.md`](llm-summarization-handoff.md) for what's built and the next-phase TODO.
+**Status:** Design doc (2026-06-15). **Phases A–C implemented** (A: 2026-06-15; B + C + the §6
+four-zone email redesign: 2026-06-16) — the cluster/story/thread schema, the write-side summarization
+pipeline (content hash → grammar-constrained sidecar → faithfulness gate → deterministic baseline), the
+hierarchical pre-summarization (cluster → story synthesis → thread label/delta), and the redesigned item
+row (context eyebrow / headline / grounded summary with entity badges / provenance), behind the
+`llm-summarization` cargo feature as the **sole, compile-time** kill switch (no runtime flag — §2.5's "+
+runtime flag" was dropped in build), off by default. **One deliberate deviation from §6.1:** the amber
+debug block is **kept and enriched** (summary provenance/band, thread label/delta, fused connections),
+not deleted — the audit trace stays in-email for now. **Phase D** (the authored big-picture lead)
+remains. See [`llm-summarization-handoff.md`](llm-summarization-handoff.md) for what's built and the
+next-phase TODO.
 Promotes the roadmap-deferred *LLM
 summarization* item (design §9.5, roadmap M6 backlog) into a concrete build plan, now that the email
 template has summary slots to fill (`digest/render.rs` — the three lorem-ipsum placeholders).
@@ -529,12 +534,16 @@ layer uses.
   builds, content-hashed; the extract-then-summarize pass + the faithfulness gate. Fills `item_summary`
   from the representative cluster; the lead becomes a **deterministic** compose. *Biggest single win —
   retires the per-item summary and the big-picture lorem.*
-- **Phase B — Thread label + delta (the context eyebrow).** Readable `thread.label`, which becomes the
-  per-item **context eyebrow** (§1.1/§6.1, retiring the `item_category` lorem and folding in the existing
-  chip); the §5.2 `delta` flag in `thread_maintenance`, watermarked by last-delivered, on the same line.
-- **Phase C — Story cross-source synthesis.** `story.summary` cached by member-sig in
-  `thread_maintenance`; upgrades `item_summary` from the representative-cluster fallback to a fused
-  multi-source rewrite for recurring stories.
+- **Phase B — Thread label + delta (the context eyebrow).** ✅ *Implemented 2026-06-16.* A
+  deterministic auto-label (top entities) is written onto `thread.label` every maintenance pass (so the
+  eyebrow works feature-off); a gated sweep (`summarize::sweep_thread_labels`) upgrades it to a readable
+  prose label on `thread.summary` and composes the §5.2 `delta` flag from the new stories since
+  `delta_through`. The per-item **context eyebrow** (§1.1/§6.1) renders label + delta on one clamped
+  line, retiring the `item_category` lorem and folding in the standalone chip.
+- **Phase C — Story cross-source synthesis.** ✅ *Implemented 2026-06-16.* `story.summary` cached by
+  member-signature (`summarize::sweep_stories` in the per-subscriber pass); upgrades the item summary
+  from the representative-cluster fallback to a fused multi-source rewrite for recurring stories
+  (degrading to the representative cluster on cold-start / a down sidecar).
 - **Phase D — Authored big-picture lead (optional).** Replace the deterministic lead with a
   deadline-bounded best-effort "editor's note" over the selected items' summaries, deterministic lead as
   the fallback. Only worth it if the templated lead proves too flat.

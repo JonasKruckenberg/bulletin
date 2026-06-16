@@ -11,9 +11,12 @@ use serde::Deserialize;
 
 use crate::common::event::Event;
 use crate::summarize::{
-    apply_comprehension, baseline, comprehend_user_prompt, comprehension_schema, extract_facts,
-    faithful, response_schema, source_corpus, user_prompt, Band, ClusterSummary, Comprehension,
-    Facts, SummarizationConfig, TldrRun, COMPREHEND_SYSTEM_PROMPT, SYSTEM_PROMPT,
+    apply_comprehension, baseline, clean_delta, clean_label, comprehend_user_prompt,
+    comprehension_schema, delta_schema, delta_user_prompt, extract_facts, faithful, label_schema,
+    label_user_prompt, response_schema, source_corpus, story_member_corpus, story_user_prompt,
+    synthesize_facts, user_prompt, Band, ClusterSummary, Comprehension, Facts, SummarizationConfig,
+    TldrRun, COMPREHEND_SYSTEM_PROMPT, DELTA_SYSTEM_PROMPT, LABEL_SYSTEM_PROMPT,
+    STORY_SYSTEM_PROMPT, SYSTEM_PROMPT,
 };
 
 /// Summarize one cluster: extract-then-summarize (§3.2) — hand the model the pre-extracted facts +
@@ -77,6 +80,126 @@ pub async fn summarize_cluster(
     Some(summary)
 }
 
+/// Synthesize a story's cross-source summary (Phase C, §2.2): fuse the member clusters' precomputed
+/// summaries into one headline + tldr for the whole happening, then run the §3.4 faithfulness gate
+/// over the fused facts. `members` are the story's member-cluster summaries, **newest-first** (so
+/// `members[0]` is the representative and the freshest lifecycle wins in [`synthesize_facts`]).
+///
+/// Returns, mirroring [`summarize_cluster`]:
+/// - `Some(synthesis)` on success, or — on a gate rejection — the **representative member's own
+///   summary** (already grounded and gate-passed when it was generated), banded down to its band;
+///   both are stable, content-derived results worth caching.
+/// - `None` when the model itself was unavailable, so the caller leaves the story un-synthesized and a
+///   later pass retries once the sidecar recovers (rather than caching a degraded synthesis).
+pub async fn synthesize_story(
+    cfg: &SummarizationConfig,
+    http: &reqwest::Client,
+    members: &[ClusterSummary],
+    thread_label: Option<&str>,
+) -> Option<ClusterSummary> {
+    // Nothing to fuse — let the caller fall back to the representative cluster (cold-start, §2.2).
+    let representative = members.first()?;
+    // A lone member is not a cross-source synthesis: the representative summary already *is* the
+    // answer, so reuse it verbatim rather than spending a model call to paraphrase one input.
+    if members.len() == 1 {
+        return Some(representative.clone());
+    }
+
+    let facts = synthesize_facts(members);
+    let corpus = story_member_corpus(members);
+
+    let candidate = match chat_json::<ModelOutput>(
+        cfg,
+        http,
+        STORY_SYSTEM_PROMPT,
+        story_user_prompt(&facts, &corpus, thread_label),
+        cfg.headline_max_tokens + cfg.tldr_max_tokens + 64,
+        response_schema(&facts.entities),
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "story synthesis call failed; leaving story un-synthesized for retry");
+            return None;
+        }
+    };
+
+    let mut summary = ClusterSummary {
+        headline: candidate.headline.trim().to_string(),
+        tldr: candidate.tldr,
+        tldr_text: String::new(),
+        facts: facts.clone(),
+        band: Band::Confirmed,
+    };
+    summary.rebuild_tldr_text();
+
+    if cfg.faithfulness_gate {
+        if let Err(v) = faithful(&summary, &facts, &corpus) {
+            tracing::debug!(violation = ?v, "story synthesis gate rejected; falling back to representative cluster summary");
+            return Some(representative.clone());
+        }
+    }
+    Some(summary)
+}
+
+/// Generate a readable thread **label** (Phase B, §2.3): upgrade the deterministic auto-label to a
+/// short prose name from the thread's entity spine + a few recent headlines. Best-effort — `None` on
+/// any transport failure *or* a gate rejection (over-length / hype), so the caller keeps the
+/// deterministic `thread.label`. The §3.4 gate here is the lighter [`clean_label`] (voice + length;
+/// a label is a name, not a grounded claim).
+pub async fn label_thread(
+    cfg: &SummarizationConfig,
+    http: &reqwest::Client,
+    entities: &[String],
+    recent_headlines: &[String],
+) -> Option<String> {
+    let out = chat_json::<LabelOutput>(
+        cfg,
+        http,
+        LABEL_SYSTEM_PROMPT,
+        label_user_prompt(entities, recent_headlines),
+        cfg.headline_max_tokens + 16,
+        label_schema(),
+    )
+    .await;
+    match out {
+        Ok(o) => clean_label(&o.label),
+        Err(e) => {
+            tracing::debug!(error = %e, "thread label call failed; keeping deterministic auto-label");
+            None
+        }
+    }
+}
+
+/// Generate the thread **delta** flag (Phase B, §5.2): compress the new stories' headlines since the
+/// watermark into a ≤6-word "what changed" tag. Best-effort — `None` on any transport failure *or* a
+/// gate rejection ([`clean_delta`]: voice + length + word-count + no end punctuation), so the caller
+/// keeps the deterministic count delta.
+pub async fn delta_thread(
+    cfg: &SummarizationConfig,
+    http: &reqwest::Client,
+    label: &str,
+    new_headlines: &[String],
+) -> Option<String> {
+    let out = chat_json::<DeltaOutput>(
+        cfg,
+        http,
+        DELTA_SYSTEM_PROMPT,
+        delta_user_prompt(label, new_headlines),
+        cfg.headline_max_tokens + 16,
+        delta_schema(),
+    )
+    .await;
+    match out {
+        Ok(o) => clean_delta(&o.delta),
+        Err(e) => {
+            tracing::debug!(error = %e, "thread delta call failed; keeping deterministic count delta");
+            None
+        }
+    }
+}
+
 /// Run the comprehension pass for one cluster (§3.2, `local-ml-options.md` §6): a constrained chat
 /// completion that classifies `event_type` / `state` / `certainty` over the deterministically-extracted
 /// grounding + source text. Reasoning is free (the `analysis` scratchpad), only the classification is
@@ -125,13 +248,28 @@ fn source_labels(events: &[Event]) -> Vec<&'static str> {
 }
 
 /// The slice of the model's response we parse — the abstractive fields. The rest is reconstructed
-/// locally: `tldr_text` from the runs, `facts`/`band` from grounding + the gate.
+/// locally: `tldr_text` from the runs, `facts`/`band` from grounding + the gate. Shared by the cluster
+/// summarizer and the Phase-C story synthesis (both emit headline + tldr run-list).
 #[derive(Debug, Deserialize)]
 struct ModelOutput {
     #[serde(default)]
     headline: String,
     #[serde(default)]
     tldr: Vec<TldrRun>,
+}
+
+/// The Phase-B thread-label response (just the readable name); cleaned by [`clean_label`].
+#[derive(Debug, Deserialize)]
+struct LabelOutput {
+    #[serde(default)]
+    label: String,
+}
+
+/// The Phase-B thread-delta response (just the flag); cleaned by [`clean_delta`].
+#[derive(Debug, Deserialize)]
+struct DeltaOutput {
+    #[serde(default)]
+    delta: String,
 }
 
 /// POST one grammar-constrained summarization completion and parse the structured output. Errors
