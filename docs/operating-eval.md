@@ -42,7 +42,9 @@ bulletin debug config-set --story-cap 3 --recency-half-life-days 2.0
 bulletin debug digest-explain <sub>
 ```
 
-Run as the service user, which presets `DATABASE_URL`: `sudo -u bulletin bulletin debug …`.
+Run as the service user: `sudo -u bulletin bulletin debug …`. `debug` is a gRPC client of the admin
+API (`bulletin api`), so this needs `services.bulletin.api.adminKeyFile` set; the CLI wrapper presets
+`BULLETIN_API_ADDR` and sources the bearer for you. (`eval` / `explain` / `config` are read-only.)
 
 ## The knobs (`digest_config`) and what they do
 

@@ -333,11 +333,17 @@ and `tonic-health` (standard `grpc.health.v1`) are cheap, standard add-ons. `sha
    split later (smallest diff; matches `webhook.rs`/`worker.rs`).
 2. **Self-service subscriber tokens — issue only via admin, or also a `SubscriberService` self-issue?**
    Recommend admin-only for the first cut; add self-issue with the frontend.
-3. **Should `debug` be *replaced* by a thin gRPC client over `AdminService`,** or kept as the
-   direct-DB operator path? Recommend keep `debug` direct for now (no daemon dependency for ops); revisit
-   once `api` is always-on.
-4. **Operator verbs (build/digest-run/explain) — confirm they stay CLI-only in the first cut** (this doc
-   assumes yes; they're A3 if a tool needs them).
+3. **Should `debug` be *replaced* by a thin gRPC client over the API?** **RESOLVED — yes, done.**
+   `bulletin debug …` is now a pure gRPC client of the admin API (even locally): it opens no DB and
+   builds no mailer, so an operator drives the engine — *including digest dispatch* — without the
+   runtime DB credential or the SMTP secret. It dials `BULLETIN_API_ADDR` with the admin bearer. The
+   trade-off accepted: `debug` now depends on a running `api` (`bulletin all` starts one).
+4. **Operator verbs (build/digest-run/explain/eval/provenance/config).** **RESOLVED — exposed, but on a
+   separate `UnstableDebugService`,** not `AdminService`. The instability is encoded in the *service
+   name* (it survives codegen → shows up in the generated client/server, in reflection, and on the wire
+   path), marking the whole surface as exempt from `AdminService`'s v1 wire-compat guarantee: it exists
+   to drive the first-party CLI and may change without a version bump. The two send RPCs deliver
+   server-side (the engine holds the SMTP credential); the rest are read-only dry-runs.
 5. **TLS/exposure posture** — loopback + reverse-proxy (assumed) vs direct TLS in `api`. Decide when the
    API leaves the box.
 </content>

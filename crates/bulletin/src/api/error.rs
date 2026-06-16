@@ -8,6 +8,13 @@ use tonic::Status;
 /// A `map_err` adapter for a database (or other internal) failure: log `context` + the error, return
 /// an opaque `Internal`. Usage: `something(...).await.map_err(error::db("list connections"))?`.
 pub fn db(context: &'static str) -> impl FnOnce(sqlx::Error) -> Status {
+    internal(context)
+}
+
+/// Like [`db`], but for any displayable error — the `core` engine fns the debug plane drives return
+/// `anyhow::Error`, not a bare `sqlx::Error`. Same behavior: log the detail server-side, return an
+/// opaque `Internal` so engine internals never leak over the wire.
+pub fn internal<E: std::fmt::Display>(context: &'static str) -> impl FnOnce(E) -> Status {
     move |e| {
         tracing::error!(error = %e, "api: {context}");
         Status::internal("internal error")

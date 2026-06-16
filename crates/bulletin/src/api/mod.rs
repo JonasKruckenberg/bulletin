@@ -27,12 +27,21 @@ pub mod proto {
         include_bytes!(concat!(env!("OUT_DIR"), "/bulletin_descriptor.bin"));
 }
 
+use crate::transport::EmailConfig;
 use auth::{admin_interceptor, AuthState};
 use proto::admin_service_server::AdminServiceServer;
+use proto::unstable_debug_service_server::UnstableDebugServiceServer;
 
 /// Runs the gRPC API server until shutdown. `admin_key` authorizes the admin plane; without it every
 /// admin RPC is rejected (fail-closed) and we warn once at startup, mirroring the webhook catcher.
-pub async fn serve(addr: SocketAddr, pool: PgPool, admin_key: Option<String>) -> Result<()> {
+/// `email` is the engine's delivery config: the digest-send RPCs build the mailer from it server-side,
+/// so the `debug` CLI can fire a digest without holding the SMTP credential locally.
+pub async fn serve(
+    addr: SocketAddr,
+    pool: PgPool,
+    admin_key: Option<String>,
+    email: EmailConfig,
+) -> Result<()> {
     if admin_key.is_none() {
         tracing::warn!(
             "no API admin key configured; all gRPC admin calls will be rejected \
@@ -40,10 +49,13 @@ pub async fn serve(addr: SocketAddr, pool: PgPool, admin_key: Option<String>) ->
         );
     }
     let auth = Arc::new(AuthState::new(admin_key));
-    // Auth is enforced by an interceptor over the whole AdminService (below), so the handlers
-    // themselves carry no per-RPC auth check — one chokepoint, no by-omission gap.
-    let admin =
-        AdminServiceServer::with_interceptor(admin::AdminApi::new(pool), admin_interceptor(auth));
+    // One `AdminApi` backs both planes. Auth is enforced by an interceptor over each whole service
+    // (so the handlers carry no per-RPC auth check — one chokepoint per service, no by-omission gap).
+    // The unstable debug plane is its own service (its instability lives in the name) but runs under
+    // the same admin bearer.
+    let api = admin::AdminApi::new(pool, email);
+    let admin = AdminServiceServer::with_interceptor(api.clone(), admin_interceptor(auth.clone()));
+    let debug = UnstableDebugServiceServer::with_interceptor(api, admin_interceptor(auth));
 
     // gRPC server reflection (v1) so tooling can list services/methods over the wire.
     let reflection = tonic_reflection::server::Builder::configure()
@@ -60,6 +72,7 @@ pub async fn serve(addr: SocketAddr, pool: PgPool, admin_key: Option<String>) ->
     tracing::info!(%addr, "gRPC API listening");
     Server::builder()
         .add_service(admin)
+        .add_service(debug)
         .add_service(reflection)
         .add_service(health_service)
         .serve(addr)
