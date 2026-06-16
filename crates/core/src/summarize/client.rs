@@ -11,8 +11,9 @@ use serde::Deserialize;
 
 use crate::common::event::Event;
 use crate::summarize::{
-    baseline, extract_facts, faithful, response_schema, source_corpus, user_prompt, Band,
-    ClusterSummary, Facts, SummarizationConfig, TldrRun, SYSTEM_PROMPT,
+    apply_comprehension, baseline, comprehend_user_prompt, comprehension_schema, extract_facts,
+    faithful, response_schema, source_corpus, user_prompt, Band, ClusterSummary, Comprehension,
+    Facts, SummarizationConfig, TldrRun, COMPREHEND_SYSTEM_PROMPT, SYSTEM_PROMPT,
 };
 
 /// Summarize one cluster: extract-then-summarize (§3.2) — hand the model the pre-extracted facts +
@@ -32,8 +33,17 @@ pub async fn summarize_cluster(
     title: &str,
     events: &[Event],
 ) -> Option<ClusterSummary> {
-    let facts = extract_facts(events);
+    let mut facts = extract_facts(events);
     let source = source_corpus(events, cfg.max_source_chars);
+
+    // Extract-then-summarize (§3.2): run the comprehension pass first so the summarizer's hedge rule
+    // (§3.6) is a mechanical branch on `facts.certainty`/`state`, not an inference. Best-effort — a
+    // failed/disabled comprehension leaves the neutral defaults (asserted, plain), the safe direction.
+    if cfg.comprehend {
+        if let Some(comp) = comprehend_cluster(cfg, http, &facts, &source).await {
+            apply_comprehension(&mut facts, &comp);
+        }
+    }
 
     let candidate = match call_model(cfg, http, &facts, &source).await {
         Ok(c) => c,
@@ -65,6 +75,73 @@ pub async fn summarize_cluster(
         }
     }
     Some(summary)
+}
+
+/// Run the comprehension pass for one cluster (§3.2, `local-ml-options.md` §6): a constrained chat
+/// completion that classifies `event_type` / `state` / `certainty` over the deterministically-extracted
+/// grounding + source text. Reasoning is free (the `analysis` scratchpad), only the classification is
+/// grammar-constrained (CRANE — avoid the reasoning "grammar tax").
+///
+/// Returns `None` on any failure (transport, non-2xx, malformed JSON) — comprehension is itself
+/// best-effort, so the caller proceeds with the neutral facts rather than blocking the summary.
+async fn comprehend_cluster(
+    cfg: &SummarizationConfig,
+    http: &reqwest::Client,
+    facts: &Facts,
+    source: &str,
+) -> Option<Comprehension> {
+    match call_comprehension(cfg, http, facts, source).await {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::debug!(error = %e, "comprehension call failed; summarizing with neutral facts");
+            None
+        }
+    }
+}
+
+/// POST one grammar-constrained comprehension completion and parse the classified output. Errors
+/// bubble up to [`comprehend_cluster`], which degrades to neutral facts.
+async fn call_comprehension(
+    cfg: &SummarizationConfig,
+    http: &reqwest::Client,
+    facts: &Facts,
+    source: &str,
+) -> anyhow::Result<Comprehension> {
+    use serde_json::json;
+
+    let body = json!({
+        "model": cfg.model,
+        "messages": [
+            { "role": "system", "content": COMPREHEND_SYSTEM_PROMPT },
+            { "role": "user", "content": comprehend_user_prompt(facts, source) }
+        ],
+        "temperature": cfg.temperature,
+        "seed": cfg.seed,
+        "max_tokens": cfg.comprehension_max_tokens,
+        "response_format": { "type": "json_schema", "json_schema": comprehension_schema() }
+    });
+
+    let resp = http
+        .post(format!("{}/chat/completions", cfg.base_url))
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&body)?)
+        .send()
+        .await?;
+
+    let status = resp.status();
+    let text = resp.text().await?;
+    if !status.is_success() {
+        anyhow::bail!("sidecar returned {status}: {text}");
+    }
+
+    let envelope: ChatResponse = serde_json::from_str(&text)?;
+    let content = envelope
+        .choices
+        .into_iter()
+        .next()
+        .map(|c| c.message.content)
+        .ok_or_else(|| anyhow::anyhow!("sidecar response had no choices"))?;
+    Ok(serde_json::from_str(&content)?)
 }
 
 /// The source-kind labels a cluster's events came from, in event order (the baseline tldr sorts +

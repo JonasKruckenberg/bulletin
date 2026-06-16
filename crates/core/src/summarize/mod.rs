@@ -49,6 +49,10 @@ pub struct SummarizationConfig {
     /// Per-task token ceilings (§3.3): short outputs cut latency *and* hallucination.
     pub headline_max_tokens: u32,
     pub tldr_max_tokens: u32,
+    /// Token ceiling for the comprehension pass (§3.2, `local-ml-options.md` §6): a short
+    /// `analysis` scratchpad + the three classified fields, so it needs a touch more room than a
+    /// headline but stays small (it is off the hot path).
+    pub comprehension_max_tokens: u32,
     /// Low temperature + fixed seed ⇒ a content-unchanged cluster re-summarizes identically, so the
     /// content-hash cache is meaningful (§3.3 idempotency).
     pub temperature: f32,
@@ -56,6 +60,12 @@ pub struct SummarizationConfig {
     /// Run the deterministic faithfulness gate (§3.4). Off only for eval/debugging — production keeps
     /// it on, since it is the real backstop against a hallucinated entity/number reaching a digest.
     pub faithfulness_gate: bool,
+    /// Run the comprehension pass (§3.2, `local-ml-options.md` §6) ahead of the summarizer: a tiny
+    /// constrained LLM call that fills `facts.event_type` / `state` / `certainty` so the summarizer's
+    /// hedge rule (§3.6) is *looked up*, not inferred. Best-effort itself — when off, or when the call
+    /// fails, the facts stay at their neutral defaults and the summarizer degrades to "state asserted
+    /// facts plainly," the safe direction.
+    pub comprehend: bool,
     /// HTTP timeout for one sidecar call. Generous — it is off the punctual path; a timeout just
     /// degrades that cluster to baseline.
     pub request_timeout: Duration,
@@ -72,12 +82,16 @@ impl Default for SummarizationConfig {
         SummarizationConfig {
             base_url: "http://127.0.0.1:8080/v1".to_string(),
             model: "qwen3.5-4b-instruct".to_string(),
-            prompt_version: 1,
+            // Bumped to 2 with the comprehension pass: facts now carry event_type/state/certainty, so
+            // a re-summarize of the corpus picks up the richer (and hedge-aware) phrasing.
+            prompt_version: 2,
             headline_max_tokens: 24,
             tldr_max_tokens: 96,
+            comprehension_max_tokens: 256,
             temperature: 0.2,
             seed: 42,
             faithfulness_gate: true,
+            comprehend: true,
             request_timeout: Duration::from_secs(60),
             max_source_chars: 4000,
             max_per_sweep: 200,
@@ -276,10 +290,18 @@ pub fn summary_hash(events: &[Event]) -> Vec<u8> {
 /// extracted: the sorted, de-duplicated union of its events' `entities` (the §8.2 blocking substrate),
 /// plus numbers/dates mined by a light scan over each event's title + body.
 ///
-/// The richer comprehension output (`event_type`, `state`, per-fact `certainty`) is the Phase-2
-/// GLiNER + tiny-LLM pass (`local-ml-options.md` §6) — **not yet built** — so those stay at their
-/// neutral defaults here. Until it lands the summarizer degrades to "state asserted facts plainly,"
-/// which is exactly the safe direction. (Handoff: wire comprehension output into these fields.)
+/// This is the deterministic *skeleton*. The richer comprehension output (`event_type`, `state`,
+/// `certainty`) is filled by [`apply_comprehension`] from the tiny-LLM pass (`local-ml-options.md`
+/// §6), wired into [`client::summarize_cluster`](crate::summarize::client::summarize_cluster) ahead of
+/// the summarizer. When the comprehension pass is off or unavailable those fields stay at their
+/// neutral defaults, and the summarizer degrades to "state asserted facts plainly," the safe
+/// direction.
+///
+/// On the entity-span half of the design's GLiNER + tiny-LLM split: Bulletin already has a
+/// deterministic NER substrate — M3's namespaced entity tokens (`repo:`/`user:`/`cve:`/…), rolled
+/// onto every cluster — so `facts.entities` is sourced from ground truth here rather than from a
+/// separate span model. The comprehension LLM only supplies the *reasoning* half (the event's type,
+/// lifecycle state, and the source's stance).
 pub fn extract_facts(events: &[Event]) -> Facts {
     let mut entities: Vec<String> = Vec::new();
     let mut numbers: Vec<String> = Vec::new();
@@ -356,6 +378,149 @@ fn push_numeric(cur: &mut String, has_digit: &mut bool, out: &mut Vec<String>) {
     }
     cur.clear();
     *has_digit = false;
+}
+
+// ── The comprehension pass (§3.2, local-ml-options.md §6) — extract before summarize ──────────────
+
+/// The closed event-type vocabulary the comprehension pass classifies into (the schema `enum`, and the
+/// validation re-check). `other` is the always-available escape hatch a small model can fall back to;
+/// it is treated as "no useful type" by [`apply_comprehension`] (left unset on the facts).
+pub const EVENT_TYPES: &[&str] = &[
+    "incident",
+    "release",
+    "advisory",
+    "announcement",
+    "discussion",
+    "change",
+    "other",
+];
+
+/// The closed lifecycle-state vocabulary. `none` means "no lifecycle applies" — [`apply_comprehension`]
+/// leaves the fact's `state` unset for it (and for `other`), so a non-lifecycle event carries no
+/// misleading state.
+pub const STATES: &[&str] = &[
+    "detected",
+    "investigating",
+    "resolved",
+    "proposed",
+    "in_progress",
+    "merged",
+    "published",
+    "closed",
+    "none",
+];
+
+/// The comprehension pass's output (§3.2): a short free-text `analysis` scratchpad **first** (the
+/// CRANE "reason, then constrain" lever — `local-ml-options.md` §6), then the three classified fields
+/// the summarizer branches on. The model never recalls names/numbers here — that is the deterministic
+/// skeleton's job (`extract_facts`); this only judges *type / lifecycle / stance* once, so every
+/// downstream summary call is a mechanical rephrase (§3.6).
+///
+/// Tolerant deserialize (every field defaulted): a missing/garbled field degrades to the neutral
+/// default, and [`apply_comprehension`] re-validates the closed-vocab fields against [`EVENT_TYPES`] /
+/// [`STATES`] regardless of the grammar (defense in depth, like the entity gate).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Comprehension {
+    /// The reasoning scratchpad. Named to sort *first* among the object's keys so it is generated
+    /// before the classification (serde_json has no `preserve_order` here, and llama.cpp orders object
+    /// properties lexically — an `a…` name is the portable way to guarantee scratchpad-first).
+    #[serde(default)]
+    pub analysis: String,
+    /// The source's stance — the §3.6 hedge driver. Validated by the schema `enum`; defaults to
+    /// `asserted` (the safe, plain-spoken direction) when absent.
+    #[serde(default)]
+    pub certainty: Certainty,
+    #[serde(default)]
+    pub event_type: String,
+    #[serde(default)]
+    pub state: String,
+}
+
+/// Fold a comprehension result onto the deterministic [`Facts`] skeleton (§2.1). Re-validates the
+/// closed-vocab fields against [`EVENT_TYPES`] / [`STATES`] — an out-of-vocab or "no useful value"
+/// (`other` / `none`) classification leaves the field unset, so the summarizer only ever sees a
+/// grounded type/state. `certainty` always applies (its only values are the safe `asserted` and the
+/// hedging `tentative`). Pure + deterministic, so it is unit-tested without a model.
+pub fn apply_comprehension(facts: &mut Facts, c: &Comprehension) {
+    facts.certainty = c.certainty;
+    if EVENT_TYPES.contains(&c.event_type.as_str()) && c.event_type != "other" {
+        facts.event_type = Some(c.event_type.clone());
+    }
+    if STATES.contains(&c.state.as_str()) && c.state != "none" {
+        facts.state = Some(c.state.clone());
+    }
+}
+
+/// The comprehension system prompt — engineered for a 3–4B model exactly like [`SYSTEM_PROMPT`]
+/// (§3.6 "built for a 3–4B model"): short, imperative, one job, with the closed vocab inline and two
+/// worked few-shot pairs that *show* asserted→plain and tentative→hedged. A constant ⇒ prefix-cached.
+pub const COMPREHEND_SYSTEM_PROMPT: &str = r#"You read one work event and classify it. Think first, then label.
+
+Fill these fields:
+- analysis: 1-2 short sentences. What happened, and does the source state it as settled fact or hedge it (suspected, appears to, proposed, under investigation)?
+- event_type: one of incident, release, advisory, announcement, discussion, change, other.
+- state: where it is in its lifecycle - one of detected, investigating, resolved, proposed, in_progress, merged, published, closed, none. Use none if no lifecycle applies.
+- certainty: asserted if the source states it as settled fact; tentative if the source hedges.
+
+Use only what the source says. Do not guess beyond it. Output only the JSON the schema asks for. No preamble.
+
+EXAMPLES
+source: A bad config in the 14:02 rollout broke token validation; ~12% of logins failed for 40m until a rollback.
+out: {"analysis":"A deploy broke logins and was rolled back; the source states it as resolved fact.","certainty":"asserted","event_type":"incident","state":"resolved"}
+
+source: A high-severity advisory appears to affect billing's PDF path; no patch yet, still under investigation.
+out: {"analysis":"A security advisory that may affect billing; the source hedges and is still investigating.","certainty":"tentative","event_type":"advisory","state":"investigating"}"#;
+
+/// The per-cluster comprehension user prompt: the deterministically-extracted grounding (entities,
+/// numbers, dates) + the budgeted source text + the concrete ask. Short and concrete over the §4
+/// pre-distilled inputs, like [`user_prompt`].
+pub fn comprehend_user_prompt(facts: &Facts, source_text: &str) -> String {
+    let entity_list = if facts.entities.is_empty() {
+        "(none)".to_string()
+    } else {
+        facts.entities.join(", ")
+    };
+    let numbers = if facts.numbers.is_empty() {
+        "(none)".to_string()
+    } else {
+        facts.numbers.join(", ")
+    };
+    let dates = if facts.dates.is_empty() {
+        "(none)".to_string()
+    } else {
+        facts.dates.join(", ")
+    };
+    format!(
+        "entities: {entity_list}\n\
+         numbers: {numbers}\n\
+         dates: {dates}\n\
+         source:\n{source_text}\n\n\
+         Classify this event: analysis first, then event_type, state, certainty."
+    )
+}
+
+/// The comprehension response schema (§3.2) for `response_format: json_schema`. Constrains the three
+/// classified fields to their closed vocab so the small model can only emit a known type/state/stance,
+/// while `analysis` is a free-text string (the scratchpad — deliberately *not* hard-constrained, the
+/// `local-ml-options.md` §6 "grammar tax" caveat; only its length is capped). All four are required so
+/// the scratchpad is always produced (and, being named `analysis`, produced first).
+pub fn comprehension_schema() -> serde_json::Value {
+    use serde_json::json;
+    json!({
+        "name": "comprehension",
+        "strict": true,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "analysis":   { "type": "string", "maxLength": 600 },
+                "certainty":  { "type": "string", "enum": ["asserted", "tentative"] },
+                "event_type": { "type": "string", "enum": EVENT_TYPES },
+                "state":      { "type": "string", "enum": STATES }
+            },
+            "required": ["analysis", "certainty", "event_type", "state"],
+            "additionalProperties": false
+        }
+    })
 }
 
 // ── The faithfulness gate (§3.4) — ML never grounds alone ────────────────────────────────────────
@@ -1007,6 +1172,89 @@ mod tests {
     }
 
     #[test]
+    fn apply_comprehension_validates_and_folds() {
+        // Valid, in-vocab classification folds onto the skeleton.
+        let mut facts = Facts {
+            entities: vec!["repo:acme/auth".to_string()],
+            ..Facts::default()
+        };
+        apply_comprehension(
+            &mut facts,
+            &Comprehension {
+                analysis: "deploy broke logins, resolved".to_string(),
+                certainty: Certainty::Asserted,
+                event_type: "incident".to_string(),
+                state: "resolved".to_string(),
+            },
+        );
+        assert_eq!(facts.event_type.as_deref(), Some("incident"));
+        assert_eq!(facts.state.as_deref(), Some("resolved"));
+        assert_eq!(facts.certainty, Certainty::Asserted);
+        assert_eq!(facts.entities, vec!["repo:acme/auth"]); // skeleton untouched
+
+        // `other`/`none` and out-of-vocab values leave the field unset (no misleading type/state), but
+        // certainty (tentative) still applies — it drives the hedge.
+        let mut neutral = Facts::default();
+        apply_comprehension(
+            &mut neutral,
+            &Comprehension {
+                analysis: String::new(),
+                certainty: Certainty::Tentative,
+                event_type: "other".to_string(),
+                state: "bogus".to_string(),
+            },
+        );
+        assert_eq!(neutral.event_type, None);
+        assert_eq!(neutral.state, None);
+        assert_eq!(neutral.certainty, Certainty::Tentative);
+    }
+
+    #[test]
+    fn comprehension_schema_constrains_vocab_and_scratchpad_first() {
+        let s = serde_json::to_string(&comprehension_schema()).unwrap();
+        assert!(s.contains("comprehension"));
+        // Closed vocab reaches the schema as enums.
+        assert!(s.contains("incident") && s.contains("advisory"));
+        assert!(s.contains("resolved") && s.contains("investigating"));
+        assert!(s.contains("asserted") && s.contains("tentative"));
+        // All four fields required (analysis must always be produced).
+        assert!(s.contains("analysis"));
+        // The scratchpad sorts first among the keys (serde_json has no preserve_order, and llama.cpp
+        // orders object properties lexically): `analysis` precedes the classification keys.
+        let a = s.find("analysis").unwrap();
+        for key in ["certainty", "event_type", "state"] {
+            assert!(a < s.find(key).unwrap(), "analysis must precede {key}");
+        }
+    }
+
+    #[test]
+    fn comprehension_output_deserializes_tolerantly() {
+        let c: Comprehension = serde_json::from_str(
+            r#"{"analysis":"x","certainty":"tentative","event_type":"advisory","state":"investigating"}"#,
+        )
+        .unwrap();
+        assert_eq!(c.certainty, Certainty::Tentative);
+        assert_eq!(c.event_type, "advisory");
+        // Missing fields fall back to defaults rather than failing the parse.
+        let empty: Comprehension = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty.certainty, Certainty::Asserted);
+        assert!(empty.event_type.is_empty());
+    }
+
+    #[test]
+    fn comprehend_user_prompt_carries_grounding() {
+        let facts = Facts {
+            entities: vec!["repo:acme/auth".to_string()],
+            numbers: vec!["12%".to_string()],
+            ..Facts::default()
+        };
+        let p = comprehend_user_prompt(&facts, "the source");
+        assert!(p.contains("repo:acme/auth"));
+        assert!(p.contains("12%"));
+        assert!(p.contains("the source"));
+    }
+
+    #[test]
     fn source_corpus_is_budgeted_newest_first() {
         let events = [
             ev(1, 100, "OLD", Some("old body"), &[]),
@@ -1021,6 +1269,6 @@ mod tests {
     #[test]
     fn summary_model_string() {
         let cfg = SummarizationConfig::default();
-        assert_eq!(cfg.summary_model(), "qwen3.5-4b-instruct@1");
+        assert_eq!(cfg.summary_model(), "qwen3.5-4b-instruct@2");
     }
 }

@@ -282,7 +282,7 @@ in
       };
       promptVersion = lib.mkOption {
         type = lib.types.int;
-        default = 1;
+        default = 2;
         description = "Prompt/schema version; bump to invalidate + re-summarize the whole corpus.";
       };
       serveLocally = lib.mkOption {

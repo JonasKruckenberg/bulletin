@@ -260,9 +260,14 @@ async fn generate_digest(
     .await
 }
 
-/// Run one subscriber's thread_maintenance pass. Best-effort by contract: a failure is logged and
-/// surfaced as a failed job (so apalis retries), but it never blocks or corrupts a digest — the
-/// prior thread state simply stands until the next pass succeeds.
+/// Run one subscriber's per-subscriber off-path pass: thread_maintenance, then the best-effort
+/// **private** cluster-summarization sweep (`docs/llm-summarization.md` §5 / handoff §4.3 — folded in
+/// here, the one job that already walks the subscriber's content). Both are best-effort by contract: a
+/// maintenance failure is surfaced so apalis retries, but it never blocks a digest and never skips the
+/// private sweep; the summary sweep itself never fails the job (a down sidecar just leaves clusters at
+/// their deterministic baseline). The private sweep rides this job, so it follows its
+/// `thread-weighting`-gated cadence — the realistic `llm-summarization` build keeps `thread-weighting`
+/// on (the default), so both run together.
 async fn thread_maintenance(
     job: ThreadMaintenanceJob,
     task_id: TaskId<Ulid>,
@@ -271,22 +276,58 @@ async fn thread_maintenance(
 ) -> Result<(), BoxDynError> {
     traced("thread_maintenance", task_id, attempt, async move {
         let cfg = bulletin_core::thread::MaintenanceConfig::default();
-        match bulletin_core::thread::maintain(&pool, job.subscriber_id, Utc::now(), &cfg).await {
-            Ok(stats) => tracing::info!(
-                subscriber_id = %job.subscriber_id,
-                sources = stats.sources,
-                entities = stats.entities,
-                communities = stats.communities,
-                threads = stats.threads_written,
-                weighted_entities = stats.weighted_entities,
-                "thread maintenance complete"
-            ),
-            Err(e) => return Err(boxed(e)),
-        }
-        Ok(())
+        let maintenance =
+            match bulletin_core::thread::maintain(&pool, job.subscriber_id, Utc::now(), &cfg).await
+            {
+                Ok(stats) => {
+                    tracing::info!(
+                        subscriber_id = %job.subscriber_id,
+                        sources = stats.sources,
+                        entities = stats.entities,
+                        communities = stats.communities,
+                        threads = stats.threads_written,
+                        weighted_entities = stats.weighted_entities,
+                        "thread maintenance complete"
+                    );
+                    Ok(())
+                }
+                Err(e) => Err(boxed(e)),
+            };
+        // Private cluster summaries, off the punctual path — attempted regardless of the maintenance
+        // outcome (it operates on `cluster`, not `thread`) and never fails the job. A no-op without the
+        // `llm-summarization` feature.
+        summarize_private(&pool, job.subscriber_id).await;
+        maintenance
     })
     .await
 }
+
+/// Best-effort **private** cluster-summarization sweep for one subscriber, in their RLS context
+/// (per-unit, stateless — no cross-tenant content in one call, `docs/llm-summarization.md` §3.5). The
+/// private mirror of [`summarize_public`]: the `llm-summarization` cargo feature is the **sole** kill
+/// switch — without it this is the empty no-op below. Never propagates an error — summarization is not
+/// the deliverable.
+#[cfg(feature = "llm-summarization")]
+async fn summarize_private(pool: &PgPool, subscriber_id: Uuid) {
+    let cfg = bulletin_core::summarize::SummarizationConfig::from_env();
+    match bulletin_core::summarize::sweep_private(pool, subscriber_id, &cfg).await {
+        Ok(stats) => tracing::info!(
+            subscriber_id = %subscriber_id,
+            summarized = stats.summarized,
+            skipped = stats.skipped,
+            unavailable = stats.unavailable,
+            "private cluster summarization sweep complete"
+        ),
+        Err(e) => tracing::warn!(
+            subscriber_id = %subscriber_id,
+            error = %format!("{e:#}"),
+            "private cluster summarization sweep failed (non-fatal)"
+        ),
+    }
+}
+
+#[cfg(not(feature = "llm-summarization"))]
+async fn summarize_private(_: &PgPool, _: Uuid) {}
 
 /// How often a subscriber's thread-maintenance pass runs (a relaxed, off-path cadence).
 #[cfg(feature = "thread-weighting")]
