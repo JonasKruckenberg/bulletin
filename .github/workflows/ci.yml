@@ -30,12 +30,16 @@ jobs:
       - uses: nix-community/cache-nix-action@v7
         with:
           # Key on everything that changes the build inputs: flake.lock (toolchain +
-          # crane), Cargo.lock (the deps-only layer crane caches) and the toolchain
-          # pin. A dep bump makes a fresh cache; source-only commits hit the prefix
-          # restore and reuse the warm store (devShell + crane cargoArtifacts).
-          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'Cargo.lock', 'rust-toolchain.toml') }}
+          # crane), Cargo.lock (the deps-only layer crane caches), the toolchain pin,
+          # and flake.nix itself (how the build/devShell are assembled). A change to any
+          # makes a fresh cache; source-only commits hit the prefix restore and reuse the
+          # warm store (devShell + crane cargoArtifacts).
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'Cargo.lock', 'rust-toolchain.toml', 'flake.nix') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-
-          gc-max-store-size-linux: 5G
+          # The retained closure now includes the crane deps layer (rooted below) on top of
+          # the devShell + toolchain, so give gc headroom to keep all three rather than
+          # evicting one to stay under the cap.
+          gc-max-store-size-linux: 8G
           purge: true
           purge-prefixes: nix-${{ runner.os }}-
           purge-last-accessed: P7D
@@ -50,7 +54,14 @@ jobs:
 
       - run: nix develop --command cargo deny check
 
+      # Build the crane deps-only layer first and keep its result symlink. The --out-link
+      # registers a GC root for cargoArtifacts, so cache-nix-action's save-time gc retains it
+      # in the Nix store and the next run restores it instead of cold-rebuilding the whole
+      # dependency graph (~5.5 min). cargoArtifacts is a build-only input of .#bulletin and is
+      # not part of the final binary's runtime closure, so without this root it was always
+      # collected before the cache was saved — which is why dep caching never actually helped.
+      - run: nix build .#deps --out-link result-deps
+
       # Build the deployable binary (crane: deps come from the cached cargoArtifacts layer,
-      # so this only compiles the workspace crates on source-only changes). Restoring the
-      # warm Nix store above is what keeps that dependency layer from rebuilding each run.
+      # so this only compiles the workspace crates on source-only changes).
       - run: nix build .#bulletin

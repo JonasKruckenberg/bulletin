@@ -122,6 +122,14 @@
         {
           inherit bulletin bulletin-llm;
           default = bulletin;
+
+          # Expose the crane deps-only layer as a build target so CI can `nix build .#deps
+          # --out-link ...` it. That out-link registers a GC root, which is what keeps
+          # cargoArtifacts in the Nix store through cache-nix-action's save-time gc. Without a
+          # root this layer — a build-only input of `.#bulletin`, absent from the final binary's
+          # runtime closure — was collected before the cache was saved, so every run cold-rebuilt
+          # the whole dependency graph (~5.5 min) despite the cache "hitting".
+          deps = cargoArtifacts;
         }
       );
 
