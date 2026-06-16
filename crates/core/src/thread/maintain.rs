@@ -92,6 +92,18 @@ pub async fn maintain(
     // commit atomically. Best-effort — a failure rolls back, leaving the prior thread state intact.
     with_scope(pool, ScopeCtx::Subscriber(subscriber_id), move |conn| {
         Box::pin(async move {
+            // A maintenance job can outlive its subscriber: enqueued, then the subscriber is deleted
+            // (cascading away its threads + watermark). The retrying job would then run against an empty
+            // scope, compute nothing, and fail the watermark's `subscriber_id` FK on insert — erroring
+            // (and retrying) forever. Treat a vanished subscriber as a successful no-op instead.
+            if !store::subscriber_exists(&mut *conn, subscriber_id)
+                .await
+                .context("check subscriber exists")?
+            {
+                tracing::info!(%subscriber_id, "subscriber no longer exists; skipping maintenance pass");
+                return Ok(MaintenanceStats::default());
+            }
+
             let since = store::feedback_cursor(&mut *conn, subscriber_id)
                 .await
                 .context("read maintenance watermark")?;

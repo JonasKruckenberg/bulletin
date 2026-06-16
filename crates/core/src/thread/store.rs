@@ -237,6 +237,22 @@ pub async fn load_entity_weights(
     Ok(serde_json::from_value(json).unwrap_or_default())
 }
 
+/// Whether the subscriber's own row still exists (visible under its Subscriber RLS scope). A
+/// maintenance job can outlive its subscriber: the job is enqueued, the subscriber is then deleted —
+/// cascading away its threads + watermark — and the retrying job runs against a now-empty scope, would
+/// compute an empty pass, and then fail the watermark's `subscriber_id` foreign key on the final
+/// insert (and retry forever). The caller checks this first and treats a vanished subscriber as a
+/// no-op instead.
+pub async fn subscriber_exists(
+    executor: impl PgExecutor<'_>,
+    subscriber_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM subscriber WHERE id = $1)")
+        .bind(subscriber_id)
+        .fetch_one(executor)
+        .await
+}
+
 /// The incremental feedback cursor for the subscriber's maintenance (a missing row reads as the
 /// epoch, so the first pass folds all prior care feedback in once).
 pub async fn feedback_cursor(
