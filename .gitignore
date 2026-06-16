@@ -1,2 +1,6 @@
 target/
 .postgres/
+
+# nix build out-links
+/result
+/result-*
