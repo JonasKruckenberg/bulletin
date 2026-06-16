@@ -357,6 +357,19 @@ in
           Required whenever `llm.modelUrl` is set.
         '';
       };
+      contextSize = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 8192;
+        description = ''
+          Context window (`--ctx-size`) the local sidecar loads with. Bulletin's summarization inputs
+          are tiny (budgeted source snippets + a short `max_tokens`), so a small window is plenty.
+          Left unset, `llama-server` defaults to the model's *training* context (e.g. Qwen3.5-4B's
+          262144), whose KV cache is multiple GB and a real OOM risk on a RAM-bound box — an OOM-kill +
+          restart leaves the port down for the reload window, surfacing as transient `connect`-refused
+          summarization warnings (`local-ml-options.md` §2/§7). Raise only if a future tier feeds longer
+          inputs.
+        '';
+      };
     };
 
     openFirewall = lib.mkOption {
@@ -448,6 +461,11 @@ in
         "--jinja"
         "--reasoning-budget"
         "0"
+        # Cap the context window so the KV cache stays small — without this `llama-server` loads the
+        # model's full training context (Qwen3.5-4B: 256K), whose multi-GB KV cache risks an OOM-kill +
+        # restart, the reload window of which is the transient `connect`-refused the worker logs.
+        "--ctx-size"
+        (toString cfg.llm.contextSize)
       ];
     };
 
