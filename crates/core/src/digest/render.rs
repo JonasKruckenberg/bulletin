@@ -221,21 +221,26 @@ fn render_plain(
             "{}. [{}] {}\n",
             i + 1,
             item.reason.format.as_str().to_uppercase(),
-            item.headline
+            clean(&item.headline)
         ));
         // The context eyebrow (§6.1 zone 1): the thread label + delta flag, when threaded. Plaintext
         // shows the label regardless of band (no "possibly"/omit budgeting — that's a visual nicety).
         if let Some(tag) = item.thread.as_ref().filter(|t| !t.label.trim().is_empty()) {
             match tag.delta.as_deref().filter(|d| !d.trim().is_empty()) {
-                Some(delta) => body.push_str(&format!("   ~ {} · {delta}\n", tag.label)),
-                None => body.push_str(&format!("   ~ {}\n", tag.label)),
+                Some(delta) => {
+                    body.push_str(&format!("   ~ {} · {}\n", clean(&tag.label), clean(delta)))
+                }
+                None => body.push_str(&format!("   ~ {}\n", clean(&tag.label))),
             }
         }
         // The grounded one-sentence tldr (§6.1 zone 3), when a summary has run; omitted otherwise.
         if !item.summary.trim().is_empty() {
-            body.push_str(&format!("   {}\n", item.summary));
+            body.push_str(&format!("   {}\n", clean(&item.summary)));
         }
-        if let Some(link) = &item.link {
+        // Only print a link the HTML view would also make live (http/https/mailto) — an unsafe scheme is
+        // dropped rather than shown as text, so the two views agree and no `javascript:`/`data:` URL ever
+        // reaches the reader. Sanitized of control/bidi characters by `safe_href`.
+        if let Some(link) = item.link.as_deref().and_then(safe_href) {
             body.push_str(&format!("   {link}\n"));
         }
         body.push_str(&format!(
@@ -249,12 +254,12 @@ fn render_plain(
         body.push_str(&format!("   why: {}\n", reason_line(&item.reason)));
         // The cross-source connections fused into this story, each with why it belongs (§8.2).
         for conn in &item.connections {
-            body.push_str(&format!("   ↳ {} [{}]", conn.title, conn.source.as_str()));
+            body.push_str(&format!("   ↳ {} [{}]", clean(&conn.title), conn.source.as_str()));
             if let Some(reason) = &conn.link_reason {
-                body.push_str(&format!(" — {reason}"));
+                body.push_str(&format!(" — {}", clean(reason)));
             }
             body.push('\n');
-            if let Some(link) = &conn.link {
+            if let Some(link) = conn.link.as_deref().and_then(safe_href) {
                 body.push_str(&format!("     {link}\n"));
             }
         }
@@ -529,10 +534,10 @@ fn date_rule(date: &str) -> String {
 /// [`soft_divider`], not a rule.
 fn render_story_row(position: usize, item: &RenderItem, tz: Tz) -> String {
     let headline_text = escape(&item.headline);
-    let headline = match &item.link {
+    let headline = match item.link.as_deref().and_then(safe_href) {
         Some(link) => format!(
             r#"<a class="headline" href="{}" style="display:block;margin-top:10px;font-family:{SERIF};font-size:22px;font-weight:700;line-height:1.32;color:{INK};text-decoration:none;">{headline_text}</a>"#,
-            escape(link)
+            escape(&link)
         ),
         None => format!(
             r#"<span class="headline" style="display:block;margin-top:10px;font-family:{SERIF};font-size:22px;font-weight:700;line-height:1.32;color:{INK};">{headline_text}</span>"#
@@ -751,10 +756,10 @@ fn debug_trace_block(position: usize, item: &RenderItem, tz: Tz) -> String {
 /// can still out-rank a Story (it's interleaved in global priority order).
 fn render_note_row(item: &RenderItem, tz: Tz) -> String {
     let headline_text = escape(&item.headline);
-    let headline = match &item.link {
+    let headline = match item.link.as_deref().and_then(safe_href) {
         Some(link) => format!(
             r#"<a href="{}" style="display:block;margin-top:8px;font-family:{SERIF};font-size:17px;font-weight:700;line-height:1.4;color:{INK};text-decoration:none;">{headline_text}</a>"#,
-            escape(link)
+            escape(&link)
         ),
         None => format!(
             r#"<span style="display:block;margin-top:8px;font-family:{SERIF};font-size:17px;font-weight:700;line-height:1.4;color:{INK};">{headline_text}</span>"#
@@ -805,11 +810,38 @@ fn render_eyebrow(thread: Option<&ThreadTag>) -> String {
     )
 }
 
-/// Minimal HTML escaping for untrusted feed text, safe in both element-text and double-quoted
-/// attribute contexts (the two places we interpolate).
+/// Characters we drop from untrusted feed/model text *before* HTML-escaping it — a class that can
+/// never legitimately appear in a calm editorial digest line and that "renders weirdly" (or worse) when
+/// it does:
+///
+/// - **C0/C1 control codes** (`U+0000`–`U+001F` except tab/newline, `U+007F`–`U+009F`) — non-printing
+///   bytes that can smuggle a scheme past a URL check or break a line mid-field;
+/// - **bidi embeddings, overrides and isolates** (`U+202A`–`U+202E`, `U+2066`–`U+2069`) — the
+///   Trojan-Source / spoofing family that visually reorders text so a headline reads as something it
+///   isn't;
+/// - **zero-width and join controls + BOM** (`U+200B`–`U+200F`, `U+2060`–`U+2064`, `U+FEFF`) — invisible
+///   characters that hide content or split words the eye can't see.
+///
+/// Tab (`U+0009`) and newline (`U+000A`) are kept — they're legitimate whitespace that HTML collapses
+/// harmlessly. Everything else printable passes through to [`escape`].
+fn is_unsafe_char(c: char) -> bool {
+    matches!(c,
+        '\u{0000}'..='\u{0008}' | '\u{000B}'..='\u{001F}' | '\u{007F}'..='\u{009F}'
+        | '\u{200B}'..='\u{200F}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}'
+        | '\u{202A}'..='\u{202E}' | '\u{FEFF}'
+    )
+}
+
+/// HTML escaping for untrusted feed/model text, safe in both element-text and double-quoted attribute
+/// contexts (the two places we interpolate). First strips the [`is_unsafe_char`] class (control / bidi /
+/// zero-width) so a hostile or malformed feed can't reorder, hide, or break the rendered line, then
+/// escapes the five HTML-significant characters so nothing can break out of the markup.
 fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
+        if is_unsafe_char(c) {
+            continue;
+        }
         match c {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
@@ -820,6 +852,37 @@ fn escape(s: &str) -> String {
         }
     }
     out
+}
+
+/// Strip the [`is_unsafe_char`] class from untrusted text for the **plaintext** view, where there is no
+/// markup to escape but a bidi-override or control character would still reorder or mangle the line in a
+/// terminal or plain-text mail client (the same Trojan-Source concern, minus the injection). The HTML
+/// view gets this stripping for free inside [`escape`]; plaintext fields call this directly.
+fn clean(s: &str) -> String {
+    s.chars().filter(|c| !is_unsafe_char(*c)).collect()
+}
+
+/// A feed-supplied URL we are willing to emit as a live `href` / link target, or `None` to render the
+/// item **unlinked**. Feed links are untrusted: a `javascript:`, `data:`, or `vbscript:` URL executes
+/// (or renders attacker markup) in the mail clients that honour it, and HTML-escaping does not stop it —
+/// escaping only neutralizes the quotes that would break the attribute, not the scheme inside it. So we
+/// allowlist **only** the schemes a digest link can legitimately use — `http`, `https`, `mailto` —
+/// matched case-insensitively after stripping the control characters that could hide a scheme
+/// (`java\u{0009}script:`) and trimming surrounding whitespace. Anything else (another scheme, or a
+/// relative/scheme-relative URL we can't vet) drops to `None`, and the caller shows plain text instead of
+/// a live link. The returned string still carries no control characters; callers HTML-escape it as usual.
+fn safe_href(url: &str) -> Option<String> {
+    let cleaned: String = url.chars().filter(|c| !is_unsafe_char(*c)).collect();
+    let trimmed = cleaned.trim();
+    let scheme = trimmed.to_ascii_lowercase();
+    if scheme.starts_with("http://")
+        || scheme.starts_with("https://")
+        || scheme.starts_with("mailto:")
+    {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
