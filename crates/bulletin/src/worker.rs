@@ -227,6 +227,16 @@ fn report_sweep(
     result: anyhow::Result<bulletin_core::summarize::SummarizeStats>,
 ) {
     match result {
+        // A non-zero `unavailable` count means the sidecar was unreachable/erroring for at least one
+        // cluster this pass — surface it at WARN so a degraded model edge is visible at the default log
+        // level (those clusters retry next sweep), while a clean pass stays at INFO.
+        Ok(stats) if stats.unavailable > 0 => tracing::warn!(
+            ?subscriber_id,
+            summarized = stats.summarized,
+            skipped = stats.skipped,
+            unavailable = stats.unavailable,
+            "cluster summarization sweep complete with unavailable clusters (sidecar degraded?)"
+        ),
         Ok(stats) => tracing::info!(
             ?subscriber_id,
             summarized = stats.summarized,
