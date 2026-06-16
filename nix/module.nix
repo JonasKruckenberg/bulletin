@@ -434,6 +434,11 @@ in
       model = llmModelPath;
       host = "127.0.0.1";
       port = llmPort;
+      # `--jinja` makes llama-server honour the model's chat template and the worker's
+      # `chat_template_kwargs` — notably `enable_thinking: false`, which stops a reasoning model
+      # (Qwen3 et al.) from spending the small summary token budget on a `<think>` block and returning
+      # an empty completion (the "EOF while parsing a value at line 1 column 0" / timeout symptoms).
+      extraFlags = [ "--jinja" ];
     };
 
     # When the model is fetched declaratively, gate the sidecar on a verified file: chain

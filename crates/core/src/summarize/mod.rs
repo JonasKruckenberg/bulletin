@@ -66,8 +66,16 @@ pub struct SummarizationConfig {
     /// fails, the facts stay at their neutral defaults and the summarizer degrades to "state asserted
     /// facts plainly," the safe direction.
     pub comprehend: bool,
+    /// Send `chat_template_kwargs: {enable_thinking: false}` on every call to suppress a reasoning
+    /// model's native `<think>` block (§3.6 — these are short, grammar-constrained rephrases; the
+    /// reasoning only wastes the token budget and, when it exhausts it, leaves an empty completion).
+    /// Honoured by a llama.cpp sidecar run with `--jinja`; harmlessly ignored otherwise. On by default;
+    /// the rare deployment whose model *needs* thinking can clear it via `BULLETIN_LLM_DISABLE_THINKING`.
+    pub disable_thinking: bool,
     /// HTTP timeout for one sidecar call. Generous — it is off the punctual path; a timeout just
-    /// degrades that cluster to baseline.
+    /// degrades that cluster to baseline. A small model on CPU can be slow on a cold cache, so this is
+    /// sized for the worst realistic single call; raise it for slower hardware via
+    /// `BULLETIN_LLM_REQUEST_TIMEOUT_SECS`.
     pub request_timeout: Duration,
     /// Source-text budget per cluster (§7 long-context cliff): truncate the concatenated event
     /// title+body fed to the model so a small model stays in its faithful regime.
@@ -92,7 +100,8 @@ impl Default for SummarizationConfig {
             seed: 42,
             faithfulness_gate: true,
             comprehend: true,
-            request_timeout: Duration::from_secs(60),
+            disable_thinking: true,
+            request_timeout: Duration::from_secs(120),
             max_source_chars: 4000,
             max_per_sweep: 200,
         }
@@ -107,11 +116,14 @@ impl SummarizationConfig {
         format!("{}@{}", self.model, self.prompt_version)
     }
 
-    /// Build a config from the `BULLETIN_LLM_*` environment (the binary's runtime config seam) — the
-    /// sidecar `BASE_URL`, `MODEL`, and `PROMPT_VERSION` only; everything else stays at the
-    /// conservative defaults. These are *config, not a kill switch* — whether summarization runs at
-    /// all is the compile-time feature's call (this code only exists in a feature build). Reached only
-    /// from the gated worker step, so it never executes in a default build.
+    /// Build a config from the `BULLETIN_LLM_*` environment (the binary's runtime config seam): the
+    /// sidecar `BASE_URL`, `MODEL`, and `PROMPT_VERSION`, plus the operational knobs an operator needs
+    /// to recover a degraded edge without a recompile — `REQUEST_TIMEOUT_SECS` (slow hardware),
+    /// `COMPREHEND` (drop the extra per-cluster call to halve the load), and `DISABLE_THINKING` (the
+    /// reasoning-model toggle). Everything else stays at the conservative defaults. These are *config,
+    /// not a kill switch* — whether summarization runs at all is the compile-time feature's call (this
+    /// code only exists in a feature build). Reached only from the gated worker step, so it never
+    /// executes in a default build.
     pub fn from_env() -> Self {
         let mut cfg = SummarizationConfig::default();
         if let Ok(v) = std::env::var("BULLETIN_LLM_BASE_URL") {
@@ -129,7 +141,34 @@ impl SummarizationConfig {
                 cfg.prompt_version = n;
             }
         }
+        // A positive whole-second override only — a `0`/garbage value keeps the default rather than
+        // setting a zero (i.e. effectively no) timeout.
+        if let Ok(v) = std::env::var("BULLETIN_LLM_REQUEST_TIMEOUT_SECS") {
+            if let Ok(secs) = v.trim().parse::<u64>() {
+                if secs > 0 {
+                    cfg.request_timeout = Duration::from_secs(secs);
+                }
+            }
+        }
+        if let Some(b) = env_bool("BULLETIN_LLM_COMPREHEND") {
+            cfg.comprehend = b;
+        }
+        if let Some(b) = env_bool("BULLETIN_LLM_DISABLE_THINKING") {
+            cfg.disable_thinking = b;
+        }
         cfg
+    }
+}
+
+/// Parse a boolean-ish env var (`1`/`0`, `true`/`false`, `yes`/`no`, `on`/`off`, case-insensitive).
+/// `None` when unset or unrecognized, so the caller keeps its default rather than guessing — used by
+/// the optional `BULLETIN_LLM_*` toggles in [`SummarizationConfig::from_env`].
+fn env_bool(key: &str) -> Option<bool> {
+    let v = std::env::var(key).ok()?;
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
     }
 }
 
