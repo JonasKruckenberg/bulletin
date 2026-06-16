@@ -543,7 +543,7 @@ fn render_story_row(position: usize, item: &RenderItem, tz: Tz) -> String {
     let headline = match item.link.as_deref().and_then(safe_href) {
         Some(link) => format!(
             r#"<a class="headline" href="{}" style="display:block;margin-top:10px;font-family:{SERIF};font-size:22px;font-weight:700;line-height:1.32;color:{INK};text-decoration:none;">{headline_text}</a>"#,
-            escape(&link)
+            escape_attr(&link)
         ),
         None => format!(
             r#"<span class="headline" style="display:block;margin-top:10px;font-family:{SERIF};font-size:22px;font-weight:700;line-height:1.32;color:{INK};">{headline_text}</span>"#
@@ -765,7 +765,7 @@ fn render_note_row(item: &RenderItem, tz: Tz) -> String {
     let headline = match item.link.as_deref().and_then(safe_href) {
         Some(link) => format!(
             r#"<a href="{}" style="display:block;margin-top:8px;font-family:{SERIF};font-size:17px;font-weight:700;line-height:1.4;color:{INK};text-decoration:none;">{headline_text}</a>"#,
-            escape(&link)
+            escape_attr(&link)
         ),
         None => format!(
             r#"<span style="display:block;margin-top:8px;font-family:{SERIF};font-size:17px;font-weight:700;line-height:1.4;color:{INK};">{headline_text}</span>"#
@@ -838,26 +838,29 @@ fn is_unsafe_char(c: char) -> bool {
     )
 }
 
-/// HTML escaping for untrusted feed/model text, safe in both element-text and double-quoted attribute
-/// contexts (the two places we interpolate). First strips the [`is_unsafe_char`] class (control / bidi /
-/// zero-width) so a hostile or malformed feed can't reorder, hide, or break the rendered line, then
-/// escapes the five HTML-significant characters so nothing can break out of the markup.
+/// HTML entity-encode untrusted feed/model text for an **element-text** context (between tags) — the
+/// vast majority of our interpolations: headlines, summaries, labels, badge surfaces, chrome. First
+/// strips the [`is_unsafe_char`] class (control / bidi / zero-width) so a hostile or malformed feed
+/// can't reorder, hide, or break the rendered line — no HTML escaper covers Trojan-Source characters,
+/// since they're a Unicode concern, not a markup one — then delegates the actual entity-encoding to
+/// `html_escape::encode_text` (escapes `&`, `<`, `>`) rather than hand-rolling it. Attribute values use
+/// [`escape_attr`] instead.
 fn escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if is_unsafe_char(c) {
-            continue;
-        }
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(c),
-        }
-    }
-    out
+    html_escape::encode_text(&strip_unsafe(s)).into_owned()
+}
+
+/// HTML entity-encode untrusted text for a **double-quoted attribute** value — the one such sink is the
+/// link `href`. `html_escape::encode_double_quoted_attribute` escapes `&` and `"` so the value can never
+/// close the attribute, after the same control/bidi strip. (`encode_text` is *not* safe here — it
+/// leaves `"` intact.)
+fn escape_attr(s: &str) -> String {
+    html_escape::encode_double_quoted_attribute(&strip_unsafe(s)).into_owned()
+}
+
+/// Drop the [`is_unsafe_char`] class from a string — the shared sanitization pass both [`escape`] and
+/// [`escape_attr`] run before entity-encoding, and the whole of what the plaintext [`clean`] does.
+fn strip_unsafe(s: &str) -> String {
+    s.chars().filter(|c| !is_unsafe_char(*c)).collect()
 }
 
 /// Strip the [`is_unsafe_char`] class from untrusted text for the **plaintext** view, where there is no
@@ -865,30 +868,23 @@ fn escape(s: &str) -> String {
 /// terminal or plain-text mail client (the same Trojan-Source concern, minus the injection). The HTML
 /// view gets this stripping for free inside [`escape`]; plaintext fields call this directly.
 fn clean(s: &str) -> String {
-    s.chars().filter(|c| !is_unsafe_char(*c)).collect()
+    strip_unsafe(s)
 }
 
 /// A feed-supplied URL we are willing to emit as a live `href` / link target, or `None` to render the
 /// item **unlinked**. Feed links are untrusted: a `javascript:`, `data:`, or `vbscript:` URL executes
 /// (or renders attacker markup) in the mail clients that honour it, and HTML-escaping does not stop it —
 /// escaping only neutralizes the quotes that would break the attribute, not the scheme inside it. So we
-/// allowlist **only** the schemes a digest link can legitimately use — `http`, `https`, `mailto` —
-/// matched case-insensitively after stripping the control characters that could hide a scheme
-/// (`java\u{0009}script:`) and trimming surrounding whitespace. Anything else (another scheme, or a
-/// relative/scheme-relative URL we can't vet) drops to `None`, and the caller shows plain text instead of
-/// a live link. The returned string still carries no control characters; callers HTML-escape it as usual.
+/// allowlist **only** the schemes a digest link can legitimately use — `http`, `https`, `mailto`. We
+/// WHATWG-parse the link with the `url` crate (after the control-character strip that could otherwise
+/// hide a scheme) and check the normalized `scheme()`, rather than prefix-matching the raw string: the
+/// parser rejects malformed and relative/scheme-relative URLs for us and normalizes the scheme, so the
+/// allowlist can't be slipped by casing or whitespace tricks. Anything that doesn't parse, or parses to
+/// a scheme outside the allowlist, drops to `None` and the caller shows plain text instead of a live
+/// link. The returned string still carries no control characters; callers HTML-escape it as usual.
 fn safe_href(url: &str) -> Option<String> {
-    let cleaned: String = url.chars().filter(|c| !is_unsafe_char(*c)).collect();
-    let trimmed = cleaned.trim();
-    let scheme = trimmed.to_ascii_lowercase();
-    if scheme.starts_with("http://")
-        || scheme.starts_with("https://")
-        || scheme.starts_with("mailto:")
-    {
-        Some(trimmed.to_string())
-    } else {
-        None
-    }
+    let parsed = url::Url::parse(strip_unsafe(url).trim()).ok()?;
+    matches!(parsed.scheme(), "http" | "https" | "mailto").then(|| parsed.to_string())
 }
 
 #[cfg(test)]
@@ -995,9 +991,11 @@ mod tests {
         // No raw injection survives.
         assert!(!html.contains("<script>"));
         assert!(html.contains("Tom &amp; Jerry &lt;script&gt;"));
-        // The attribute-breaking quote in the link is neutralised.
+        // The attribute-breaking quote in the link is neutralised: WHATWG-parsing percent-encodes the
+        // `"`/`<`/`>` (so `"` becomes `%22`), and the attribute encoder entitizes the `&` separator — so
+        // nothing can close the href and inject markup.
         assert!(!html.contains(r#"a=1&b=2"></a>"#));
-        assert!(html.contains("&amp;b=2&quot;"));
+        assert!(html.contains("a=1&amp;b=2%22"));
     }
 
     #[test]

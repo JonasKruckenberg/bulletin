@@ -41,6 +41,8 @@ reqwest          = { workspace = true }
 rss              = { workspace = true }
 atom_syndication = { workspace = true }
 lettre           = { workspace = true }
+html-escape      = { workspace = true }  # entity-encode untrusted feed/LLM text in the digest renderer
+url              = { workspace = true }  # WHATWG URL parse → scheme allowlist for feed-supplied links
 
 [dev-dependencies]
 proptest               = { workspace = true }
