@@ -1296,6 +1296,14 @@ fn build_summarize_http(cfg: &SummarizationConfig, what: &str) -> anyhow::Result
 /// actually moved — generate + gate + store a fresh summary. The model/prompt provenance gates a
 /// corpus-wide re-summarize after an upgrade. The RLS context is derived from the scope by
 /// [`ScopeCtx::for_scope`] (public → no-subscriber, private → owner), the single source of that mapping.
+///
+/// **Each DB step runs in its own short scoped transaction, with the model calls held *between* them
+/// (never inside one).** A single sidecar call can take seconds, and a sweep walks up to
+/// `max_per_sweep` clusters — so wrapping the whole loop in one transaction (as this once did) would
+/// pin a connection `idle in transaction` for minutes, holding locks the public build and every other
+/// writer to `cluster` then queue behind. That is exactly what surfaces as a multi-minute "slow
+/// statement" on the trivial `store_summary` `UPDATE`. The model calls touch no DB, so they sit
+/// comfortably outside any transaction.
 #[cfg(feature = "llm-summarization")]
 async fn sweep(
     pool: &sqlx::PgPool,
@@ -1308,76 +1316,100 @@ async fn sweep(
 
     let ctx = ScopeCtx::for_scope(scope);
     let model = cfg.summary_model();
-    let scope = scope.clone();
-    let cfg = cfg.clone();
-    let http = build_summarize_http(&cfg, "cluster")?;
+    let http = build_summarize_http(cfg, "cluster")?;
 
-    with_scope(pool, ctx, move |conn| {
-        Box::pin(async move {
-            let mut stats = SummarizeStats::default();
-            let due =
-                store::clusters_needing_summary(&mut *conn, &scope, &model, cfg.max_per_sweep)
+    // The work queue, loaded in its own short transaction.
+    let due = with_scope(pool, ctx, {
+        let scope = scope.clone();
+        let model = model.clone();
+        let limit = cfg.max_per_sweep;
+        move |conn| {
+            Box::pin(async move {
+                store::clusters_needing_summary(conn, &scope, &model, limit)
                     .await
-                    .context("load clusters needing summary")?;
-            // Record which sidecar this sweep targets and how much work it found, so an operator can
-            // correlate any per-cluster `connect`/`timeout` warnings below with the configured endpoint
-            // (a misconfigured `BULLETIN_LLM_BASE_URL` looks exactly like a down sidecar otherwise).
-            tracing::debug!(
-                base_url = %cfg.base_url,
-                model = %model,
-                request_timeout_s = cfg.request_timeout.as_secs(),
-                due = due.len(),
-                "summarization sweep starting"
-            );
-            for c in due {
-                let events = crate::cluster::store::list_group_events(
-                    &mut *conn,
-                    &scope,
-                    c.source,
-                    &c.group_key,
-                )
-                .await
-                .context("load cluster events for summary")?;
-                if events.is_empty() {
-                    continue;
-                }
-                let hash = summary_hash(&events);
-                // The exact re-check behind the cheap SQL gate: content unchanged (and same model) ⇒
-                // the cached summary still holds, so just bump the watermark and skip the model call.
-                if c.summary_hash.as_deref() == Some(hash.as_slice()) {
-                    store::touch_summarized(&mut *conn, c.id).await.ok();
-                    stats.skipped += 1;
-                    continue;
-                }
-                // `None` ⇒ the model was unavailable: leave the cluster unsummarized (don't advance
-                // `summarized_at`) so a later sweep retries once the sidecar recovers, rather than
-                // freezing it at a baseline until its content next changes. A gate rejection still
-                // returns `Some(baseline)` — that is a stable, content-derived result worth caching.
-                // A span so the best-effort warnings inside `summarize_cluster` (model/comprehension
-                // call failed) carry *which* cluster they were for — the failure is logged at the call
-                // site where the error type is known, but the identity lives out here.
-                let span = tracing::debug_span!(
-                    "summarize_cluster",
-                    cluster_id = %c.id,
-                    source = c.source.as_str(),
-                );
-                match client::summarize_cluster(&cfg, &http, &c.title, &events)
-                    .instrument(span)
-                    .await
-                {
-                    Some(summary) => {
-                        store::store_summary(&mut *conn, c.id, &summary, &hash, &model)
-                            .await
-                            .context("store cluster summary")?;
-                        stats.summarized += 1;
-                    }
-                    None => stats.unavailable += 1,
-                }
-            }
-            Ok(stats)
-        })
+                    .context("load clusters needing summary")
+            })
+        }
     })
-    .await
+    .await?;
+    // Record which sidecar this sweep targets and how much work it found, so an operator can correlate
+    // any per-cluster `connect`/`timeout` warnings below with the configured endpoint (a misconfigured
+    // `BULLETIN_LLM_BASE_URL` looks exactly like a down sidecar otherwise).
+    tracing::debug!(
+        base_url = %cfg.base_url,
+        model = %model,
+        request_timeout_s = cfg.request_timeout.as_secs(),
+        due = due.len(),
+        "summarization sweep starting"
+    );
+
+    let mut stats = SummarizeStats::default();
+    for c in due {
+        let events = with_scope(pool, ctx, {
+            let scope = scope.clone();
+            let source = c.source;
+            let group_key = c.group_key.clone();
+            move |conn| {
+                Box::pin(async move {
+                    crate::cluster::store::list_group_events(conn, &scope, source, &group_key)
+                        .await
+                        .context("load cluster events for summary")
+                })
+            }
+        })
+        .await?;
+        if events.is_empty() {
+            continue;
+        }
+        let hash = summary_hash(&events);
+        // The exact re-check behind the cheap SQL gate: content unchanged (and same model) ⇒ the
+        // cached summary still holds, so just bump the watermark and skip the model call.
+        if c.summary_hash.as_deref() == Some(hash.as_slice()) {
+            let cid = c.id;
+            let _ = with_scope(pool, ctx, move |conn| {
+                Box::pin(async move {
+                    store::touch_summarized(conn, cid)
+                        .await
+                        .context("touch summarized watermark")
+                })
+            })
+            .await;
+            stats.skipped += 1;
+            continue;
+        }
+        // `None` ⇒ the model was unavailable: leave the cluster unsummarized (don't advance
+        // `summarized_at`) so a later sweep retries once the sidecar recovers, rather than freezing it
+        // at a baseline until its content next changes. A gate rejection still returns `Some(baseline)`
+        // — that is a stable, content-derived result worth caching. A span so the best-effort warnings
+        // inside `summarize_cluster` (model/comprehension call failed) carry *which* cluster they were
+        // for — the failure is logged at the call site where the error type is known, but the identity
+        // lives out here. The call holds no transaction.
+        let span = tracing::debug_span!(
+            "summarize_cluster",
+            cluster_id = %c.id,
+            source = c.source.as_str(),
+        );
+        match client::summarize_cluster(cfg, &http, &c.title, &events)
+            .instrument(span)
+            .await
+        {
+            Some(summary) => {
+                let cid = c.id;
+                let model = model.clone();
+                with_scope(pool, ctx, move |conn| {
+                    Box::pin(async move {
+                        store::store_summary(conn, cid, &summary, &hash, &model)
+                            .await
+                            .context("store cluster summary")
+                    })
+                })
+                .await?;
+                stats.summarized += 1;
+            }
+            None => stats.unavailable += 1,
+        }
+    }
+    Ok(stats)
 }
 
 /// Run a best-effort **story cross-source synthesis** pass (Phase C, §2.2) for one subscriber, in
@@ -1402,67 +1434,98 @@ pub async fn sweep_stories(
     use anyhow::Context;
 
     let model = cfg.summary_model();
-    let cfg = cfg.clone();
-    let http = build_summarize_http(&cfg, "story-synthesis")?;
+    let http = build_summarize_http(cfg, "story-synthesis")?;
+    let ctx = ScopeCtx::Subscriber(subscriber_id);
 
-    with_scope(pool, ScopeCtx::Subscriber(subscriber_id), move |conn| {
-        Box::pin(async move {
-            let mut stats = SummarizeStats::default();
-            let due = store::stories_needing_summary(
-                &mut *conn,
-                subscriber_id,
-                &model,
-                cfg.max_per_sweep,
-            )
-            .await
-            .context("load stories needing synthesis")?;
-            for s in due {
-                let members = store::load_member_summaries(&mut *conn, &s.cluster_ids)
+    // Same transaction discipline as `sweep`: each DB step is its own short scoped transaction and the
+    // synthesis model calls sit between them, so a slow sidecar never pins a connection in a long-held
+    // transaction (the slow-`UPDATE` / lock-contention failure mode).
+    let due = with_scope(pool, ctx, {
+        let model = model.clone();
+        let limit = cfg.max_per_sweep;
+        move |conn| {
+            Box::pin(async move {
+                store::stories_needing_summary(conn, subscriber_id, &model, limit)
                     .await
-                    .context("load story member summaries")?;
-                // A cross-source synthesis needs ≥2 members *and* at least one with a real cluster
-                // summary to fuse; otherwise fire-time already renders the representative cluster
-                // identically — skip the model call, just advance the watermark so it isn't re-flagged.
-                let has_content = members.iter().any(|m| !m.summary.is_empty());
-                if members.len() < 2 || !has_content {
-                    store::touch_story_summarized(&mut *conn, s.id, &model)
-                        .await
-                        .ok();
-                    stats.skipped += 1;
-                    continue;
-                }
-
-                let hashes: Vec<Option<Vec<u8>>> =
-                    members.iter().map(|m| m.summary_hash.clone()).collect();
-                let sig = story_summary_sig(&hashes);
-                // Exact re-check behind the cheap SQL gate: signature unchanged *and* same model ⇒ the
-                // cached synthesis still holds, so just advance the watermark and skip the model call.
-                if s.summary_sig.as_deref() == Some(sig.as_slice())
-                    && s.summary_model.as_deref() == Some(model.as_str())
-                {
-                    store::touch_story_summarized(&mut *conn, s.id, &model)
-                        .await
-                        .ok();
-                    stats.skipped += 1;
-                    continue;
-                }
-
-                let summaries: Vec<ClusterSummary> =
-                    members.into_iter().map(|m| m.summary).collect();
-                match client::synthesize_story(&cfg, &http, &summaries, None).await {
-                    Some(summary) => {
-                        store::store_story_summary(&mut *conn, s.id, &summary, &sig, &model)
-                            .await
-                            .context("store story summary")?;
-                        stats.summarized += 1;
-                    }
-                    None => stats.unavailable += 1,
-                }
-            }
-            Ok(stats)
-        })
+                    .context("load stories needing synthesis")
+            })
+        }
     })
-    .await
+    .await?;
+
+    let mut stats = SummarizeStats::default();
+    for s in due {
+        let members = with_scope(pool, ctx, {
+            let cluster_ids = s.cluster_ids.clone();
+            move |conn| {
+                Box::pin(async move {
+                    store::load_member_summaries(conn, &cluster_ids)
+                        .await
+                        .context("load story member summaries")
+                })
+            }
+        })
+        .await?;
+        // A cross-source synthesis needs ≥2 members *and* at least one with a real cluster summary to
+        // fuse; otherwise fire-time already renders the representative cluster identically — skip the
+        // model call, just advance the watermark so it isn't re-flagged.
+        let has_content = members.iter().any(|m| !m.summary.is_empty());
+        if members.len() < 2 || !has_content {
+            let sid = s.id;
+            let model = model.clone();
+            let _ = with_scope(pool, ctx, move |conn| {
+                Box::pin(async move {
+                    store::touch_story_summarized(conn, sid, &model)
+                        .await
+                        .context("touch story summarized")
+                })
+            })
+            .await;
+            stats.skipped += 1;
+            continue;
+        }
+
+        let hashes: Vec<Option<Vec<u8>>> =
+            members.iter().map(|m| m.summary_hash.clone()).collect();
+        let sig = story_summary_sig(&hashes);
+        // Exact re-check behind the cheap SQL gate: signature unchanged *and* same model ⇒ the cached
+        // synthesis still holds, so just advance the watermark and skip the model call.
+        if s.summary_sig.as_deref() == Some(sig.as_slice())
+            && s.summary_model.as_deref() == Some(model.as_str())
+        {
+            let sid = s.id;
+            let model = model.clone();
+            let _ = with_scope(pool, ctx, move |conn| {
+                Box::pin(async move {
+                    store::touch_story_summarized(conn, sid, &model)
+                        .await
+                        .context("touch story summarized")
+                })
+            })
+            .await;
+            stats.skipped += 1;
+            continue;
+        }
+
+        let summaries: Vec<ClusterSummary> = members.into_iter().map(|m| m.summary).collect();
+        match client::synthesize_story(cfg, &http, &summaries, None).await {
+            Some(summary) => {
+                let sid = s.id;
+                let model = model.clone();
+                with_scope(pool, ctx, move |conn| {
+                    Box::pin(async move {
+                        store::store_story_summary(conn, sid, &summary, &sig, &model)
+                            .await
+                            .context("store story summary")
+                    })
+                })
+                .await?;
+                stats.summarized += 1;
+            }
+            None => stats.unavailable += 1,
+        }
+    }
+    Ok(stats)
 }
 
 /// Run a best-effort **thread label + delta** pass (Phase B, §2.3/§5.2) for one subscriber, in their
@@ -1489,112 +1552,126 @@ pub async fn sweep_thread_labels(
     const FANIN_LIMIT: usize = 6;
 
     let model = cfg.summary_model();
-    let cfg = cfg.clone();
-    let http = build_summarize_http(&cfg, "thread-label")?;
+    let http = build_summarize_http(cfg, "thread-label")?;
+    let ctx = ScopeCtx::Subscriber(subscriber_id);
 
-    with_scope(pool, ScopeCtx::Subscriber(subscriber_id), move |conn| {
-        Box::pin(async move {
-            let mut stats = SummarizeStats::default();
-            let due = store::threads_needing_summary(
-                &mut *conn,
-                subscriber_id,
-                &model,
-                cfg.max_per_sweep,
-            )
-            .await
-            .context("load threads needing label/delta")?;
-            for t in due {
-                // The recent stories on this thread's spine (newest-first): the label inputs, and
-                // (filtered by the prior watermark) the delta's "what newly changed".
-                let recent = store::thread_recent_stories(
-                    &mut *conn,
-                    subscriber_id,
-                    &t.entities,
-                    STORY_SCAN_LIMIT,
-                )
-                .await
-                .context("load thread recent stories")?;
-                let since = t
-                    .delta_through
-                    .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
-                // All stories newer than the watermark (up to the scan limit), so the count is accurate
-                // for the deterministic delta; the LLM fan-in is capped separately to FANIN_LIMIT.
-                let new: Vec<&store::ThreadStory> = recent
-                    .iter()
-                    .filter(|s| s.last_event_time > since)
-                    .collect();
-                let new_count = new.len();
-                // The count is exact unless *every* scanned story is new (then more may lie beyond the
-                // scan window, so the deterministic delta renders "N+").
-                let saturated = new_count as i64 == STORY_SCAN_LIMIT;
-                let new_headlines: Vec<String> = new
-                    .iter()
-                    .take(FANIN_LIMIT)
-                    .map(|s| s.headline.clone())
-                    .collect();
+    // Same transaction discipline as `sweep`: each DB step is its own short scoped transaction and the
+    // label/delta model calls sit between them, so a slow sidecar never pins a connection in a
+    // long-held transaction (the slow-`UPDATE` / lock-contention failure mode).
+    let due = with_scope(pool, ctx, {
+        let model = model.clone();
+        let limit = cfg.max_per_sweep;
+        move |conn| {
+            Box::pin(async move {
+                store::threads_needing_summary(conn, subscriber_id, &model, limit)
+                    .await
+                    .context("load threads needing label/delta")
+            })
+        }
+    })
+    .await?;
 
-                // Label: (re)generate when missing, after a model change, *or* when new stories landed
-                // — the thread's subject can drift as its spine grows, so a label that never refreshes
-                // would go stale against the (always-recomputed) deterministic baseline. Keep the prior
-                // readable label on a gate/transport miss; never downgrade.
-                let need_label = t.summary.is_empty()
-                    || t.summary_model.as_deref() != Some(model.as_str())
-                    || new_count > 0;
-                let mut summary = t.summary.clone();
-                if need_label {
-                    let label_headlines: Vec<String> = recent
-                        .iter()
-                        .take(FANIN_LIMIT)
-                        .map(|s| s.headline.clone())
-                        .collect();
-                    if !label_headlines.is_empty() {
-                        if let Some(label) =
-                            client::label_thread(&cfg, &http, &t.entities, &label_headlines).await
-                        {
-                            summary = ThreadSummary { label };
-                        }
-                    }
-                }
-
-                // Delta: the LLM flag over the new stories, falling back to the deterministic count
-                // ("N+" when the scan saturated). When *nothing* is new, keep the prior delta rather
-                // than clearing it — a model-only re-fire (no new stories) must not wipe a valid flag.
-                let delta = if new_headlines.is_empty() {
-                    t.delta.clone()
-                } else {
-                    let label_for_delta = if summary.label.trim().is_empty() {
-                        auto_label(&t.entities)
-                    } else {
-                        summary.label.clone()
-                    };
-                    let count_delta = if saturated {
-                        Some(format!("{new_count}+ updates"))
-                    } else {
-                        auto_delta(new_count)
-                    };
-                    client::delta_thread(&cfg, &http, &label_for_delta, &new_headlines)
+    let mut stats = SummarizeStats::default();
+    for t in due {
+        // The recent stories on this thread's spine (newest-first): the label inputs, and (filtered by
+        // the prior watermark) the delta's "what newly changed".
+        let recent = with_scope(pool, ctx, {
+            let entities = t.entities.clone();
+            move |conn| {
+                Box::pin(async move {
+                    store::thread_recent_stories(conn, subscriber_id, &entities, STORY_SCAN_LIMIT)
                         .await
-                        .or(count_delta)
-                };
+                        .context("load thread recent stories")
+                })
+            }
+        })
+        .await?;
+        let since = t
+            .delta_through
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
+        // All stories newer than the watermark (up to the scan limit), so the count is accurate for the
+        // deterministic delta; the LLM fan-in is capped separately to FANIN_LIMIT.
+        let new: Vec<&store::ThreadStory> = recent
+            .iter()
+            .filter(|s| s.last_event_time > since)
+            .collect();
+        let new_count = new.len();
+        // The count is exact unless *every* scanned story is new (then more may lie beyond the scan
+        // window, so the deterministic delta renders "N+").
+        let saturated = new_count as i64 == STORY_SCAN_LIMIT;
+        let new_headlines: Vec<String> = new
+            .iter()
+            .take(FANIN_LIMIT)
+            .map(|s| s.headline.clone())
+            .collect();
 
-                // The watermark the delta now covers = the thread's last story time (so an unchanged
-                // thread isn't re-flagged); stored as-is (including NULL) to keep the due-gate stable.
+        // Label: (re)generate when missing, after a model change, *or* when new stories landed — the
+        // thread's subject can drift as its spine grows, so a label that never refreshes would go stale
+        // against the (always-recomputed) deterministic baseline. Keep the prior readable label on a
+        // gate/transport miss; never downgrade. The model call holds no transaction.
+        let need_label = t.summary.is_empty()
+            || t.summary_model.as_deref() != Some(model.as_str())
+            || new_count > 0;
+        let mut summary = t.summary.clone();
+        if need_label {
+            let label_headlines: Vec<String> = recent
+                .iter()
+                .take(FANIN_LIMIT)
+                .map(|s| s.headline.clone())
+                .collect();
+            if !label_headlines.is_empty() {
+                if let Some(label) =
+                    client::label_thread(cfg, &http, &t.entities, &label_headlines).await
+                {
+                    summary = ThreadSummary { label };
+                }
+            }
+        }
+
+        // Delta: the LLM flag over the new stories, falling back to the deterministic count ("N+" when
+        // the scan saturated). When *nothing* is new, keep the prior delta rather than clearing it — a
+        // model-only re-fire (no new stories) must not wipe a valid flag.
+        let delta = if new_headlines.is_empty() {
+            t.delta.clone()
+        } else {
+            let label_for_delta = if summary.label.trim().is_empty() {
+                auto_label(&t.entities)
+            } else {
+                summary.label.clone()
+            };
+            let count_delta = if saturated {
+                Some(format!("{new_count}+ updates"))
+            } else {
+                auto_delta(new_count)
+            };
+            client::delta_thread(cfg, &http, &label_for_delta, &new_headlines)
+                .await
+                .or(count_delta)
+        };
+
+        // The watermark the delta now covers = the thread's last story time (so an unchanged thread
+        // isn't re-flagged); stored as-is (including NULL) to keep the due-gate stable.
+        let tid = t.id;
+        let last_story_time = t.last_story_time;
+        let model = model.clone();
+        with_scope(pool, ctx, move |conn| {
+            Box::pin(async move {
                 store::store_thread_summary(
-                    &mut *conn,
-                    t.id,
+                    conn,
+                    tid,
                     &summary,
                     delta.as_deref(),
-                    t.last_story_time,
+                    last_story_time,
                     &model,
                 )
                 .await
-                .context("store thread summary")?;
-                stats.summarized += 1;
-            }
-            Ok(stats)
+                .context("store thread summary")
+            })
         })
-    })
-    .await
+        .await?;
+        stats.summarized += 1;
+    }
+    Ok(stats)
 }
 
 #[cfg(test)]
