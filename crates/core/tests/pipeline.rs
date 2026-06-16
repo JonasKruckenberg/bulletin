@@ -167,7 +167,7 @@ async fn select_stories(
     last_run: Option<chrono::DateTime<Utc>>,
     max_items: usize,
 ) -> Vec<FrozenItem> {
-    let clusters = candidate_clusters(pool, sub_id, last_run, 30)
+    let clusters = candidate_clusters(pool, sub_id, last_run, 30, false)
         .await
         .unwrap();
     let assignment = link(&clusters, &[], Uuid::now_v7);
@@ -210,7 +210,7 @@ async fn build_groups_events_into_clusters() {
         .unwrap();
     assert_eq!(rollup(&shared).unwrap().title, "Shared latest");
 
-    let candidates = candidate_clusters(&pool, Uuid::nil(), None, 30)
+    let candidates = candidate_clusters(&pool, Uuid::nil(), None, 30, false)
         .await
         .unwrap();
     assert_eq!(candidates.len(), 3);
@@ -287,7 +287,7 @@ async fn no_build_gate_unbuilt_events_ride_next_fire() {
     );
     // ...but the unbuilt event is not yet a candidate.
     assert!(
-        candidate_clusters(&pool, Uuid::nil(), None, 30)
+        candidate_clusters(&pool, Uuid::nil(), None, 30, false)
             .await
             .unwrap()
             .is_empty(),
@@ -298,13 +298,66 @@ async fn no_build_gate_unbuilt_events_ride_next_fire() {
 
     // Once clustered it becomes a candidate.
     assert_eq!(
-        candidate_clusters(&pool, Uuid::nil(), None, 30)
+        candidate_clusters(&pool, Uuid::nil(), None, 30, false)
             .await
             .unwrap()
             .len(),
         1,
         "built cluster is now a candidate"
     );
+}
+
+// With the summary gate on (the `llm-summarization` build), a cluster is a candidate only once it
+// carries a gate-passed model summary (band confirmed/probable). A never-summarized cluster and a
+// rejected `uncertain` baseline both slip; with the gate off (the deterministic build) all are
+// candidates regardless. Drives the band directly via SQL (the gated store writer isn't reachable here).
+#[tokio::test]
+async fn summary_gate_withholds_unsummarized_and_baseline_clusters() {
+    let (pool, _pg) = setup().await;
+
+    insert_public(&pool, "good", "good", "Has a model summary", 100).await;
+    insert_public(&pool, "weak", "weak", "Only a baseline", 200).await;
+    insert_public(&pool, "none", "none", "Never summarized", 300).await;
+    build_all(&pool).await;
+
+    // Stamp a gate-passed model summary on one cluster and a rejected baseline on another; the third
+    // keeps the inert '{}' default (never summarized).
+    let set_band = |group: &'static str, band: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query("UPDATE cluster SET summary = $2::jsonb WHERE group_key = $1")
+                .bind(group)
+                .bind(format!(r#"{{"headline":"h","tldr_text":"t","band":"{band}"}}"#))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    };
+    set_band("good", "confirmed").await;
+    set_band("weak", "uncertain").await;
+
+    // Gate off (deterministic build): all three clusters are candidates.
+    assert_eq!(
+        candidate_clusters(&pool, Uuid::nil(), None, 30, false)
+            .await
+            .unwrap()
+            .len(),
+        3,
+        "with the gate off every built cluster is a candidate"
+    );
+
+    // Gate on (llm-summarization build): only the gate-passed model summary survives.
+    let gated = candidate_clusters(&pool, Uuid::nil(), None, 30, true)
+        .await
+        .unwrap();
+    assert_eq!(gated.len(), 1, "baseline + never-summarized clusters slip");
+    let title: String = sqlx::query("SELECT title FROM cluster WHERE id = $1")
+        .bind(gated[0].id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("title");
+    assert_eq!(title, "Has a model summary");
 }
 
 // The digest freezes its selection, delivers once, advances the subscriber watermark, and is
@@ -423,14 +476,14 @@ async fn private_clusters_are_isolated_to_their_owner() {
 
     // Alice and Bob each see the public cluster + their own private one (2), never the other's.
     assert_eq!(
-        candidate_clusters(&pool, alice, None, 30)
+        candidate_clusters(&pool, alice, None, 30, false)
             .await
             .unwrap()
             .len(),
         2
     );
     assert_eq!(
-        candidate_clusters(&pool, bob, None, 30)
+        candidate_clusters(&pool, bob, None, 30, false)
             .await
             .unwrap()
             .len(),
@@ -438,7 +491,7 @@ async fn private_clusters_are_isolated_to_their_owner() {
     );
     // Carol sees only the shared public cluster.
     assert_eq!(
-        candidate_clusters(&pool, carol, None, 30)
+        candidate_clusters(&pool, carol, None, 30, false)
             .await
             .unwrap()
             .len(),
@@ -498,7 +551,7 @@ async fn cross_boundary_seed_pulls_aged_public_for_a_fresh_private_link() {
     assert_eq!(build_private(&pool, alice).await.unwrap(), 1);
 
     // The aged-out public advisory is pulled back in via the strong-key seed, and fuses.
-    let clusters = candidate_clusters(&pool, alice, None, 30).await.unwrap();
+    let clusters = candidate_clusters(&pool, alice, None, 30, false).await.unwrap();
     assert_eq!(
         clusters.len(),
         2,
@@ -552,7 +605,7 @@ async fn cross_source_story_fuses_private_and_public_via_cve() {
     assert_eq!(build_private(&pool, alice).await.unwrap(), 1);
 
     // Alice's candidate set is her private PR + the public advisory; linking fuses them on the CVE.
-    let clusters = candidate_clusters(&pool, alice, None, 30).await.unwrap();
+    let clusters = candidate_clusters(&pool, alice, None, 30, false).await.unwrap();
     assert_eq!(clusters.len(), 2);
     let assignment = link(&clusters, &[], Uuid::now_v7);
     assert_eq!(
@@ -1136,7 +1189,7 @@ async fn scoring_classifies_story_and_note() {
     .await;
     build_all(&pool).await;
 
-    let clusters = candidate_clusters(&pool, sub, None, 30).await.unwrap();
+    let clusters = candidate_clusters(&pool, sub, None, 30, false).await.unwrap();
     let assignment = link(&clusters, &[], Uuid::now_v7);
     // Mirror the digest flow's candidate construction (its rollups drive richness).
     let cands: Vec<Candidate> = assignment
@@ -1171,7 +1224,7 @@ async fn resurface_without_new_events_fades_to_note() {
     build_all(&pool).await;
 
     // First window: select + freeze the story as a Story.
-    let clusters = candidate_clusters(&pool, sub, None, 30).await.unwrap();
+    let clusters = candidate_clusters(&pool, sub, None, 30, false).await.unwrap();
     let assignment = link(&clusters, &[], Uuid::now_v7);
     persist_assignment(&pool, sub, &assignment).await.unwrap();
     let story = assignment.stories[0].clone();
@@ -1212,7 +1265,7 @@ async fn provenance_walks_story_to_its_events() {
     insert_public(&pool, "e2", "g", "Second", 200).await; // same group → one cluster, two events
     build_all(&pool).await;
 
-    let clusters = candidate_clusters(&pool, sub, None, 30).await.unwrap();
+    let clusters = candidate_clusters(&pool, sub, None, 30, false).await.unwrap();
     let assignment = link(&clusters, &[], Uuid::now_v7);
     persist_assignment(&pool, sub, &assignment).await.unwrap();
     let story = &assignment.stories[0];
