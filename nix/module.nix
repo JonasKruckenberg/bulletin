@@ -478,8 +478,9 @@ in
     # CLI wrapper (DATABASE_URL preset) on PATH for seeding/ops + the digest-explain loop.
     environment.systemPackages = [ cliWrapper ];
 
-    # The optional local summarization sidecar (`llama-server` over llama.cpp, OpenAI-compatible). No
-    # egress — it binds loopback and the worker calls it over AF_INET (design §12, local-ml-options §4).
+    # The optional local summarization sidecar (`llama-server` over llama.cpp, OpenAI-compatible). It
+    # binds loopback and the worker calls it over AF_INET (design §12, local-ml-options §4); egress is
+    # then hard-blocked below via IPAddressDeny so "no data egress" is enforced, not just intended.
     services.llama-cpp = lib.mkIf cfg.llm.serveLocally {
       enable = true;
       package = llmPackage;
@@ -506,6 +507,25 @@ in
         "--ctx-size"
         (toString cfg.llm.contextSize)
       ];
+    };
+
+    # Pin the sidecar to **zero network egress** (the design §12 / local-ml-options "no data egress"
+    # invariant — Bulletin summarizes private Slack/GitHub/email content locally). The upstream
+    # `services.llama-cpp` module already sandboxes hard (ProtectSystem=strict, all capabilities
+    # dropped, RestrictAddressFamilies limited to AF_INET/AF_INET6/AF_UNIX), but none of that stops
+    # `llama-server` from opening an *outbound* IP connection — and it never needs one: the GGUF is
+    # fetched out-of-band by the `bulletin-model-fetch` oneshot (it does not auto-download from
+    # HuggingFace), and the only client is the bulletin worker reaching it over loopback. So deny all
+    # IP traffic except loopback at the cgroup-BPF level: non-loopback egress *and* ingress are both
+    # blocked, while the 127.0.0.1 worker ↔ server link keeps working.
+    #
+    # We can't use the stricter `PrivateNetwork = true` ("no network namespace at all"): that hands
+    # the unit its *own* private loopback inside a separate netns, which the host-side worker calling
+    # `http://127.0.0.1:<port>` could not reach. For a loopback-served sidecar the IP allow/deny pair
+    # is the correct mechanism. AF_INET stays permitted because binding 127.0.0.1 requires it.
+    systemd.services.llama-cpp.serviceConfig = lib.mkIf cfg.llm.serveLocally {
+      IPAddressDeny = "any";
+      IPAddressAllow = "localhost";
     };
 
     # When the model is fetched declaratively, gate the sidecar on a verified file: chain
@@ -666,8 +686,12 @@ in
           RestartSec = 5;
           StateDirectory = "bulletin";
           StateDirectoryMode = "0700";
-          # Mark the unit failed if /health doesn't come up → deploy-rs (or any rollback) reverts.
-          ExecStartPost = "${pkgs.curl}/bin/curl --fail --silent --max-time 5 --retry 15 --retry-delay 1 --retry-connrefused http://${cfg.http.addr}/health";
+          # Mark the unit failed if /health doesn't come up → deploy-rs (or any rollback) reverts. With
+          # `llm.enable` the binary now gates startup on the summarization sidecar being reachable (it
+          # won't bind /health until then, and the sidecar may still be loading its GGUF), so widen the
+          # retry window to cover that — an unreachable sidecar still fails the probe and rolls back,
+          # but a slow-loading one isn't mistaken for a dead deploy. Stays tight on the baseline build.
+          ExecStartPost = "${pkgs.curl}/bin/curl --fail --silent --max-time 5 --retry ${toString (if cfg.llm.enable then 90 else 15)} --retry-delay 1 --retry-connrefused http://${cfg.http.addr}/health";
         }
         // lib.optionalAttrs (envSecretFiles != [ ]) {
           # Both secret env files (SMTP creds + the sealed GitHub App credentials) are read as root

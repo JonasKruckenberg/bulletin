@@ -7,6 +7,8 @@
 //! and offline-buildable, and it gives us exact control of the `response_format`/grammar payload.
 //! (Handoff: swap to `async-openai` if richer client features — streaming, tool-calls — are wanted.)
 
+use std::time::{Duration, Instant};
+
 use anyhow::Context;
 use serde::Deserialize;
 
@@ -204,6 +206,49 @@ pub async fn delta_thread(
             tracing::debug!(error = %e, "thread delta call failed; keeping deterministic count delta");
             None
         }
+    }
+}
+
+/// Startup reachability gate for the local summarization sidecar (the fail-loud counterpart to the
+/// per-call best-effort degradation). A `llm-summarization` build exists *to* summarize against the
+/// sidecar; if it can't be reached when the worker boots, that is a deployment/config error — a wrong
+/// `BULLETIN_LLM_BASE_URL`, a sidecar that never came up, or a model that failed to load — and we want
+/// it surfaced **loudly** (a failed unit → deploy rollback) rather than silently shipping deterministic
+/// baselines forever. This is intentionally distinct from the *running* contract: once past this gate,
+/// a transient sidecar blip mid-sweep still degrades best-effort and retries (a digest is never blocked).
+///
+/// Probes the OpenAI-compatible `{base_url}/models` endpoint, retrying with capped exponential backoff
+/// until `deadline` elapses, so a sidecar still mapping its GGUF at boot (llama-cpp is ordered before us
+/// but only answers once the model is loaded) is given time rather than mistaken for an absent one.
+/// Returns `Err` only after the whole window passes with no successful response.
+pub async fn ensure_reachable(cfg: &SummarizationConfig, deadline: Duration) -> anyhow::Result<()> {
+    // Short per-attempt timeout so one hung connect can't swallow the whole window in a single try.
+    let attempt_timeout = Duration::from_secs(5).min(deadline);
+    let http = reqwest::Client::builder()
+        .timeout(attempt_timeout)
+        .build()
+        .context("build sidecar readiness http client")?;
+    let url = format!("{}/models", cfg.base_url);
+
+    let start = Instant::now();
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        let last_err = match http.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => return Ok(()),
+            Ok(resp) => format!("sidecar returned HTTP {}", resp.status()),
+            Err(e) => format!("{e}"),
+        };
+        let remaining = deadline.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            anyhow::bail!(
+                "summarization sidecar at {} not reachable after {}s: {last_err}",
+                cfg.base_url,
+                deadline.as_secs(),
+            );
+        }
+        // Never sleep past the deadline, then grow the backoff (capped) for the next try.
+        tokio::time::sleep(backoff.min(remaining)).await;
+        backoff = (backoff * 2).min(Duration::from_secs(5));
     }
 }
 
@@ -472,6 +517,22 @@ struct ChatMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn ensure_reachable_errors_when_sidecar_absent() {
+        let cfg = SummarizationConfig {
+            // Port 1 has nothing listening → connection refused → the gate must fail (and fast,
+            // within the deadline), never hang. This is the no-sidecar deploy/config error path.
+            base_url: "http://127.0.0.1:1/v1".to_string(),
+            ..SummarizationConfig::default()
+        };
+        let err = ensure_reachable(&cfg, Duration::from_millis(200))
+            .await
+            .expect_err("an absent sidecar must be a hard error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not reachable"), "unexpected error: {msg}");
+    }
 
     #[test]
     fn strip_reasoning_drops_leading_think_block() {

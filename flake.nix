@@ -136,6 +136,16 @@
       nixosModules.bulletin = import ./nix/module.nix self;
       nixosModules.default = self.nixosModules.bulletin;
 
+      # NixOS VM tests. Guarded to Linux — the test driver boots QEMU VMs, which
+      # the Darwin builders can't do.
+      checks = forAllSystems (
+        pkgs:
+        lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          # Regression guard for the llama.cpp sidecar's no-egress lockdown.
+          llama-cpp-egress = import ./nix/test/llama-egress.nix { inherit self pkgs lib; };
+        }
+      );
+
       devShells = forAllSystems (
         pkgs:
         let

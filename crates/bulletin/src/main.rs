@@ -139,6 +139,8 @@ async fn main() -> Result<()> {
             metric::init(cli.metrics_addr)?;
             let pool = connect_pool(cli.database_url()?).await?;
             let connectors = cli.secrets.connector_ctx()?;
+            // Fail loud if this is an LLM build and the sidecar isn't reachable (no-op otherwise).
+            ensure_sidecar_ready().await?;
             tracing::info!("starting worker");
             worker::start(pool, cli.email.clone(), connectors).await?;
         }
@@ -158,6 +160,11 @@ async fn main() -> Result<()> {
             let pool = connect_pool(cli.database_url()?).await?;
             let webhook_secret = cli.secrets.webhook_secret()?;
             let connectors = cli.secrets.connector_ctx()?;
+            // Verify the summarization sidecar *before* binding `/health` (no-op without the
+            // `llm-summarization` feature). A feature build that can't reach its sidecar then never
+            // reports healthy, so the deploy's `ExecStartPost` health probe fails and the rollout rolls
+            // back — instead of silently serving deterministic baselines.
+            ensure_sidecar_ready().await?;
             tracing::info!(addr = %cli.http_addr, "starting server + worker + api");
             tokio::try_join!(
                 serve(cli.http_addr, pool.clone(), webhook_secret),
@@ -186,6 +193,45 @@ async fn connect_pool(database_url: &str) -> Result<PgPool> {
     bulletin_core::connect(database_url)
         .await
         .context("failed to connect to database")
+}
+
+/// Startup gate: in an `llm-summarization` build, refuse to run the worker if the local summarization
+/// sidecar can't be reached. The feature *is* the summarization edge, so an unreachable sidecar at boot
+/// is a deployment/config error (wrong `BULLETIN_LLM_BASE_URL`, sidecar down, model didn't load) we want
+/// to fail loudly on — not paper over by silently shipping deterministic baselines. Gives the sidecar a
+/// bounded window to come up (it may still be loading its GGUF), tunable via
+/// `BULLETIN_LLM_STARTUP_TIMEOUT_SECS` (default 60). Once past this gate the *running* path stays
+/// best-effort: a transient blip mid-sweep degrades and retries, never blocking a digest.
+#[cfg(feature = "llm-summarization")]
+async fn ensure_sidecar_ready() -> Result<()> {
+    use std::time::Duration;
+    let cfg = bulletin_core::summarize::SummarizationConfig::from_env();
+    let timeout_secs = std::env::var("BULLETIN_LLM_STARTUP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(60);
+    tracing::info!(
+        base_url = %cfg.base_url,
+        timeout_s = timeout_secs,
+        "verifying summarization sidecar is reachable"
+    );
+    bulletin_core::summarize::client::ensure_reachable(&cfg, Duration::from_secs(timeout_secs))
+        .await
+        .context(
+            "summarization sidecar unreachable at startup (llm-summarization build). Bring up the \
+             llama-server sidecar and check BULLETIN_LLM_BASE_URL, or build without the \
+             llm-summarization feature to run the deterministic baseline",
+        )?;
+    tracing::info!("summarization sidecar reachable");
+    Ok(())
+}
+
+/// Without the `llm-summarization` feature there is no sidecar to gate on — the deterministic build runs
+/// unconditionally.
+#[cfg(not(feature = "llm-summarization"))]
+async fn ensure_sidecar_ready() -> Result<()> {
+    Ok(())
 }
 
 /// The HTTP server (`serve` / `all`): liveness `/health` + the webhook catcher (`/webhooks/github`),
