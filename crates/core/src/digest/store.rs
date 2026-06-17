@@ -521,6 +521,23 @@ pub async fn record_decisions(
     Ok(())
 }
 
+/// Persist the digest's rendered big-picture **lead** (Phase D, `llm-summarization.md` §2.4) onto the
+/// `digest` row, for explainability parity with [`record_decisions`] — so the lead that shipped is
+/// reproducible in the debug trace. Whatever was rendered is stored: the authored editor's note, or the
+/// deterministic fallback it degraded to. Runs on the caller's subscriber-scoped connection.
+pub async fn store_lead(
+    conn: &mut PgConnection,
+    digest_id: Uuid,
+    lead: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE digest SET lead = $2 WHERE id = $1")
+        .bind(digest_id)
+        .bind(lead)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
 /// Load a digest's decision log (the structured `digest.decisions` array). Empty for a pre-thread
 /// digest (the `'[]'` default). Used by the render debug trace and any later explain consumer.
 pub async fn load_decisions(

@@ -110,7 +110,8 @@ is the only switch — without it `summarize_public` is an empty no-op and no su
    context) have a ready entry — `summarize::sweep_private(pool, subscriber_id, cfg)` — but are **not
    yet called**. Deliberately *not* hung off `generate()` (the punctual path); they want a dedicated
    best-effort step (see §4).
-4. **Cluster tier schema only.** Story/thread/digest columns are deferred to their phases.
+4. **Cluster tier schema only (at Phase A).** Story/thread/digest columns were deferred to their phases
+   — since landed: thread (migration `028`, Phase B), story (`029`, Phase C), digest (`030`, Phase D).
 5. **~~The render side is untouched.~~** **Done (§4.1, 2026-06-15):** the digest now reads
    `cluster.summary` into the email. `ClusterCard`/`cluster_cards` `SELECT summary` and deserialize it;
    `RenderItem` carries `headline` (the representative cluster's `summary.headline`, degrading to the raw
@@ -230,7 +231,23 @@ is the only switch — without it `summarize_public` is an empty no-op and no su
    content alone — `thread_id` is *not* folded in (decoupling Phase C from fire-time thread-assignment);
    a story moving threads doesn't itself force a re-synthesis. Singleton/all-unsummarized stories are
    skipped (render already shows the representative cluster identically).
-6. **Eval hook (`digest-explain`).** Run the faithfulness gate read-only over historical clusters to
+6. ~~**Phase D — authored big-picture lead**~~ **Done (2026-06-17).** Migration `030` adds the digest
+   tier (`digest.lead text`, nullable). `digest::generate` now composes the lead through `digest_lead`
+   → `authored_lead`: the deterministic Phase-A lead (`render::compose_lead`, now `pub(crate)`) is the
+   fallback beneath a deadline-bounded best-effort editor's note (`summarize::client::authored_lead` over
+   the selected headlines + the threads they advance, `LEAD_SYSTEM_PROMPT` + `lead_schema`, gated by
+   `clean_lead` — voice/length/URL + numeric grounding against the headlines). It is the **one model call
+   on the punctual path**, so it is wrapped in `tokio::time::timeout(cfg.lead_deadline, …)`
+   (`SummarizationConfig::lead_deadline`, env `BULLETIN_LLM_LEAD_DEADLINE_SECS`, default 20s): on a
+   transport miss, gate rejection, *or* the deadline it ships the deterministic lead and sends on time.
+   The chosen lead is persisted onto `digest.lead` best-effort (`store::store_lead`) for the debug trace,
+   parity with `digest.decisions`. **Feature-off / manual `dispatch_now` preview is unchanged** — render
+   composes the deterministic lead at fire time (`render` now takes `lead: Option<&str>`; `None` ⇒
+   deterministic), the column stays NULL, no model call. **Deviation from §2.4:** the lead is composed
+   from the selected items' **headlines** (always present, gate-passed) + thread **labels**, not the full
+   tldr/delta payloads — short, grounded inputs that keep the on-path call fast and the §3.4 gate simple
+   (no entity-ref check — the lead is plain prose, it *names* threads rather than badging entities).
+7. **Eval hook (`digest-explain`).** Run the faithfulness gate read-only over historical clusters to
    measure the Vectara-style entity/number accuracy rate before any summary touches a delivered digest
    (§3.4, §7).
 
