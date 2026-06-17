@@ -2,6 +2,8 @@
 //! to a `Mailer` the binary supplies (file or SMTP) — so the transport/config stays runtime-side
 //! while the deliver *flow* lives here in the digest slice.
 
+use std::borrow::Cow;
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
@@ -212,7 +214,7 @@ fn render_plain(
     // through the feed content it summarized. The HTML view escapes them; the plaintext view has no
     // markup to escape but still strips control/bidi characters so neither can mangle the line.
     let opening = if lead.is_empty() {
-        clean(greeting)
+        clean(greeting).into_owned()
     } else {
         format!("{} {}", clean(greeting), clean(lead))
     };
@@ -841,37 +843,32 @@ fn is_unsafe_char(c: char) -> bool {
     )
 }
 
+/// Drop the [`is_unsafe_char`] class (control / bidi / zero-width) from untrusted feed/model text — the
+/// shared Trojan-Source sanitization both the HTML escapers and the plaintext sinks run, so a hostile or
+/// malformed feed can't reorder, hide, or forge a line. No HTML escaper covers this class (it's a Unicode
+/// concern, not a markup one), so it's ours. Returns `Borrowed` when the text is already clean (the
+/// common case), allocating only when something must actually be removed.
+fn clean(s: &str) -> Cow<'_, str> {
+    if s.chars().any(is_unsafe_char) {
+        Cow::Owned(s.chars().filter(|c| !is_unsafe_char(*c)).collect())
+    } else {
+        Cow::Borrowed(s)
+    }
+}
+
 /// HTML entity-encode untrusted feed/model text for an **element-text** context (between tags) — the
-/// vast majority of our interpolations: headlines, summaries, labels, badge surfaces, chrome. First
-/// strips the [`is_unsafe_char`] class (control / bidi / zero-width) so a hostile or malformed feed
-/// can't reorder, hide, or break the rendered line — no HTML escaper covers Trojan-Source characters,
-/// since they're a Unicode concern, not a markup one — then delegates the actual entity-encoding to
-/// `html_escape::encode_text` (escapes `&`, `<`, `>`) rather than hand-rolling it. Attribute values use
-/// [`escape_attr`] instead.
+/// vast majority of our interpolations: headlines, summaries, labels, badge surfaces, chrome. [`clean`]s
+/// the Trojan-Source class first, then delegates the entity-encoding to `html_escape::encode_text`
+/// (escapes `&`, `<`, `>`) rather than hand-rolling it. Attribute values use [`escape_attr`] instead.
 fn escape(s: &str) -> String {
-    html_escape::encode_text(&strip_unsafe(s)).into_owned()
+    html_escape::encode_text(&clean(s)).into_owned()
 }
 
 /// HTML entity-encode untrusted text for a **double-quoted attribute** value — the one such sink is the
 /// link `href`. `html_escape::encode_double_quoted_attribute` escapes `&` and `"` so the value can never
-/// close the attribute, after the same control/bidi strip. (`encode_text` is *not* safe here — it
-/// leaves `"` intact.)
+/// close the attribute, after the same [`clean`]. (`encode_text` is *not* safe here — it leaves `"` intact.)
 fn escape_attr(s: &str) -> String {
-    html_escape::encode_double_quoted_attribute(&strip_unsafe(s)).into_owned()
-}
-
-/// Drop the [`is_unsafe_char`] class from a string — the shared sanitization pass both [`escape`] and
-/// [`escape_attr`] run before entity-encoding, and the whole of what the plaintext [`clean`] does.
-fn strip_unsafe(s: &str) -> String {
-    s.chars().filter(|c| !is_unsafe_char(*c)).collect()
-}
-
-/// Strip the [`is_unsafe_char`] class from untrusted text for the **plaintext** view, where there is no
-/// markup to escape but a bidi-override or control character would still reorder or mangle the line in a
-/// terminal or plain-text mail client (the same Trojan-Source concern, minus the injection). The HTML
-/// view gets this stripping for free inside [`escape`]; plaintext fields call this directly.
-fn clean(s: &str) -> String {
-    strip_unsafe(s)
+    html_escape::encode_double_quoted_attribute(&clean(s)).into_owned()
 }
 
 /// A feed-supplied URL we are willing to emit as a live `href` / link target, or `None` to render the
@@ -879,14 +876,14 @@ fn clean(s: &str) -> String {
 /// (or renders attacker markup) in the mail clients that honour it, and HTML-escaping does not stop it —
 /// escaping only neutralizes the quotes that would break the attribute, not the scheme inside it. So we
 /// allowlist **only** the schemes a digest link can legitimately use — `http`, `https`, `mailto`. We
-/// WHATWG-parse the link with the `url` crate (after the control-character strip that could otherwise
-/// hide a scheme) and check the normalized `scheme()`, rather than prefix-matching the raw string: the
-/// parser rejects malformed and relative/scheme-relative URLs for us and normalizes the scheme, so the
-/// allowlist can't be slipped by casing or whitespace tricks. Anything that doesn't parse, or parses to
-/// a scheme outside the allowlist, drops to `None` and the caller shows plain text instead of a live
-/// link. The returned string still carries no control characters; callers HTML-escape it as usual.
+/// WHATWG-parse the link with the `url` crate and check the normalized `scheme()`, rather than
+/// prefix-matching the raw string: the parser strips the control characters that could hide a scheme,
+/// rejects malformed and relative/scheme-relative URLs, and normalizes the scheme, so the allowlist can't
+/// be slipped by casing or whitespace tricks. Anything that doesn't parse, or parses to a scheme outside
+/// the allowlist, drops to `None` and the caller shows plain text. The serializer percent-encodes any
+/// control characters, so the result is clean; callers still HTML-escape it via [`escape_attr`].
 fn safe_href(url: &str) -> Option<String> {
-    let parsed = url::Url::parse(strip_unsafe(url).trim()).ok()?;
+    let parsed = url::Url::parse(url.trim()).ok()?;
     matches!(parsed.scheme(), "http" | "https" | "mailto").then(|| parsed.to_string())
 }
 

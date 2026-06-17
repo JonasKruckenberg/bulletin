@@ -46,15 +46,12 @@ pub async fn candidate_clusters(
     horizon_days: i32,
     require_summary: bool,
 ) -> Result<Vec<LinkCluster>, sqlx::Error> {
-    // A static fragment chosen by a bool — no user input — so interpolating it into the SQL is safe.
-    // `band` is read from the `summary` jsonb; a never-summarized cluster ('{}') has no band and is
-    // excluded, exactly like a rejected `uncertain` baseline.
-    let summary_gate = if require_summary {
-        "AND summary ->> 'band' IN ('confirmed', 'probable')"
-    } else {
-        ""
-    };
-    let sql = format!(
+    // The summary gate is a bound bool ($4), not interpolated SQL: when `require_summary` is false the
+    // `$4` arm short-circuits the predicate true (allow all); when true, the cluster must carry a
+    // gate-passed model summary. `band` is read from the `summary` jsonb — a never-summarized cluster
+    // ('{}') has no band and a rejected baseline bands `uncertain`, so both are excluded. Applied to the
+    // two public-candidate arms (in_floor, cross_boundary), never to the private_strong seed.
+    sqlx::query(
         "WITH floor AS (SELECT LEAST($2, now() - make_interval(days => $3)) AS lo),
               in_floor AS (
                   SELECT id, scope_kind, source, entities, first_event_time, last_event_time,
@@ -62,7 +59,7 @@ pub async fn candidate_clusters(
                   FROM cluster
                   WHERE (scope_kind = 'public' OR scope_subscriber_id = $1)
                     AND updated_at >= (SELECT lo FROM floor)
-                    {summary_gate}
+                    AND (NOT $4 OR summary ->> 'band' IN ('confirmed', 'probable'))
               ),
               -- The strong keys (cve:/url:, mirrors entity::link_strength) the subscriber's *active*
               -- private clusters carry — floored like in_floor, so the seed scales with recent
@@ -85,17 +82,17 @@ pub async fn candidate_clusters(
                   FROM cluster
                   WHERE scope_kind = 'public'
                     AND entities && (SELECT keys FROM private_strong)
-                    {summary_gate}
+                    AND (NOT $4 OR summary ->> 'band' IN ('confirmed', 'probable'))
               )
          SELECT * FROM in_floor
          UNION
          SELECT * FROM cross_boundary
-         ORDER BY id"
-    );
-    sqlx::query(&sql)
+         ORDER BY id",
+    )
     .bind(subscriber_id)
     .bind(last_run)
     .bind(horizon_days)
+    .bind(require_summary)
     .try_map(|row: PgRow| {
         let scope_kind: String = row.get("scope_kind");
         Ok(LinkCluster {
