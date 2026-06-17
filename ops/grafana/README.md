@@ -19,6 +19,10 @@ datasource (the dashboard exposes a `datasource` variable, so it isn't pinned to
   poll failures, time-since-last-ingest.
 - **Digests / delivery** — outcomes, items per digest, pending, time-since-last-delivery,
   cadence mix.
+- **LLM summarization** — per-call latency (p50/p95/p99 by phase), call outcomes, token
+  throughput, faithfulness-gate rejections, and content-hash cache hit ratio. Empty unless the
+  binary is built with `--features llm-summarization`; the model edge (and these metrics) compile
+  out by default.
 
 ## Notes on the metrics
 
@@ -30,6 +34,19 @@ datasource (the dashboard exposes a `datasource` variable, so it isn't pinned to
   ride the next tick. Page on delivery/queue/freshness, not on build lag.
 - **Gauges refresh once per minute** (the cron tick calls `status::gather`). Range/rate windows
   should be ≥1m. If `bulletin_status_gather_failures_total` is climbing, the gauges are stale.
+- **The `bulletin_llm_*` series only exist in a `llm-summarization` build.** They are recorded from
+  `bulletin-core` at the single `chat_json` choke point all five `phase`s route through
+  (`summarize` | `comprehend` | `synthesize` | `label` | `delta`). `bulletin_llm_call_duration_seconds`
+  is keyed on `phase` + `outcome` — every call is timed, including failures, so **filter `outcome="ok"`
+  for clean prompt latency** (an instant `connect` failure and a 120s `timeout` are in there too). The
+  `outcome` reuses the structured-log buckets (`ok` | `timeout` | `connect` | `status` | `decode` |
+  `transport` | `response`), and the histogram's `_count{phase,outcome}` doubles as the per-outcome
+  call total (there is no separate calls counter). Token counts come from the sidecar's `usage` block
+  and are absent if it omits one.
+- **The LLM path is best-effort and off the punctual path.** A failed call or a gate rejection
+  degrades that cluster/story to its deterministic baseline — never a late or wrong digest. Treat the
+  LLM panels as quality/efficiency signals, not delivery SLOs: page on the delivery/queue rows, watch
+  these.
 
 ## Suggested alerts
 
@@ -42,6 +59,8 @@ datasource (the dashboard exposes a `datasource` variable, so it isn't pinned to
 | Ingestion stalled | `time() - max(bulletin_last_ingest_timestamp_seconds) > 86400` | 0m |
 | Connections errored | `bulletin_connections_errored > 0` | 30m |
 | Metrics going stale | `increase(bulletin_status_gather_failures_total[15m]) > 0` | 0m |
+| LLM sidecar unreachable | `sum(rate(bulletin_llm_call_duration_seconds_count{outcome=~"connect|timeout"}[10m])) / clamp_min(sum(rate(bulletin_llm_call_duration_seconds_count[10m])), 1) > 0.5` | 15m |
 
 Tune the "no deliveries" / "ingestion stalled" thresholds to your slowest cadence (weekly digests,
-slow feeds).
+slow feeds). The LLM-sidecar alert only fires where `llm-summarization` is deployed — skip it
+otherwise, since the series won't exist.

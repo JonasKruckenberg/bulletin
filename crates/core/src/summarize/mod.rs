@@ -18,6 +18,9 @@
 
 #[cfg(feature = "llm-summarization")]
 pub mod client;
+/// The `bulletin_llm_*` recorders for the summarization path; gated with the rest of the model edge.
+#[cfg(feature = "llm-summarization")]
+mod metric;
 #[cfg(feature = "llm-summarization")]
 pub(crate) mod store;
 
@@ -1404,6 +1407,7 @@ async fn sweep(
         // The exact re-check behind the cheap SQL gate: content unchanged (and same model) ⇒ the
         // cached summary still holds, so just bump the watermark and skip the model call.
         if c.summary_hash.as_deref() == Some(hash.as_slice()) {
+            metric::cache("cluster", true);
             let cid = c.id;
             let _ = with_scope(pool, ctx, move |conn| {
                 Box::pin(async move {
@@ -1416,6 +1420,7 @@ async fn sweep(
             stats.skipped += 1;
             continue;
         }
+        metric::cache("cluster", false);
         // `None` ⇒ the model was unavailable: leave the cluster unsummarized (don't advance
         // `summarized_at`) so a later sweep retries once the sidecar recovers, rather than freezing it
         // at a baseline until its content next changes. A gate rejection still returns `Some(baseline)`
@@ -1531,6 +1536,7 @@ pub async fn sweep_stories(
         if s.summary_sig.as_deref() == Some(sig.as_slice())
             && s.summary_model.as_deref() == Some(model.as_str())
         {
+            metric::cache("story", true);
             let sid = s.id;
             let model = model.clone();
             let _ = with_scope(pool, ctx, move |conn| {
@@ -1544,6 +1550,7 @@ pub async fn sweep_stories(
             stats.skipped += 1;
             continue;
         }
+        metric::cache("story", false);
 
         let summaries: Vec<ClusterSummary> = members.into_iter().map(|m| m.summary).collect();
         match client::synthesize_story(cfg, &http, &summaries, None).await {

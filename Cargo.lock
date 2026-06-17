@@ -548,6 +548,7 @@ dependencies = [
  "html-escape",
  "jsonwebtoken",
  "lettre",
+ "metrics",
  "proptest",
  "reqwest",
  "rss",

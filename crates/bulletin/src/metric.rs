@@ -22,6 +22,15 @@ const JOB_DURATION_BUCKETS: &[f64] = &[
 /// low-double-digits, so the tail past ~50 is lumped into `+Inf`.
 const DIGEST_ITEMS_BUCKETS: &[f64] = &[0.0, 1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, 34.0, 55.0];
 
+/// Per-call latency buckets for `bulletin_llm_call_duration_seconds`, in seconds. A local sidecar call
+/// runs from tens of milliseconds (cache-warm classify) up to the request timeout (default 120s) on a
+/// cold CPU generation, so the bucketing is denser in the 0.1–10s working range and reaches the
+/// timeout ceiling. Recorded from `bulletin-core` only in an `llm-summarization` build; harmless to
+/// register either way (the matcher simply never fires when nothing emits the metric).
+const LLM_CALL_DURATION_BUCKETS: &[f64] = &[
+    0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0, 45.0, 60.0, 90.0, 120.0,
+];
+
 /// Installs the global Prometheus recorder and starts its own HTTP exporter on `addr` (not an app
 /// route — the exporter's listener also drives histogram upkeep). Must run inside the tokio
 /// runtime, since it spawns the listener.
@@ -38,6 +47,11 @@ pub fn init(addr: SocketAddr) -> Result<()> {
             DIGEST_ITEMS_BUCKETS,
         )
         .context("set digest-items buckets")?
+        .set_buckets_for_metric(
+            Matcher::Full("bulletin_llm_call_duration_seconds".to_string()),
+            LLM_CALL_DURATION_BUCKETS,
+        )
+        .context("set llm-call-duration buckets")?
         .install()
         .context("install prometheus exporter")?;
     tracing::info!(%addr, "metrics exporter listening");

@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use serde::Deserialize;
 
+use super::metric;
 use crate::common::event::Event;
 use crate::summarize::{
     apply_comprehension, baseline, clean_delta, clean_label, comprehend_user_prompt,
@@ -78,6 +79,7 @@ pub async fn summarize_cluster(
     if cfg.faithfulness_gate {
         if let Err(v) = faithful(&summary, &facts, &source) {
             tracing::debug!(violation = ?v, "faithfulness gate rejected summary; using baseline");
+            metric::gate_rejection("summarize", &v);
             return Some(baseline(
                 title,
                 events.len() as i32,
@@ -120,6 +122,7 @@ pub async fn synthesize_story(
     let candidate = match chat_json::<ModelOutput>(
         cfg,
         http,
+        "synthesize",
         STORY_SYSTEM_PROMPT,
         story_user_prompt(&facts, &corpus, thread_label),
         cfg.headline_max_tokens + cfg.tldr_max_tokens + 64,
@@ -146,6 +149,7 @@ pub async fn synthesize_story(
     if cfg.faithfulness_gate {
         if let Err(v) = faithful(&summary, &facts, &corpus) {
             tracing::debug!(violation = ?v, "story synthesis gate rejected; falling back to representative cluster summary");
+            metric::gate_rejection("synthesize", &v);
             return Some(representative.clone());
         }
     }
@@ -166,6 +170,7 @@ pub async fn label_thread(
     let out = chat_json::<LabelOutput>(
         cfg,
         http,
+        "label",
         LABEL_SYSTEM_PROMPT,
         label_user_prompt(entities, recent_headlines),
         cfg.headline_max_tokens + 16,
@@ -194,6 +199,7 @@ pub async fn delta_thread(
     let out = chat_json::<DeltaOutput>(
         cfg,
         http,
+        "delta",
         DELTA_SYSTEM_PROMPT,
         delta_user_prompt(label, new_headlines),
         cfg.headline_max_tokens + 16,
@@ -307,6 +313,7 @@ async fn call_comprehension(
     chat_json(
         cfg,
         http,
+        "comprehend",
         COMPREHEND_SYSTEM_PROMPT,
         comprehend_user_prompt(facts, source),
         cfg.comprehension_max_tokens,
@@ -357,6 +364,7 @@ async fn call_model(
     chat_json(
         cfg,
         http,
+        "summarize",
         SYSTEM_PROMPT,
         user_prompt(facts, source),
         cfg.headline_max_tokens + cfg.tldr_max_tokens + 64,
@@ -374,6 +382,30 @@ async fn call_model(
 async fn chat_json<T: serde::de::DeserializeOwned>(
     cfg: &SummarizationConfig,
     http: &reqwest::Client,
+    phase: &'static str,
+    system: &str,
+    user: String,
+    max_tokens: u32,
+    schema: serde_json::Value,
+) -> anyhow::Result<T> {
+    // Time and tally every call at the single choke point all five phases route through. The latency
+    // histogram is keyed on `phase` + `outcome`, so the percentiles can be read clean (filter
+    // `outcome="ok"`) without losing the failure latencies — a fast `connect` failure and a 120s
+    // `timeout` are recorded too, under their own outcome.
+    let started = std::time::Instant::now();
+    let result = chat_json_inner(cfg, http, phase, system, user, max_tokens, schema).await;
+    let outcome = match &result {
+        Ok(_) => "ok",
+        Err(e) => failure_kind(e),
+    };
+    metric::llm_call(phase, outcome, started.elapsed());
+    result
+}
+
+async fn chat_json_inner<T: serde::de::DeserializeOwned>(
+    cfg: &SummarizationConfig,
+    http: &reqwest::Client,
+    phase: &'static str,
     system: &str,
     user: String,
     max_tokens: u32,
@@ -421,6 +453,12 @@ async fn chat_json<T: serde::de::DeserializeOwned>(
     // OpenAI-compatible envelope: choices[0].message.content is the JSON string the schema shaped.
     let envelope: ChatResponse = serde_json::from_str(&text)
         .with_context(|| format!("parse sidecar response envelope ({} bytes)", text.len()))?;
+    // Token accounting from the `usage` block (present on the 2xx path), recorded before the content is
+    // even validated: the tokens were spent regardless of whether the body parses or the gate later
+    // rejects it.
+    if let Some(usage) = envelope.usage {
+        metric::llm_tokens(phase, usage.prompt_tokens, usage.completion_tokens);
+    }
     let choice = envelope
         .choices
         .into_iter()
@@ -491,6 +529,20 @@ fn snippet(s: &str) -> String {
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
     choices: Vec<ChatChoice>,
+    /// The OpenAI-compatible token accounting llama.cpp returns alongside the choices. Optional — a
+    /// non-conforming sidecar may omit it — so its absence degrades to "no token metric", never an error.
+    #[serde(default)]
+    usage: Option<Usage>,
+}
+
+/// The slice of the `usage` block we record. `Copy` so reading it doesn't disturb the `choices` move
+/// that follows.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+struct Usage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]
