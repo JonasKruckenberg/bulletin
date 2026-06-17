@@ -327,7 +327,9 @@ async fn summary_gate_withholds_unsummarized_and_baseline_clusters() {
         async move {
             sqlx::query("UPDATE cluster SET summary = $2::jsonb WHERE group_key = $1")
                 .bind(group)
-                .bind(format!(r#"{{"headline":"h","tldr_text":"t","band":"{band}"}}"#))
+                .bind(format!(
+                    r#"{{"headline":"h","tldr_text":"t","band":"{band}"}}"#
+                ))
                 .execute(&pool)
                 .await
                 .unwrap();
@@ -551,7 +553,9 @@ async fn cross_boundary_seed_pulls_aged_public_for_a_fresh_private_link() {
     assert_eq!(build_private(&pool, alice).await.unwrap(), 1);
 
     // The aged-out public advisory is pulled back in via the strong-key seed, and fuses.
-    let clusters = candidate_clusters(&pool, alice, None, 30, false).await.unwrap();
+    let clusters = candidate_clusters(&pool, alice, None, 30, false)
+        .await
+        .unwrap();
     assert_eq!(
         clusters.len(),
         2,
@@ -605,7 +609,9 @@ async fn cross_source_story_fuses_private_and_public_via_cve() {
     assert_eq!(build_private(&pool, alice).await.unwrap(), 1);
 
     // Alice's candidate set is her private PR + the public advisory; linking fuses them on the CVE.
-    let clusters = candidate_clusters(&pool, alice, None, 30, false).await.unwrap();
+    let clusters = candidate_clusters(&pool, alice, None, 30, false)
+        .await
+        .unwrap();
     assert_eq!(clusters.len(), 2);
     let assignment = link(&clusters, &[], Uuid::now_v7);
     assert_eq!(
@@ -1189,7 +1195,9 @@ async fn scoring_classifies_story_and_note() {
     .await;
     build_all(&pool).await;
 
-    let clusters = candidate_clusters(&pool, sub, None, 30, false).await.unwrap();
+    let clusters = candidate_clusters(&pool, sub, None, 30, false)
+        .await
+        .unwrap();
     let assignment = link(&clusters, &[], Uuid::now_v7);
     // Mirror the digest flow's candidate construction (its rollups drive richness).
     let cands: Vec<Candidate> = assignment
@@ -1224,7 +1232,9 @@ async fn resurface_without_new_events_fades_to_note() {
     build_all(&pool).await;
 
     // First window: select + freeze the story as a Story.
-    let clusters = candidate_clusters(&pool, sub, None, 30, false).await.unwrap();
+    let clusters = candidate_clusters(&pool, sub, None, 30, false)
+        .await
+        .unwrap();
     let assignment = link(&clusters, &[], Uuid::now_v7);
     persist_assignment(&pool, sub, &assignment).await.unwrap();
     let story = assignment.stories[0].clone();
@@ -1265,7 +1275,9 @@ async fn provenance_walks_story_to_its_events() {
     insert_public(&pool, "e2", "g", "Second", 200).await; // same group → one cluster, two events
     build_all(&pool).await;
 
-    let clusters = candidate_clusters(&pool, sub, None, 30, false).await.unwrap();
+    let clusters = candidate_clusters(&pool, sub, None, 30, false)
+        .await
+        .unwrap();
     let assignment = link(&clusters, &[], Uuid::now_v7);
     persist_assignment(&pool, sub, &assignment).await.unwrap();
     let story = &assignment.stories[0];

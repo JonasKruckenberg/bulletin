@@ -260,7 +260,11 @@ fn render_plain(
         body.push_str(&format!("   why: {}\n", reason_line(&item.reason)));
         // The cross-source connections fused into this story, each with why it belongs (§8.2).
         for conn in &item.connections {
-            body.push_str(&format!("   ↳ {} [{}]", clean(&conn.title), conn.source.as_str()));
+            body.push_str(&format!(
+                "   ↳ {} [{}]",
+                clean(&conn.title),
+                conn.source.as_str()
+            ));
             if let Some(reason) = &conn.link_reason {
                 body.push_str(&format!(" — {}", clean(reason)));
             }
@@ -1427,7 +1431,13 @@ mod tests {
             assert!(html.contains(r#"<span class="headline""#));
         }
         // A legitimate https link is still emitted as a live href.
-        let ok = summarized("raw", "H", "S", Some("https://example.com/x"), SourceKind::Rss);
+        let ok = summarized(
+            "raw",
+            "H",
+            "S",
+            Some("https://example.com/x"),
+            SourceKind::Rss,
+        );
         assert!(render_one(&ok).contains(r#"href="https://example.com/x""#));
     }
 
