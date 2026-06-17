@@ -103,6 +103,49 @@ pub(crate) async fn touch_summarized(
     Ok(())
 }
 
+/// A historical cluster sampled for the read-only faithfulness eval (§3.4/§7 — the `digest-explain`
+/// hook): its id (for the per-cluster log/span) plus the scope-aware identity needed to re-read its
+/// events. The eval generates a *fresh* candidate for every sampled cluster, so — unlike
+/// [`DueCluster`] — there is no `summary_hash`/title to carry (it never advances the cache and never
+/// builds a baseline).
+pub(crate) struct EvalCluster {
+    pub id: Uuid,
+    pub source: SourceKind,
+    pub group_key: String,
+}
+
+/// A sample of recent clusters in the given `scope` for the faithfulness eval (§3.4/§7). Unlike
+/// [`clusters_needing_summary`] this ignores `summarized_at`/`summary_model` — the eval re-generates a
+/// candidate for every cluster regardless of cache state, since it measures the model rather than
+/// advancing the cache. Newest-first, bounded by `limit`. Reads `cluster` (RLS-protected) → the caller
+/// runs it in the matching scope context.
+pub(crate) async fn clusters_for_eval(
+    conn: &mut PgConnection,
+    scope: &Scope,
+    limit: i64,
+) -> Result<Vec<EvalCluster>, sqlx::Error> {
+    let (scope_kind, scope_subscriber_id) = scope.to_columns();
+    sqlx::query(
+        "SELECT id, source, group_key
+         FROM cluster
+         WHERE scope_kind = $1 AND scope_subscriber_id IS NOT DISTINCT FROM $2
+         ORDER BY last_event_time DESC
+         LIMIT $3",
+    )
+    .bind(scope_kind)
+    .bind(scope_subscriber_id)
+    .bind(limit)
+    .try_map(|row: PgRow| {
+        Ok(EvalCluster {
+            id: row.get("id"),
+            source: row.try_get("source")?,
+            group_key: row.get("group_key"),
+        })
+    })
+    .fetch_all(conn)
+    .await
+}
+
 // ── Phase C — story cross-source synthesis (§2.2) ────────────────────────────────────────────────
 
 /// A story the synthesis pass should consider (re)synthesizing: its id plus the member cluster ids

@@ -1398,6 +1398,119 @@ pub fn lead_schema() -> serde_json::Value {
     })
 }
 
+// ── The faithfulness eval (§3.4/§7 — the `digest-explain` hook) ──────────────────────────────────
+
+/// The verdict for one cluster in a read-only faithfulness eval pass (§3.4/§7). The eval runs the
+/// *exact* generation path the real sweep uses (extract → comprehend → model → gate) but reports the
+/// gate's decision instead of silently degrading to baseline, and stores nothing — so the model's
+/// output can be measured *before* any of it touches a delivered digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EvalVerdict {
+    /// The model produced a candidate that passed the gate — a faithful summary.
+    Passed,
+    /// The model produced a candidate the gate rejected (it would degrade to baseline in production).
+    /// Carries the violation so the report can break rejections down by reason.
+    Rejected(GateViolation),
+    /// The model was unavailable for this cluster (transport/HTTP failure) — not a faithfulness signal,
+    /// so it is tallied separately and excluded from the accuracy rate.
+    Unavailable,
+}
+
+/// The aggregate of a read-only eval pass (§3.4/§7 — the `digest-explain` faithfulness hook): the
+/// Vectara-style entity/number accuracy rate over the sampled clusters (`local-ml-options.md` §7) plus
+/// the rejection breakdown, so a phase's model output can be measured before it ships to a digest. Pure
+/// + accumulator-only, so it is unit-tested without a model or DB.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct EvalReport {
+    /// Candidates that passed the gate.
+    pub passed: usize,
+    /// Candidates the gate rejected (sum of the per-reason counts below).
+    pub rejected: usize,
+    /// Clusters the model couldn't answer (transport/HTTP failure) — excluded from the rate.
+    pub unavailable: usize,
+    /// Clusters dropped *before* a model call — no events to summarize, or their event load errored —
+    /// so they never reached the gate. Surfaced so a sample silently shrunk by eventless clusters (or
+    /// a transient DB error) is visible rather than quietly missing from the totals.
+    pub skipped: usize,
+    /// Rejection breakdown, by [`GateViolation`] variant.
+    pub ungrounded_entity: usize,
+    pub ungrounded_number: usize,
+    pub banned_word: usize,
+    pub url_in_prose: usize,
+    pub too_long: usize,
+}
+
+impl EvalReport {
+    /// Fold one cluster's [`EvalVerdict`] into the running totals.
+    pub fn record(&mut self, verdict: &EvalVerdict) {
+        match verdict {
+            EvalVerdict::Passed => self.passed += 1,
+            EvalVerdict::Unavailable => self.unavailable += 1,
+            EvalVerdict::Rejected(v) => {
+                self.rejected += 1;
+                match v {
+                    GateViolation::UngroundedEntity(_) => self.ungrounded_entity += 1,
+                    GateViolation::UngroundedNumber(_) => self.ungrounded_number += 1,
+                    GateViolation::BannedWord(_) => self.banned_word += 1,
+                    GateViolation::UrlInProse(_) => self.url_in_prose += 1,
+                    GateViolation::TooLong => self.too_long += 1,
+                }
+            }
+        }
+    }
+
+    /// Clusters the model actually answered (`passed + rejected`) — the denominator of the
+    /// faithfulness rate. `unavailable` clusters are excluded (a down sidecar is not a hallucination).
+    pub fn generated(&self) -> usize {
+        self.passed + self.rejected
+    }
+
+    /// Total clusters the eval looked at: the ones the model answered, the ones it couldn't, and the
+    /// ones dropped before a model call (eventless / load error). Equals the number of sampled
+    /// clusters that had events, so a gap from the requested `--limit` is the eventless/dropped count.
+    pub fn sampled(&self) -> usize {
+        self.generated() + self.unavailable + self.skipped
+    }
+
+    /// The Vectara-style faithfulness rate (§3.4/§7): `passed / generated`, in `0.0..=1.0`. `None` when
+    /// the model answered nothing (so the caller prints "n/a" rather than a divide-by-zero).
+    pub fn faithfulness_rate(&self) -> Option<f64> {
+        match self.generated() {
+            0 => None,
+            g => Some(self.passed as f64 / g as f64),
+        }
+    }
+}
+
+impl std::fmt::Display for EvalReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let rate = self
+            .faithfulness_rate()
+            .map(|r| format!("{:.1}% ({}/{})", r * 100.0, self.passed, self.generated()))
+            .unwrap_or_else(|| "n/a (no candidates generated)".to_string());
+        writeln!(f, "faithfulness eval — {} clusters sampled", self.sampled())?;
+        writeln!(
+            f,
+            "  generated: {}   unavailable: {}   skipped: {}",
+            self.generated(),
+            self.unavailable,
+            self.skipped
+        )?;
+        writeln!(
+            f,
+            "  passed:    {}   rejected:    {}",
+            self.passed, self.rejected
+        )?;
+        writeln!(f, "  faithfulness rate: {rate}")?;
+        writeln!(f, "  rejections by reason:")?;
+        writeln!(f, "    ungrounded_number: {}", self.ungrounded_number)?;
+        writeln!(f, "    ungrounded_entity: {}", self.ungrounded_entity)?;
+        writeln!(f, "    banned_word:       {}", self.banned_word)?;
+        writeln!(f, "    url_in_prose:      {}", self.url_in_prose)?;
+        write!(f, "    too_long:          {}", self.too_long)
+    }
+}
+
 // ── The sweep (gated) — walk the work queue, summarize best-effort ───────────────────────────────
 
 /// What a summarization sweep did, for logs / metrics.
@@ -1578,6 +1691,94 @@ async fn sweep(
         }
     }
     Ok(stats)
+}
+
+/// Run the read-only **faithfulness eval** (§3.4/§7 — the `digest-explain` hook) over a sample of
+/// historical **public** clusters, in the no-subscriber RLS context. For each sampled cluster it runs
+/// the *exact* generation path [`sweep`] uses — extract → (comprehend) → model → gate — but **stores
+/// nothing** and records the gate's verdict, so the Vectara-style entity/number accuracy rate
+/// (`local-ml-options.md` §7) can be measured *before* any summary touches a delivered digest. Newest
+/// clusters first, bounded by `limit`. Only exists in a `llm-summarization` build.
+///
+/// Unlike [`sweep`], the eval ignores `summarized_at`/`summary_model` and re-generates a candidate for
+/// every sampled cluster regardless of cache state — it is measuring the model, not advancing the
+/// cache. It is also scoped to public clusters only (the no-subscriber context, like [`sweep_public`])
+/// to stay trivially scope-clean; a per-subscriber eval is a later refinement.
+#[cfg(feature = "llm-summarization")]
+pub async fn eval_public(
+    pool: &sqlx::PgPool,
+    cfg: &SummarizationConfig,
+    limit: i64,
+) -> anyhow::Result<EvalReport> {
+    use crate::common::db::with_scope;
+    use anyhow::Context;
+    use tracing::Instrument;
+
+    let scope = Scope::Public;
+    let ctx = ScopeCtx::for_scope(&scope);
+    let http = build_summarize_http(cfg, "eval")?;
+
+    // The sample, loaded in its own short transaction (same discipline as `sweep` — the model calls
+    // sit between DB steps, never inside one).
+    let clusters = with_scope(pool, ctx, {
+        let scope = scope.clone();
+        move |conn| {
+            Box::pin(async move {
+                store::clusters_for_eval(conn, &scope, limit)
+                    .await
+                    .context("load clusters for eval")
+            })
+        }
+    })
+    .await?;
+    tracing::info!(
+        base_url = %cfg.base_url,
+        model = %cfg.summary_model(),
+        selected = clusters.len(),
+        "faithfulness eval starting (read-only — nothing is stored)"
+    );
+
+    let mut report = EvalReport::default();
+    for c in clusters {
+        let events = with_scope(pool, ctx, {
+            let scope = scope.clone();
+            let source = c.source;
+            let group_key = c.group_key.clone();
+            move |conn| {
+                Box::pin(async move {
+                    crate::cluster::store::list_group_events(conn, &scope, source, &group_key)
+                        .await
+                        .context("load cluster events for eval")
+                })
+            }
+        })
+        .await;
+        // Tolerate a per-cluster event-load failure: an eval is a one-shot read-only measurement over
+        // a large sample, so a single transient DB error (or one bad cluster) must not abort the whole
+        // run and discard every model call already spent — count it as skipped and move on. (The
+        // production `sweep` propagates here instead, but it is best-effort and retries next pass.)
+        let events = match events {
+            Ok(events) => events,
+            Err(e) => {
+                tracing::warn!(cluster_id = %c.id, error = %format!("{e:#}"), "eval: skipping cluster, event load failed");
+                report.skipped += 1;
+                continue;
+            }
+        };
+        // No events to summarize (e.g. tombstoned since selection) — nothing to measure; tally it so a
+        // sample silently shrunk by eventless clusters is visible against the requested `--limit`.
+        if events.is_empty() {
+            report.skipped += 1;
+            continue;
+        }
+        let span =
+            tracing::debug_span!("eval_cluster", cluster_id = %c.id, source = c.source.as_str());
+        let verdict = client::eval_cluster(cfg, &http, &events)
+            .instrument(span)
+            .await;
+        report.record(&verdict);
+    }
+    Ok(report)
 }
 
 /// Run a best-effort **story cross-source synthesis** pass (Phase C, §2.2) for one subscriber, in
@@ -2330,6 +2531,62 @@ mod tests {
         assert_eq!(auto_label(&["cve:CVE-2026-9".to_string()]), "CVE-2026-9");
         // Empty spine ⇒ empty label (eyebrow omitted).
         assert_eq!(auto_label(&[]), "");
+    }
+
+    // ── The faithfulness eval (§3.4/§7) ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn eval_report_tallies_and_rates() {
+        let mut r = EvalReport::default();
+        // An empty report has no rate (nothing generated) — the caller prints "n/a", not a NaN.
+        assert_eq!(r.faithfulness_rate(), None);
+
+        r.record(&EvalVerdict::Passed);
+        r.record(&EvalVerdict::Passed);
+        r.record(&EvalVerdict::Passed);
+        r.record(&EvalVerdict::Rejected(GateViolation::UngroundedNumber(
+            "99".into(),
+        )));
+        r.record(&EvalVerdict::Unavailable); // excluded from the rate
+        r.skipped += 1; // eventless / load-failed clusters: counted, but never reached the gate
+
+        assert_eq!(r.passed, 3);
+        assert_eq!(r.rejected, 1);
+        assert_eq!(r.unavailable, 1);
+        assert_eq!(r.skipped, 1);
+        assert_eq!(r.ungrounded_number, 1);
+        assert_eq!(r.generated(), 4); // passed + rejected, NOT the unavailable or skipped ones
+        assert_eq!(r.sampled(), 6); // generated (4) + unavailable (1) + skipped (1)
+                                    // 3 of 4 generated candidates passed — neither the unavailable nor the skipped cluster counts.
+        assert_eq!(r.faithfulness_rate(), Some(0.75));
+    }
+
+    #[test]
+    fn eval_report_breaks_rejections_down_by_reason() {
+        let mut r = EvalReport::default();
+        r.record(&EvalVerdict::Rejected(GateViolation::UngroundedEntity(
+            "user:eve".into(),
+        )));
+        r.record(&EvalVerdict::Rejected(GateViolation::BannedWord(
+            "massive".into(),
+        )));
+        r.record(&EvalVerdict::Rejected(GateViolation::UrlInProse(
+            "https://x".into(),
+        )));
+        r.record(&EvalVerdict::Rejected(GateViolation::TooLong));
+        assert_eq!(r.rejected, 4);
+        assert_eq!(r.ungrounded_entity, 1);
+        assert_eq!(r.banned_word, 1);
+        assert_eq!(r.url_in_prose, 1);
+        assert_eq!(r.too_long, 1);
+        // Every rejection lands in exactly one reason bucket.
+        let by_reason =
+            r.ungrounded_entity + r.ungrounded_number + r.banned_word + r.url_in_prose + r.too_long;
+        assert_eq!(by_reason, r.rejected);
+        // The rendered report carries the headline rate + the breakdown.
+        let out = r.to_string();
+        assert!(out.contains("faithfulness rate"));
+        assert!(out.contains("ungrounded_entity: 1"));
     }
 
     #[test]

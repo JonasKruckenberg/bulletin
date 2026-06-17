@@ -83,6 +83,16 @@ enum Command {
     All,
     /// Run the gRPC service API server (admin plane).
     Api,
+    /// Read-only faithfulness eval (the `digest-explain` hook, `docs/llm-summarization.md` §3.4/§7):
+    /// generate candidate summaries for a sample of historical public clusters, run them through the
+    /// faithfulness gate, and report the Vectara-style entity/number accuracy rate — **storing nothing
+    /// and touching no digest**. Requires an `llm-summarization` build with a reachable sidecar; the
+    /// deterministic build prints a clear notice and exits.
+    SummaryEval {
+        /// How many recent public clusters to sample.
+        #[arg(long, default_value_t = 100)]
+        limit: i64,
+    },
     Debug {
         #[command(subcommand)]
         command: debug::DebugCommand,
@@ -177,6 +187,14 @@ async fn main() -> Result<()> {
                 )
             )?;
         }
+        Command::SummaryEval { limit } => {
+            if limit < 1 {
+                anyhow::bail!("--limit must be >= 1");
+            }
+            // Connect inside the handler so a deterministic (feature-off) build fails on the missing
+            // feature *before* it complains about a missing DATABASE_URL — the more useful error.
+            run_summary_eval(cli.database_url.as_deref(), limit).await?;
+        }
         Command::Debug { command } => {
             // `debug` is a thin gRPC client of the admin plane (`bulletin api`) — even locally. It
             // never opens the DB or builds a mailer, so it needs neither DATABASE_URL nor the SMTP
@@ -232,6 +250,34 @@ async fn ensure_sidecar_ready() -> Result<()> {
 #[cfg(not(feature = "llm-summarization"))]
 async fn ensure_sidecar_ready() -> Result<()> {
     Ok(())
+}
+
+/// The `summary-eval` command (the `digest-explain` hook, `docs/llm-summarization.md` §3.4/§7): a
+/// read-only faithfulness eval that generates candidate summaries for a sample of historical public
+/// clusters, runs them through the faithfulness gate, and prints the Vectara-style accuracy rate —
+/// without storing anything. The sidecar must be reachable (the eval can't measure the model without
+/// it), so this gates on it up front like the worker does.
+#[cfg(feature = "llm-summarization")]
+async fn run_summary_eval(database_url: Option<&str>, limit: i64) -> Result<()> {
+    let database_url = database_url.context(DATABASE_URL_REQUIRED)?;
+    ensure_sidecar_ready().await?;
+    let pool = connect_pool(database_url).await?;
+    let cfg = bulletin_core::summarize::SummarizationConfig::from_env();
+    let report = bulletin_core::summarize::eval_public(&pool, &cfg, limit)
+        .await
+        .context("faithfulness eval failed")?;
+    println!("{report}");
+    Ok(())
+}
+
+/// Without the `llm-summarization` feature there is no model to evaluate — say so plainly rather than
+/// silently succeeding with an empty report (and before any DB connect is attempted).
+#[cfg(not(feature = "llm-summarization"))]
+async fn run_summary_eval(_: Option<&str>, _: i64) -> Result<()> {
+    anyhow::bail!(
+        "summary-eval requires an llm-summarization build (the deterministic build has no model to \
+         evaluate). Rebuild with --features llm-summarization"
+    )
 }
 
 /// The HTTP server (`serve` / `all`): liveness `/health` + the webhook catcher (`/webhooks/github`),

@@ -176,10 +176,12 @@ is the only switch — without it `summarize_public` is an empty no-op and no su
   (clear for a model that genuinely needs thinking), and `BULLETIN_LLM_STARTUP_TIMEOUT_SECS` (how long
   the startup reachability gate waits for the sidecar before failing — default `60`). See
   `SummarizationConfig::from_env` / `ensure_sidecar_ready`.
-- **The model path is never exercised in CI** (no sidecar). All *pure* logic is unit-tested (11 tests
-  in `summarize::tests`); the network round-trip needs a live `llama-server`. To smoke-test locally:
+- **The model path is never exercised in CI** (no sidecar). All *pure* logic is unit-tested (in
+  `summarize::tests`); the network round-trip needs a live `llama-server`. To smoke-test locally:
   run a llama.cpp server, build with `--features llm-summarization`, set `BULLETIN_LLM_BASE_URL`,
-  ingest, build (cluster pass).
+  ingest, build (cluster pass). The quickest read-only check that the model path works end-to-end —
+  and how faithful it is — is `bulletin summary-eval` (the §3.4/§7 hook): it exercises extract →
+  comprehend → model → gate over real clusters without writing anything.
 - **No metrics yet** for the sweep (the worker logs `summarized`/`skipped`). Add a counter when wiring
   consumption.
 
@@ -247,22 +249,44 @@ is the only switch — without it `summarize_public` is an empty no-op and no su
    from the selected items' **headlines** (always present, gate-passed) + thread **labels**, not the full
    tldr/delta payloads — short, grounded inputs that keep the on-path call fast and the §3.4 gate simple
    (no entity-ref check — the lead is plain prose, it *names* threads rather than badging entities).
-7. **Eval hook (`digest-explain`).** Run the faithfulness gate read-only over historical clusters to
-   measure the Vectara-style entity/number accuracy rate before any summary touches a delivered digest
-   (§3.4, §7).
+7. ~~**Eval hook (`digest-explain`).**~~ **Done (2026-06-17).** A read-only faithfulness eval
+   (`summarize::eval_public` → `client::eval_cluster`, exposed as the `bulletin summary-eval` command)
+   generates candidate summaries for a sample of recent **public** clusters, runs each through the
+   §3.4 faithfulness gate, and reports the Vectara-style entity/number accuracy rate
+   (`passed / generated`) with a per-reason rejection breakdown (`EvalReport`) — **storing nothing and
+   touching no digest**, so a model/prompt can be measured *before* its output ships (§3.4, §7). It
+   runs the *exact* generation path the sweep uses via the shared `client::generate_candidate`
+   (extract → comprehend → model → build candidate) but returns the gate verdict instead of degrading
+   to baseline, and deliberately **bypasses the `gate_rejection` metric** (an eval is a measurement,
+   not a production rejection). Unavailable clusters (a down sidecar) are tallied separately and
+   excluded from the rate — a transport miss is not a hallucination; eventless / load-failed clusters
+   are counted `skipped` so a sample shrunk below `--limit` is visible. Scoped to public clusters (the
+   no-subscriber RLS context) to stay trivially scope-clean; a per-subscriber eval is a later
+   refinement. The `EvalReport` accumulator is pure + unit-tested; the command fails loud if the
+   sidecar is unreachable (it can't measure the model without it) and prints a clear notice in a
+   deterministic (feature-off) build.
+
+**All §4 follow-ups are now done** (Phase D + the eval hook landed 2026-06-17). What remains is
+*design-doc* scope, not handoff scope: the §9 tuning surface (badge budget, voice calibration, gate
+strictness, input budgets, model choice on the real box) — the open questions the `summary-eval` hook
+now exists to answer.
 
 ---
 
 ## 5. How to verify what's here
 
 ```sh
-# Pure logic (no sidecar, no DB): the gate, hash, facts, schema, baseline, serde.
+# Pure logic (no sidecar, no DB): the gate, hash, facts, schema, baseline, serde, the eval accumulator.
 cargo test -p bulletin-core --lib summarize
 
 # Both feature configs compile clean (CI parity):
 cargo clippy -p bulletin-core -- -D warnings
 cargo clippy -p bulletin-core --features llm-summarization -- -D warnings
 cargo clippy -p bulletin --features llm-summarization -- -D warnings
+
+# Read-only faithfulness eval against a live sidecar (the §3.4/§7 `digest-explain` hook) — needs a
+# DATABASE_URL with clusters and a reachable BULLETIN_LLM_BASE_URL; stores nothing.
+bulletin summary-eval --limit 100
 ```
 
 Default build (feature off) is unchanged behavior; `migrate` adds four nullable/defaulted columns +
