@@ -91,8 +91,10 @@ impl Default for SummarizationConfig {
             base_url: "http://127.0.0.1:8080/v1".to_string(),
             model: "qwen3.5-4b-instruct".to_string(),
             // Bumped to 2 with the comprehension pass: facts now carry event_type/state/certainty, so
-            // a re-summarize of the corpus picks up the richer (and hedge-aware) phrasing.
-            prompt_version: 2,
+            // a re-summarize of the corpus picks up the richer (and hedge-aware) phrasing. Bumped to 3
+            // with the "never write a URL" rule (+ the deterministic url_like_token gate), so the
+            // corpus re-summarizes without the leaked source domains/links.
+            prompt_version: 3,
             headline_max_tokens: 24,
             tldr_max_tokens: 96,
             comprehension_max_tokens: 256,
@@ -584,6 +586,11 @@ pub enum GateViolation {
     UngroundedNumber(String),
     /// A banned hype word or second-person address slipped through (§3.6 denylist).
     BannedWord(String),
+    /// A web address leaked into the prose. The model names sources; it never writes URLs (the
+    /// interface carries the link). Rejected because a bare URL reads as a raw artifact *and* because
+    /// some mail clients auto-linkify one in displayed text — a link surface outside the renderer's
+    /// scheme allowlist.
+    UrlInProse(String),
     /// The headline or tldr exceeds its length budget.
     TooLong,
 }
@@ -670,6 +677,12 @@ pub fn faithful(
         return Err(GateViolation::BannedWord(w));
     }
 
+    // No web addresses in the prose: the model names sources and the interface carries the link, so a
+    // leaked URL is both an artifact and a client-autolink surface outside the renderer's allowlist.
+    if let Some(u) = url_like_token(&output) {
+        return Err(GateViolation::UrlInProse(u));
+    }
+
     Ok(())
 }
 
@@ -687,6 +700,54 @@ pub fn banned_word_in(text: &str) -> Option<String> {
         return Some("!".to_string());
     }
     None
+}
+
+/// The first URL-like token in `text`, or `None` for clean prose — the deterministic backstop to the
+/// prompt's "never write a URL" rule, shared by the cluster/story gate and the label/delta cleaners.
+///
+/// Tuned to catch the unambiguous, autolink-prone forms while *not* gating the filenames a developer
+/// digest is full of (`main.rs`, `README.md`, `ASP.NET`, `Node.js`). A whitespace token (edge
+/// punctuation trimmed) is a URL when it carries a scheme (`://`), a `www.`/`mailto:` prefix, or a
+/// `host/path` shape (a dotted host before a slash), **or** is a bare host ending in one of the classic
+/// generic TLDs that never collide with a file extension (`com`/`org`/`gov`/`edu`). A bare ccTLD address
+/// with no path (`example.de`, `main.rs`) is deliberately left to the prompt rather than risk a false
+/// reject — the cost of a miss is one plainer baseline, the cost of a false positive is a good summary lost.
+pub fn url_like_token(text: &str) -> Option<String> {
+    /// Bare-host TLDs safe to match without a scheme/path: classic gTLDs, none of them a file extension.
+    const URL_TLDS: &[&str] = &["com", "org", "gov", "edu"];
+    for raw in text.split_whitespace() {
+        let tok = raw.trim_matches(|c: char| !c.is_alphanumeric());
+        if tok.is_empty() {
+            continue;
+        }
+        let lc = tok.to_ascii_lowercase();
+        if lc.contains("://") || lc.starts_with("www.") || lc.starts_with("mailto:") {
+            return Some(tok.to_string());
+        }
+        // host/path: a dotted host before the first '/'.
+        if let Some((host, _)) = lc.split_once('/') {
+            if is_dotted_host(host) {
+                return Some(tok.to_string());
+            }
+        }
+        // Bare host ending in a classic gTLD (no scheme, no path).
+        if let Some(tld) = lc.rsplit('.').next() {
+            if URL_TLDS.contains(&tld) && is_dotted_host(&lc) {
+                return Some(tok.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// A `label(.label)+` dotted host: ≥2 non-empty labels of host characters (alphanumeric or `-`). Tells a
+/// real host (`databricks.com`) from incidental dotted prose (`e.g`, `U.S`, a version `v1`).
+fn is_dotted_host(s: &str) -> bool {
+    let labels: Vec<&str> = s.split('.').collect();
+    labels.len() >= 2
+        && labels
+            .iter()
+            .all(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
 }
 
 /// Whole-word, case-insensitive containment: `needle` (already lowercase) bounded by non-alphanumeric
@@ -765,7 +826,9 @@ You rephrase the facts. You add nothing.
    reportedly, proposed). asserted -> say it plainly. Never change a fact's certainty.
 4. Plain words. Active voice. Do not use: massive, huge, critical (unless in the
    source), game-changing, exciting, "!", "you", "we".
-5. Output only the JSON the schema asks for. No preamble.
+5. Never write a URL or web address (no "http", no "www.", no bare domains like
+   example.com). Name the source plainly; the reader's interface shows the link.
+6. Output only the JSON the schema asks for. No preamble.
 
 EXAMPLES
 facts: {event: deploy broke logins, state: resolved, certainty: asserted,
@@ -985,7 +1048,8 @@ You write ONE headline and ONE tldr for the whole thing. You add nothing.
 5. Each fact has "certainty". tentative -> hedge (suspected, appears to). asserted -> say it plainly.
 6. Plain words. Active voice. Do not use: massive, huge, critical (unless in the source),
    game-changing, exciting, "!", "you", "we".
-7. Output only the JSON the schema asks for. No preamble.
+7. Never write a URL or web address (no "http", no "www.", no bare domains like example.com).
+8. Output only the JSON the schema asks for. No preamble.
 
 EXAMPLE
 members:
@@ -1110,7 +1174,7 @@ pub fn clean_label(raw: &str) -> Option<String> {
     if s.is_empty() || s.chars().count() > LABEL_MAX {
         return None;
     }
-    if banned_word_in(s).is_some() {
+    if banned_word_in(s).is_some() || url_like_token(s).is_some() {
         return None;
     }
     Some(s.to_string())
@@ -1131,7 +1195,7 @@ pub fn clean_delta(raw: &str) -> Option<String> {
     {
         return None;
     }
-    if banned_word_in(s).is_some() {
+    if banned_word_in(s).is_some() || url_like_token(s).is_some() {
         return None;
     }
     Some(s.to_string())
@@ -1853,6 +1917,56 @@ mod tests {
     }
 
     #[test]
+    fn url_like_token_catches_addresses_not_filenames() {
+        // Scheme / prefix / host-path / bare-gTLD forms are all caught.
+        assert!(url_like_token("see https://www.databricks.com/x for more").is_some());
+        assert!(url_like_token("published on databricks.com today").is_some());
+        assert!(url_like_token("at github.com/acme/auth/pull/1").is_some());
+        assert!(url_like_token("reach us at www.example.org").is_some());
+        assert!(url_like_token("mail mailto:ops@example.com now").is_some());
+        // The jammed-together leakage (domain glued to a scheme URL) still trips on the scheme.
+        assert!(url_like_token("databricks.comhttps://www.databricks.com/l").is_some());
+        // Trailing punctuation doesn't hide it.
+        assert!(url_like_token("(see status.claude.com).").is_some());
+
+        // ...but the filenames and dotted prose a developer digest is full of are NOT URLs.
+        for clean in [
+            "the fix landed in main.rs after review",
+            "see README.md for the steps",
+            "an ASP.NET handler regressed",
+            "Node.js 22 shipped",
+            "e.g. the U.S. team", // abbreviations
+            "a 24/7 on-call rotation",
+            "the input/output split",
+            "rolled back v1.2.3",
+        ] {
+            assert!(url_like_token(clean).is_none(), "false positive on: {clean}");
+        }
+    }
+
+    #[test]
+    fn gate_rejects_a_url_in_the_prose() {
+        let facts = Facts::default();
+        let leaked = ClusterSummary {
+            headline: "Databricks launches LTAP".to_string(),
+            tldr_text: "Databricks announced LTAP. databricks.com".to_string(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            faithful(&leaked, &facts, "Databricks announced LTAP at databricks.com"),
+            Err(GateViolation::UrlInProse(_))
+        ));
+
+        // The same sentence without the address passes the URL check (a clean, named source).
+        let clean = ClusterSummary {
+            headline: "Databricks launches LTAP".to_string(),
+            tldr_text: "Databricks announced LTAP, a unified data architecture.".to_string(),
+            ..Default::default()
+        };
+        assert!(faithful(&clean, &facts, "Databricks announced LTAP").is_ok());
+    }
+
+    #[test]
     fn baseline_is_true_and_uncertain() {
         let b = baseline("Title here", 3, &["github", "slack"], Facts::default());
         assert_eq!(b.headline, "Title here");
@@ -2001,7 +2115,7 @@ mod tests {
     #[test]
     fn summary_model_string() {
         let cfg = SummarizationConfig::default();
-        assert_eq!(cfg.summary_model(), "qwen3.5-4b-instruct@2");
+        assert_eq!(cfg.summary_model(), "qwen3.5-4b-instruct@3");
     }
 
     // ── Phase C — story synthesis ────────────────────────────────────────────────────────────────
