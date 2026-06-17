@@ -41,20 +41,8 @@ pub async fn summarize_cluster(
     title: &str,
     events: &[Event],
 ) -> Option<ClusterSummary> {
-    let mut facts = extract_facts(events);
-    let source = source_corpus(events, cfg.max_source_chars);
-
-    // Extract-then-summarize (§3.2): run the comprehension pass first so the summarizer's hedge rule
-    // (§3.6) is a mechanical branch on `facts.certainty`/`state`, not an inference. Best-effort — a
-    // failed/disabled comprehension leaves the neutral defaults (asserted, plain), the safe direction.
-    if cfg.comprehend {
-        if let Some(comp) = comprehend_cluster(cfg, http, &facts, &source).await {
-            apply_comprehension(&mut facts, &comp);
-        }
-    }
-
-    let candidate = match call_model(cfg, http, &facts, &source).await {
-        Ok(c) => c,
+    let (summary, facts, source) = match generate_candidate(cfg, http, events).await {
+        Ok(generated) => generated,
         Err(e) => {
             tracing::warn!(
                 error = %format!("{e:#}"),
@@ -66,16 +54,6 @@ pub async fn summarize_cluster(
             return None;
         }
     };
-
-    // Stitch the grounding facts back on and derive the flat text from the structured runs.
-    let mut summary = ClusterSummary {
-        headline: candidate.headline.trim().to_string(),
-        tldr: candidate.tldr,
-        tldr_text: String::new(),
-        facts: facts.clone(),
-        band: Band::Confirmed,
-    };
-    summary.rebuild_tldr_text();
 
     if cfg.faithfulness_gate {
         if let Err(v) = faithful(&summary, &facts, &source) {
@@ -90,6 +68,81 @@ pub async fn summarize_cluster(
         }
     }
     Some(summary)
+}
+
+/// The shared generation half of the cluster summarizer (§3.2), factored out so the production path
+/// ([`summarize_cluster`], which gates → baseline) and the read-only eval ([`eval_cluster`], which
+/// gates → verdict) measure the **exact same path** and can't drift: extract the grounding facts,
+/// build the budgeted source corpus, run the (best-effort) comprehension pass, call the model, and
+/// assemble the candidate [`ClusterSummary`] (facts stitched back on, `tldr_text` rebuilt from the
+/// runs, banded `Confirmed` pending the §3.4 gate). Returns the candidate plus the `facts` and `source`
+/// the gate checks against. `Err` only when the model itself was unavailable (transport/HTTP) — a
+/// failed or disabled comprehension degrades to the neutral facts, never an error.
+async fn generate_candidate(
+    cfg: &SummarizationConfig,
+    http: &reqwest::Client,
+    events: &[Event],
+) -> anyhow::Result<(ClusterSummary, Facts, String)> {
+    let mut facts = extract_facts(events);
+    let source = source_corpus(events, cfg.max_source_chars);
+
+    // Extract-then-summarize (§3.2): run the comprehension pass first so the summarizer's hedge rule
+    // (§3.6) is a mechanical branch on `facts.certainty`/`state`, not an inference. Best-effort — a
+    // failed/disabled comprehension leaves the neutral defaults (asserted, plain), the safe direction.
+    if cfg.comprehend {
+        if let Some(comp) = comprehend_cluster(cfg, http, &facts, &source).await {
+            apply_comprehension(&mut facts, &comp);
+        }
+    }
+
+    let candidate = call_model(cfg, http, &facts, &source).await?;
+
+    // Stitch the grounding facts back on and derive the flat text from the structured runs.
+    let mut summary = ClusterSummary {
+        headline: candidate.headline.trim().to_string(),
+        tldr: candidate.tldr,
+        tldr_text: String::new(),
+        facts: facts.clone(),
+        band: Band::Confirmed,
+    };
+    summary.rebuild_tldr_text();
+    Ok((summary, facts, source))
+}
+
+/// Read-only **faithfulness eval** of one cluster (§3.4/§7 — the `digest-explain` hook): run the exact
+/// generation path [`summarize_cluster`] uses (the shared [`generate_candidate`]) but **return the
+/// gate's verdict** instead of degrading to baseline, and **store nothing**. The whole point is to
+/// measure how often the model's *raw* output is faithful — the Vectara-style entity/number accuracy
+/// rate (`local-ml-options.md` §7) — before any of it ships to a delivered digest.
+///
+/// Deliberately bypasses the [`metric::gate_rejection`] counter the production path increments: an eval
+/// is a measurement, not a real rejection, so it must not pollute the operational gate-rejection rate.
+/// (The shared `chat_json` plumbing still records `llm_call`/`llm_tokens` for the calls it makes — a
+/// call *was* made and tokens *were* spent — but a manual eval run installs no recorder, so those are
+/// no-ops in practice.)
+pub async fn eval_cluster(
+    cfg: &SummarizationConfig,
+    http: &reqwest::Client,
+    events: &[Event],
+) -> super::EvalVerdict {
+    use super::EvalVerdict;
+
+    let (summary, facts, source) = match generate_candidate(cfg, http, events).await {
+        Ok(generated) => generated,
+        Err(e) => {
+            tracing::debug!(
+                error = %format!("{e:#}"),
+                kind = failure_kind(&e),
+                "eval: model call failed; cluster counted unavailable"
+            );
+            return EvalVerdict::Unavailable;
+        }
+    };
+
+    match faithful(&summary, &facts, &source) {
+        Ok(()) => EvalVerdict::Passed,
+        Err(v) => EvalVerdict::Rejected(v),
+    }
 }
 
 /// Synthesize a story's cross-source summary (Phase C, §2.2): fuse the member clusters' precomputed
