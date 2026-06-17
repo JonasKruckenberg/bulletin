@@ -2079,7 +2079,7 @@
       "id": 39,
       "type": "timeseries",
       "title": "Gate rejections by phase & reason",
-      "description": "Faithfulness-gate rejections per second, split by phase (summarize | synthesize) and reason (ungrounded_entity | ungrounded_number | banned_word | too_long). The reason is the violation variant only — never the offending value — so the series stays bounded. A reason spiking points at a specific model failure mode.",
+      "description": "Faithfulness-gate rejections per second, split by phase (summarize | synthesize) and reason (ungrounded_entity | ungrounded_number | banned_word | url_in_prose | too_long). The reason is the violation variant only — never the offending value — so the series stays bounded. A reason spiking points at a specific model failure mode.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
