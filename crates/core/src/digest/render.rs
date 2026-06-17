@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use lettre::{message::MultiPart, Message};
 
+use crate::common::link_safety::defang;
 use crate::digest::select::{Format, ItemReason};
 use crate::digest::store::{RenderItem, ThreadTag};
 use crate::identity::ConfidenceBand;
@@ -216,7 +217,7 @@ fn render_plain(
     let opening = if lead.is_empty() {
         clean(greeting).into_owned()
     } else {
-        format!("{} {}", clean(greeting), clean(lead))
+        format!("{} {}", clean(greeting), clean_prose(lead))
     };
     let mut body = format!(
         "{opening}\n\nYour digest for the window ending {}\n\n",
@@ -227,21 +228,23 @@ fn render_plain(
             "{}. [{}] {}\n",
             i + 1,
             item.reason.format.as_str().to_uppercase(),
-            clean(&item.headline)
+            clean_prose(&item.headline)
         ));
         // The context eyebrow (§6.1 zone 1): the thread label + delta flag, when threaded. Plaintext
         // shows the label regardless of band (no "possibly"/omit budgeting — that's a visual nicety).
         if let Some(tag) = item.thread.as_ref().filter(|t| !t.label.trim().is_empty()) {
             match tag.delta.as_deref().filter(|d| !d.trim().is_empty()) {
-                Some(delta) => {
-                    body.push_str(&format!("   ~ {} · {}\n", clean(&tag.label), clean(delta)))
-                }
-                None => body.push_str(&format!("   ~ {}\n", clean(&tag.label))),
+                Some(delta) => body.push_str(&format!(
+                    "   ~ {} · {}\n",
+                    clean_prose(&tag.label),
+                    clean_prose(delta)
+                )),
+                None => body.push_str(&format!("   ~ {}\n", clean_prose(&tag.label))),
             }
         }
         // The grounded one-sentence tldr (§6.1 zone 3), when a summary has run; omitted otherwise.
         if !item.summary.trim().is_empty() {
-            body.push_str(&format!("   {}\n", clean(&item.summary)));
+            body.push_str(&format!("   {}\n", clean_prose(&item.summary)));
         }
         // Only print a link the HTML view would also make live (http/https/mailto) — an unsafe scheme is
         // dropped rather than shown as text, so the two views agree and no `javascript:`/`data:` URL ever
@@ -262,11 +265,11 @@ fn render_plain(
         for conn in &item.connections {
             body.push_str(&format!(
                 "   ↳ {} [{}]",
-                clean(&conn.title),
+                clean_prose(&conn.title),
                 conn.source.as_str()
             ));
             if let Some(reason) = &conn.link_reason {
-                body.push_str(&format!(" — {}", clean(reason)));
+                body.push_str(&format!(" — {}", clean_prose(reason)));
             }
             body.push('\n');
             if let Some(link) = conn.link.as_deref().and_then(safe_href) {
@@ -373,7 +376,7 @@ fn render_html(
     let lead_html = if lead.is_empty() {
         String::new()
     } else {
-        format!(" {}", escape(lead))
+        format!(" {}", escape_prose(lead))
     };
 
     // One divider, reused between every item and above the footer.
@@ -545,7 +548,7 @@ fn date_rule(date: &str) -> String {
 /// `position` is the 0-based render slot (global priority order). Items are separated by
 /// [`soft_divider`], not a rule.
 fn render_story_row(position: usize, item: &RenderItem, tz: Tz) -> String {
-    let headline_text = escape(&item.headline);
+    let headline_text = escape_prose(&item.headline);
     let headline = match item.link.as_deref().and_then(safe_href) {
         Some(link) => format!(
             r#"<a class="headline" href="{}" style="display:block;margin-top:10px;font-family:{SERIF};font-size:22px;font-weight:700;line-height:1.32;color:{INK};text-decoration:none;">{headline_text}</a>"#,
@@ -626,7 +629,7 @@ fn render_summary_runs(runs: &[TldrRun]) -> String {
     let mut out = String::new();
     for run in runs {
         match run {
-            TldrRun::Text { text } => out.push_str(&escape(text)),
+            TldrRun::Text { text } => out.push_str(&escape_prose(text)),
             TldrRun::Ref { entity, surface } => out.push_str(&render_entity_badge(entity, surface)),
         }
     }
@@ -639,7 +642,7 @@ fn render_summary_runs(runs: &[TldrRun]) -> String {
 /// Identity resolution + avatars are a later layer — for now the badge is namespace-styled and the
 /// surface text is shown verbatim, degrading gracefully to plain text for an unknown namespace.
 fn render_entity_badge(entity: &str, surface: &str) -> String {
-    let s = escape(surface);
+    let s = escape_prose(surface);
     match crate::identity::namespace(entity).map(|(ns, _)| ns) {
         Some("repo") => format!(
             r#"<span style="border-bottom:1px dotted {ACCENT};font-weight:600;color:{INK_BODY};">{s}</span>"#
@@ -716,11 +719,11 @@ fn debug_trace_block(position: usize, item: &RenderItem, tz: Tz) -> String {
                 .delta
                 .as_deref()
                 .filter(|d| !d.trim().is_empty())
-                .map(|d| format!(" &middot; delta &ldquo;{}&rdquo;", escape(d)))
+                .map(|d| format!(" &middot; delta &ldquo;{}&rdquo;", escape_prose(d)))
                 .unwrap_or_default();
             format!(
                 r#"<div style="margin-top:4px;">thread <span style="font-weight:700;">{}</span> &middot; identity {}{delta}</div>"#,
-                escape(&t.label),
+                escape_prose(&t.label),
                 t.confidence.as_str()
             )
         }
@@ -734,7 +737,7 @@ fn debug_trace_block(position: usize, item: &RenderItem, tz: Tz) -> String {
         let reason = c
             .link_reason
             .as_deref()
-            .map(|r| format!(" &mdash; {}", escape(r)))
+            .map(|r| format!(" &mdash; {}", escape_prose(r)))
             .unwrap_or_default();
         let link = c
             .link
@@ -743,7 +746,7 @@ fn debug_trace_block(position: usize, item: &RenderItem, tz: Tz) -> String {
             .unwrap_or_default();
         related_trace.push_str(&format!(
             r#"<div style="margin-top:4px;word-break:break-word;">&#8627; {} [{}]{reason}{link}</div>"#,
-            escape(&c.title),
+            escape_prose(&c.title),
             escape(c.source.as_str()),
         ));
     }
@@ -767,7 +770,7 @@ fn debug_trace_block(position: usize, item: &RenderItem, tz: Tz) -> String {
 /// definition) and no debug block. Format is purely a richness-driven rendering difference — a Note
 /// can still out-rank a Story (it's interleaved in global priority order).
 fn render_note_row(item: &RenderItem, tz: Tz) -> String {
-    let headline_text = escape(&item.headline);
+    let headline_text = escape_prose(&item.headline);
     let headline = match item.link.as_deref().and_then(safe_href) {
         Some(link) => format!(
             r#"<a href="{}" style="display:block;margin-top:8px;font-family:{SERIF};font-size:17px;font-weight:700;line-height:1.4;color:{INK};text-decoration:none;">{headline_text}</a>"#,
@@ -809,10 +812,10 @@ fn render_eyebrow(thread: Option<&ThreadTag>) -> String {
         // Budget the doubt: an Uncertain thread isn't worth an eyebrow line at all (§6.1/§10.4).
         ConfidenceBand::Uncertain => return String::new(),
     };
-    let label = escape(&tag.label);
+    let label = escape_prose(&tag.label);
     let delta = match &tag.delta {
         Some(d) if !d.trim().is_empty() => {
-            format!(r#" &nbsp;&middot;&nbsp; {}"#, escape(d))
+            format!(r#" &nbsp;&middot;&nbsp; {}"#, escape_prose(d))
         }
         _ => String::new(),
     };
@@ -873,6 +876,25 @@ fn escape(s: &str) -> String {
 /// close the attribute, after the same [`clean`]. (`encode_text` is *not* safe here — it leaves `"` intact.)
 fn escape_attr(s: &str) -> String {
     html_escape::encode_double_quoted_attribute(&clean(s)).into_owned()
+}
+
+/// HTML element-text encode for **editorial prose** — headlines, tldrs, labels, deltas, the lead, the
+/// fused-connection titles/reasons: any free text from the model or a feed. The last-line backstop to
+/// the summarizer's gate: [`defang`] rewrites any URL- or bare-domain-shaped token's dots to `[.]`
+/// *before* [`escape`], so even a leak the gate didn't reject — a baseline built from a feed title, a
+/// future field — can never reach the reader's mail client as something it would auto-linkify. Escaping
+/// alone can't stop that: it governs our own `<a>` tags, not the client's linkifier over displayed text.
+/// Not for `href` values (those are real links, allow-listed by [`safe_href`]) or chrome/enum labels.
+fn escape_prose(s: &str) -> String {
+    escape(&defang(s))
+}
+
+/// The plaintext counterpart to [`escape_prose`]: [`defang`] then [`clean`] (no markup to entity-encode,
+/// but the same Trojan-Source strip). The plaintext body is the harder case — it has no `<a>` tags at
+/// all, so the client's linkifier runs over raw text, and defang is the *only* thing keeping a
+/// domain-shaped token from going live.
+fn clean_prose(s: &str) -> String {
+    clean(&defang(s)).into_owned()
 }
 
 /// A feed-supplied URL we are willing to emit as a live `href` / link target, or `None` to render the
@@ -1439,6 +1461,52 @@ mod tests {
             SourceKind::Rss,
         );
         assert!(render_one(&ok).contains(r#"href="https://example.com/x""#));
+    }
+
+    #[test]
+    fn hallucinated_links_in_prose_are_defanged_in_both_views() {
+        // The exact failure that motivated this: the model wrote a bare domain (no scheme — which the
+        // old gate allowed) and a full URL into the headline/tldr, and the mail client auto-linkified
+        // them. Escaping can't stop a *client-side* linkifier, so the renderer's last-line defang must:
+        // neither body may carry a token a client would turn into a link; both show the inert `[.]` form.
+        let item = summarized(
+            "raw",
+            "Outage at acme.com hits logins",
+            "Mitigation tracked at https://status.acme.io/incidents per the team.",
+            None, // no real link — the only web addresses present are the hallucinated ones in prose
+            SourceKind::Rss,
+        );
+        let items = std::slice::from_ref(&item);
+        let html = render_one(&item);
+        let plain = render_plain(
+            Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
+            Tz::UTC,
+            "Hi.",
+            &compose_lead(items),
+            items,
+        );
+
+        for (view, body) in [("html", &html), ("plain", &plain)] {
+            // The live forms are gone (so no client linkifies them); the defanged forms are present.
+            assert!(
+                !body.contains("acme.com"),
+                "raw bare domain survived in {view}"
+            );
+            assert!(
+                !body.contains("https://status.acme.io"),
+                "raw URL survived in {view}"
+            );
+            assert!(body.contains("acme[.]com"), "missing defang in {view}");
+            assert!(
+                body.contains("status[.]acme[.]io"),
+                "missing defang in {view}"
+            );
+        }
+        // The plaintext body — no markup at all, the hardest case — holds nothing clickable-looking.
+        assert_eq!(
+            crate::common::link_safety::first_linkable_token(&plain),
+            None
+        );
     }
 
     #[test]

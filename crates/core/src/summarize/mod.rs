@@ -98,7 +98,9 @@ impl Default for SummarizationConfig {
             // with the "don't paste raw URLs" rule (+ the deterministic url_like_token gate), so the
             // corpus re-summarizes without the leaked raw source links. Bumped to 4 with the longer
             // tldr (2–4 sentences, wider token + gate budgets), so the corpus re-summarizes at length.
-            prompt_version: 4,
+            // Bumped to 5 when the URL rule widened to bare domains too, so the corpus re-summarizes
+            // without the bare-domain mentions a mail client would auto-linkify.
+            prompt_version: 5,
             headline_max_tokens: 24,
             tldr_max_tokens: 144,
             comprehension_max_tokens: 256,
@@ -590,10 +592,10 @@ pub enum GateViolation {
     UngroundedNumber(String),
     /// A banned hype word or second-person address slipped through (§3.6 denylist).
     BannedWord(String),
-    /// A raw URL (a scheme, or a `www.`/`mailto:` prefix) leaked into the prose. The model names sources;
-    /// it doesn't paste links (the interface carries them). Rejected because a pasted URL reads as an
-    /// artifact *and* because some mail clients auto-linkify one in displayed text — a link surface
-    /// outside the renderer's scheme allowlist. Bare domains (`databricks.com`) are allowed.
+    /// A clickable-looking token — an explicit URL (`://`, `www.`, `mailto:`) **or a bare domain**
+    /// (`databricks.com`) — leaked into the prose. The model names sources; it doesn't write links (the
+    /// interface carries them). Rejected because mail clients auto-linkify either form in displayed
+    /// text, a link surface outside the renderer's control entirely — see [`crate::common::link_safety`].
     UrlInProse(String),
     /// The headline or tldr exceeds its length budget.
     TooLong,
@@ -682,7 +684,8 @@ pub fn faithful(
     }
 
     // No web addresses in the prose: the model names sources and the interface carries the link, so a
-    // leaked URL is both an artifact and a client-autolink surface outside the renderer's allowlist.
+    // leaked URL — or bare domain — is both an artifact and a client-autolink surface the renderer
+    // can't keep inert (the client linkifies displayed text on its own). Reject; baseline is true.
     if let Some(u) = url_like_token(&output) {
         return Err(GateViolation::UrlInProse(u));
     }
@@ -706,27 +709,19 @@ pub fn banned_word_in(text: &str) -> Option<String> {
     None
 }
 
-/// The first raw-URL token in `text`, or `None` for clean prose — the deterministic backstop to the
-/// prompt's "don't paste raw URLs" rule, shared by the cluster/story gate and the label/delta cleaners.
+/// The first clickable-looking token in `text`, or `None` for clean prose — the deterministic backstop
+/// to the prompt's "no URLs, no bare domains" rule, shared by the cluster/story gate and the
+/// label/delta cleaners.
 ///
-/// Scoped to the unambiguous, autolink-prone forms only: a scheme (`://`), or a `www.`/`mailto:` prefix.
-/// **Bare links are allowed** — naming a source as `databricks.com` or `github.com/acme/auth` is fine and
-/// common in prose, and `escape`/`safe_href` keep the rendered output inert regardless. Only a pasted raw
-/// URL is rejected. This deliberately never trips on the filenames, ratios, and `.com` product names a
-/// developer digest is full of (`main.rs`, `9.5/10`, `Booking.com`): a leaked raw URL costs one baseline,
-/// while a clean summary is never thrown away over a bare domain.
+/// Detection lives in [`crate::common::link_safety`], the single source of truth shared with the
+/// renderer's defang backstop. It flags both explicit URLs (`://`, `www.`, `mailto:`) **and bare host
+/// shapes** (`databricks.com`, `github.com/acme/auth`): the original "bare domains are fine, escaping
+/// keeps them inert" reasoning was wrong — escaping governs *our* `<a>` tags, but the receiving mail
+/// client auto-linkifies a bare domain in displayed text on its own, which is exactly how a
+/// hallucinated `acme.com` became a live link. A flagged summary costs one deterministic baseline; the
+/// numeric finals of versions/ratios (`v2.0`, `9.5`) are spared, so true clean lines survive.
 pub fn url_like_token(text: &str) -> Option<String> {
-    for raw in text.split_whitespace() {
-        let tok = raw.trim_matches(|c: char| !c.is_alphanumeric());
-        // ASCII-case-insensitive prefix test, no per-token allocation.
-        let prefix = |p: &str| {
-            tok.len() >= p.len() && tok.as_bytes()[..p.len()].eq_ignore_ascii_case(p.as_bytes())
-        };
-        if tok.contains("://") || prefix("www.") || prefix("mailto:") {
-            return Some(tok.to_string());
-        }
-    }
-    None
+    crate::common::link_safety::first_linkable_token(text)
 }
 
 /// Whole-word, case-insensitive containment: `needle` (already lowercase) bounded by non-alphanumeric
@@ -805,8 +800,9 @@ You rephrase the facts. You add nothing.
    reportedly, proposed). asserted -> say it plainly. Never change a fact's certainty.
 4. Plain words. Active voice. Do not use: massive, huge, critical (unless in the
    source), game-changing, exciting, "!", "you", "we".
-5. Don't paste raw URLs (no "http://...", no "www..."). Name sources plainly;
-   the reader's interface shows the link.
+5. No web addresses at all: no URLs ("http://...", "www...") and no bare domains
+   ("acme.com", "github.com/x"). Name sources plainly; the reader's interface shows
+   the link.
 6. Output only the JSON the schema asks for. No preamble.
 
 EXAMPLES
@@ -1900,37 +1896,44 @@ mod tests {
     }
 
     #[test]
-    fn url_like_token_catches_raw_urls_only() {
-        // Only the unambiguous raw-URL forms are caught: a scheme, or a www./mailto: prefix.
+    fn url_like_token_catches_urls_and_bare_domains() {
+        // Explicit URL forms: a scheme, or a www./mailto: prefix.
         assert!(url_like_token("see https://www.databricks.com/x for more").is_some());
         assert!(url_like_token("reach us at www.example.org").is_some());
         assert!(url_like_token("mail mailto:ops@example.com now").is_some());
-        // The jammed-together leakage (domain glued to a scheme URL) still trips on the scheme.
-        assert!(url_like_token("databricks.comhttps://www.databricks.com/l").is_some());
         // Case-insensitive prefix; trailing punctuation doesn't hide a scheme.
         assert!(url_like_token("(see HTTPS://example.com).").is_some());
         assert!(url_like_token("WWW.example.com").is_some());
 
-        // Bare links are ALLOWED — a named source (domain or domain/path) is fine, as are the
-        // filenames, ratios, and product names a developer digest is full of.
-        for ok in [
+        // Bare domains are now caught too — a mail client auto-linkifies them in displayed text, so a
+        // named source written as a domain is the very leak we're closing.
+        for leak in [
             "published on databricks.com today",
             "at github.com/acme/auth/pull/1",
             "(see status.claude.com).",
             "the Booking.com outage",
             "the fix landed in main.rs after review",
-            "see README.md for the steps",
-            "an ASP.NET handler regressed",
-            "Node.js 22 shipped",
+        ] {
+            assert!(
+                url_like_token(leak).is_some(),
+                "missed a bare domain in: {leak}"
+            );
+        }
+
+        // Spared: versions, ratios, and abbreviations a developer digest is full of stay clean, so a
+        // true line is never thrown away over a non-link.
+        for ok in [
             "rated 9.5/10 by users",
             "a 24/7 on-call rotation",
+            "shipped in v2.0 this week",
+            "see, e.g., the changelog",
         ] {
             assert!(url_like_token(ok).is_none(), "false positive on: {ok}");
         }
     }
 
     #[test]
-    fn gate_rejects_a_raw_url_but_allows_a_bare_domain() {
+    fn gate_rejects_a_url_or_a_bare_domain() {
         let facts = Facts::default();
         let leaked = ClusterSummary {
             headline: "Databricks launches LTAP".to_string(),
@@ -1942,13 +1945,16 @@ mod tests {
             Err(GateViolation::UrlInProse(_))
         ));
 
-        // A bare domain named in prose is allowed (it passes the URL check).
+        // A bare domain named in prose is now rejected too — the client would linkify it.
         let bare = ClusterSummary {
             headline: "Databricks launches LTAP".to_string(),
             tldr_text: "Databricks announced LTAP on databricks.com.".to_string(),
             ..Default::default()
         };
-        assert!(faithful(&bare, &facts, "Databricks announced LTAP").is_ok());
+        assert!(matches!(
+            faithful(&bare, &facts, "Databricks announced LTAP"),
+            Err(GateViolation::UrlInProse(_))
+        ));
     }
 
     #[test]
@@ -2100,7 +2106,7 @@ mod tests {
     #[test]
     fn summary_model_string() {
         let cfg = SummarizationConfig::default();
-        assert_eq!(cfg.summary_model(), "qwen3.5-4b-instruct@4");
+        assert_eq!(cfg.summary_model(), "qwen3.5-4b-instruct@5");
     }
 
     // ── Phase C — story synthesis ────────────────────────────────────────────────────────────────
