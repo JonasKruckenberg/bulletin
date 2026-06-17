@@ -96,10 +96,11 @@ impl Default for SummarizationConfig {
             // Bumped to 2 with the comprehension pass: facts now carry event_type/state/certainty, so
             // a re-summarize of the corpus picks up the richer (and hedge-aware) phrasing. Bumped to 3
             // with the "don't paste raw URLs" rule (+ the deterministic url_like_token gate), so the
-            // corpus re-summarizes without the leaked raw source links.
-            prompt_version: 3,
+            // corpus re-summarizes without the leaked raw source links. Bumped to 4 with the longer
+            // tldr (2–4 sentences, wider token + gate budgets), so the corpus re-summarizes at length.
+            prompt_version: 4,
             headline_max_tokens: 24,
-            tldr_max_tokens: 96,
+            tldr_max_tokens: 144,
             comprehension_max_tokens: 256,
             temperature: 0.2,
             seed: 42,
@@ -277,7 +278,7 @@ pub struct ClusterSummary {
     /// Abstractive headline, ≤ ~90 chars (the schema's `maxLength`).
     #[serde(default)]
     pub headline: String,
-    /// The structured 1–2 sentence tldr as a run-list of text + grounded entity refs (§6.2).
+    /// The structured 2–4 sentence tldr as a run-list of text + grounded entity refs (§6.2).
     #[serde(default)]
     pub tldr: Vec<TldrRun>,
     /// Flat concatenation of the tldr's runs — for the plaintext email + inbox preview (§6.2).
@@ -633,8 +634,8 @@ pub fn faithful(
 ) -> Result<(), GateViolation> {
     /// Headline budget (chars) — matches the schema `maxLength` (§3.3).
     const HEADLINE_MAX: usize = 90;
-    /// tldr budget (chars) — 1–2 sentences.
-    const TLDR_MAX: usize = 320;
+    /// tldr budget (chars) — 2–4 sentences.
+    const TLDR_MAX: usize = 480;
 
     if summary.headline.chars().count() > HEADLINE_MAX
         || summary.tldr_text.chars().count() > TLDR_MAX
@@ -833,7 +834,7 @@ pub fn user_prompt(facts: &Facts, source_text: &str) -> String {
          allowed entity ids (use only these for refs): {entity_list}\n\
          source:\n{source_text}\n\n\
          Write: headline (<= 90 chars): the one most important thing. \
-         tldr (1-2 sentences): what happened, the impact, the current state."
+         tldr (2-4 sentences): what happened, the impact, the current state."
     )
 }
 
@@ -1054,7 +1055,7 @@ pub fn story_user_prompt(facts: &Facts, members_text: &str, thread_label: Option
          allowed entity ids (use only these for refs): {entity_list}\n\
          member summaries:\n{members_text}\n\n\
          These are the same happening across sources. Write one headline (<= 90 chars) and one \
-         tldr (1-2 sentences) for the whole thing. Do not list the sources."
+         tldr (2-4 sentences) for the whole thing. Do not list the sources."
     )
 }
 
@@ -2099,7 +2100,7 @@ mod tests {
     #[test]
     fn summary_model_string() {
         let cfg = SummarizationConfig::default();
-        assert_eq!(cfg.summary_model(), "qwen3.5-4b-instruct@3");
+        assert_eq!(cfg.summary_model(), "qwen3.5-4b-instruct@4");
     }
 
     // ── Phase C — story synthesis ────────────────────────────────────────────────────────────────
