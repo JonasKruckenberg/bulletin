@@ -16,8 +16,10 @@ thread-weighting = []
 # deterministic baseline ships and the whole feature (including the client) compiles out, mirroring
 # `thread-weighting`. The pure logic (content hash, faithfulness gate, prompt/schema, deterministic
 # fallback) is always compiled and unit-tested regardless of the feature; only the DB sweep and the
-# network call are gated. No new dependency: the client rides the existing `reqwest`.
-llm-summarization = []
+# network call are gated. The client rides the existing `reqwest`; the one dependency the feature adds
+# is `metrics`, for the `bulletin_llm_*` instrumentation — optional, so the deterministic build that
+# compiles the model edge out never pulls it in.
+llm-summarization = ["dep:metrics"]
 
 [dependencies]
 anyhow      = { workspace = true }
@@ -37,6 +39,7 @@ base64            = { workspace = true }
 sqlx        = { workspace = true }
 tokio       = { workspace = true }
 tracing     = { workspace = true }
+metrics     = { workspace = true, optional = true }  # `bulletin_llm_*`, pulled in by `llm-summarization`
 reqwest          = { workspace = true }
 rss              = { workspace = true }
 atom_syndication = { workspace = true }

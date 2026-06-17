@@ -547,6 +547,7 @@ dependencies = [
  "hmac",
  "jsonwebtoken",
  "lettre",
+ "metrics",
  "proptest",
  "reqwest",
  "rss",
