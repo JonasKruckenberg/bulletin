@@ -233,10 +233,14 @@ pub async fn authored_lead(
     threads: &[String],
 ) -> Option<String> {
     // The grounding the lead's numbers are checked against: the same headlines + thread labels it is
-    // composed from (joined as the model sees them).
+    // composed from. A big-picture lead naturally cites a count ("…and 6 other updates"), so the digest's
+    // own item counts — the total and the "N others" (total − 1) — are grounded too; without them the
+    // §3.4 numeric gate would reject every count-bearing lead (the deterministic lead is built around one).
+    let total = headlines.len();
     let mut grounding = headlines.join("\n");
     grounding.push('\n');
     grounding.push_str(&threads.join("\n"));
+    grounding.push_str(&format!("\n{total} {}", total.saturating_sub(1)));
 
     let out = chat_json::<LeadOutput>(
         cfg,

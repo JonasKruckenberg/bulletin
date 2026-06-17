@@ -177,6 +177,11 @@ impl SummarizationConfig {
         if let Some(b) = env_bool("BULLETIN_LLM_DISABLE_THINKING") {
             cfg.disable_thinking = b;
         }
+        // The lead deadline only bounds the punctual send if it sits at or under the per-call HTTP
+        // timeout — past that, `request_timeout` is the real cap and the "at most `lead_deadline`"
+        // guarantee is silently false. Clamp so a misconfigured (or default-vs-lowered-timeout) value
+        // can never exceed it.
+        cfg.lead_deadline = cfg.lead_deadline.min(cfg.request_timeout);
         cfg
     }
 }
@@ -630,6 +635,23 @@ const BANNED_WORDS: &[&str] = &[
     "our",
 ];
 
+/// Token-equality numeric grounding (§3.4), shared by the cluster/story faithfulness gate
+/// ([`faithful`]) and the Phase-D lead gate ([`clean_lead`]) so the two can never drift on what counts
+/// as a grounded number. Returns the first numeric/date token in `output` that does **not** appear (as
+/// the same token, case-insensitively) anywhere in `grounding`, or `None` when every number in the
+/// output is grounded. Both sides go through [`tokenize_numeric`], so they agree on token boundaries and
+/// on unit-suffix stripping ("40m" → "40") — and token-equality (not substring) means an output "40" is
+/// never falsely grounded by a `grounding` "4000".
+fn first_ungrounded_number(output: &str, grounding: &str) -> Option<String> {
+    let grounded: std::collections::HashSet<String> = tokenize_numeric(grounding)
+        .into_iter()
+        .map(|t| t.to_lowercase())
+        .collect();
+    tokenize_numeric(output)
+        .into_iter()
+        .find(|tok| !grounded.contains(&tok.to_lowercase()))
+}
+
 /// The deterministic faithfulness gate (§3.4): the model may *drop* a fact but never *add* one, and
 /// must stay in the house voice. A cheap, post-generation check that
 ///
@@ -669,8 +691,7 @@ pub fn faithful(
 
     // Numbers/dates: every numeric token in the output must be grounded — appear as the *same token*
     // in the facts' numbers/dates or the source text. Token-equality, not substring, so an output "40"
-    // is never falsely grounded by a source "4000". Both sides go through `tokenize_numeric`, so they
-    // agree on token boundaries and on the unit-suffix stripping ("40m" → "40").
+    // is never falsely grounded by a source "4000" (see [`first_ungrounded_number`]).
     let mut grounding: String = facts
         .numbers
         .iter()
@@ -680,15 +701,9 @@ pub fn faithful(
         .join(" ");
     grounding.push(' ');
     grounding.push_str(source_text);
-    let grounded: std::collections::HashSet<String> = tokenize_numeric(&grounding)
-        .into_iter()
-        .map(|t| t.to_lowercase())
-        .collect();
     let output = format!("{} {}", summary.headline, summary.tldr_text);
-    for tok in tokenize_numeric(&output) {
-        if !grounded.contains(&tok.to_lowercase()) {
-            return Err(GateViolation::UngroundedNumber(tok));
-        }
+    if let Some(tok) = first_ungrounded_number(&output, &grounding) {
+        return Err(GateViolation::UngroundedNumber(tok));
     }
 
     // House-voice lint (§3.6 denylist), whole-word + case-insensitive.
@@ -1159,7 +1174,8 @@ const DELTA_MAX: usize = 48;
 /// Max words for a delta flag (§3.6 "≤6 words: a flag, not a sentence").
 const DELTA_MAX_WORDS: usize = 6;
 /// Max chars for the big-picture lead (§2.4/§3.6 "1–2 sentences"). Matches the schema `maxLength`; the
-/// cleaner clamps to it as defense in depth.
+/// cleaner rejects output exceeding it (defense in depth behind the grammar, degrading to the
+/// deterministic lead — it does not truncate a half-sentence).
 const LEAD_MAX: usize = 320;
 
 /// Clean + gate a model-produced thread **label** (§3.6 backstop): trim, reject empties, over-length
@@ -1314,16 +1330,11 @@ pub fn clean_lead(raw: &str, grounding: &str) -> Option<String> {
     if banned_word_in(s).is_some() || url_like_token(s).is_some() {
         return None;
     }
-    // Numbers must be grounded in the inputs (token-equality, the §3.4 machinery), so a number that
-    // wasn't in any selected headline can't reach the lead.
-    let grounded: std::collections::HashSet<String> = tokenize_numeric(grounding)
-        .into_iter()
-        .map(|t| t.to_lowercase())
-        .collect();
-    for tok in tokenize_numeric(s) {
-        if !grounded.contains(&tok.to_lowercase()) {
-            return None;
-        }
+    // Numbers must be grounded in the inputs (the shared §3.4 token-equality check), so a number that
+    // wasn't in any selected headline / thread label (nor the item-count grounding the caller appends)
+    // can't reach the lead.
+    if first_ungrounded_number(s, grounding).is_some() {
+        return None;
     }
     Some(s.to_string())
 }
@@ -2393,6 +2404,24 @@ mod tests {
         assert!(clean_lead("See https://example.com for details.", grounding).is_none());
         // An ungrounded number (not in any selected headline) is rejected — no invented quantity.
         assert!(clean_lead("An auth outage hit 99% of logins.", grounding).is_none());
+
+        // A count-bearing lead ("6 other updates") passes only when the count is in the grounding —
+        // the contract `authored_lead` upholds by appending the digest's item counts (fix for the
+        // gate rejecting every count-bearing big-picture lead).
+        assert!(clean_lead(
+            "An auth outage led the day; 6 other updates followed.",
+            grounding
+        )
+        .is_none());
+        let with_count = format!("{grounding}\n7 6");
+        assert_eq!(
+            clean_lead(
+                "An auth outage led the day; 6 other updates followed.",
+                &with_count
+            )
+            .as_deref(),
+            Some("An auth outage led the day; 6 other updates followed.")
+        );
     }
 
     #[test]
