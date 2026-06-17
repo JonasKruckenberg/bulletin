@@ -820,19 +820,22 @@ fn render_eyebrow(thread: Option<&ThreadTag>) -> String {
 /// never legitimately appear in a calm editorial digest line and that "renders weirdly" (or worse) when
 /// it does:
 ///
-/// - **C0/C1 control codes** (`U+0000`–`U+001F` except tab/newline, `U+007F`–`U+009F`) — non-printing
-///   bytes that can smuggle a scheme past a URL check or break a line mid-field;
+/// - **C0/C1 control codes** (`U+0000`–`U+001F`, `U+007F`–`U+009F`) — non-printing bytes that can
+///   smuggle a scheme past a URL check or, in the plaintext view, **forge a line**: a newline in an
+///   untrusted headline would inject an attacker-controlled row outside the numbered list (the HTML view
+///   collapses whitespace, the plaintext view does not, so the control chars must go before either);
 /// - **bidi embeddings, overrides and isolates** (`U+202A`–`U+202E`, `U+2066`–`U+2069`) — the
 ///   Trojan-Source / spoofing family that visually reorders text so a headline reads as something it
 ///   isn't;
 /// - **zero-width and join controls + BOM** (`U+200B`–`U+200F`, `U+2060`–`U+2064`, `U+FEFF`) — invisible
 ///   characters that hide content or split words the eye can't see.
 ///
-/// Tab (`U+0009`) and newline (`U+000A`) are kept — they're legitimate whitespace that HTML collapses
-/// harmlessly. Everything else printable passes through to [`escape`].
+/// Tab and newline are stripped along with the rest of the C0 range: these are single-line digest fields
+/// (headline, tldr, label, delta, connection title), so an embedded tab/newline is never legitimate and
+/// is exactly what enables plaintext line-forgery. Everything else printable passes through to [`escape`].
 fn is_unsafe_char(c: char) -> bool {
     matches!(c,
-        '\u{0000}'..='\u{0008}' | '\u{000B}'..='\u{001F}' | '\u{007F}'..='\u{009F}'
+        '\u{0000}'..='\u{001F}' | '\u{007F}'..='\u{009F}'
         | '\u{200B}'..='\u{200F}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}'
         | '\u{202A}'..='\u{202E}' | '\u{FEFF}'
     )
@@ -1452,9 +1455,10 @@ mod tests {
     fn plaintext_lead_and_fields_are_stripped_of_control_chars() {
         // The plaintext lead is composed from (LLM) headlines and has no markup to escape, but bidi /
         // zero-width characters must still be stripped so they can't reorder or hide the line.
+        // The headline also carries an embedded newline (line-forgery) and tab.
         let items = vec![summarized(
             "raw",
-            "Headline\u{202E}flip\u{200B}",
+            "Headline\u{202E}flip\u{200B}\nFORGED LINE\there",
             "Body\u{202E}text",
             Some("javascript:alert(1)"),
             SourceKind::Rss,
@@ -1468,6 +1472,10 @@ mod tests {
         );
         assert!(!plain.contains('\u{202E}'));
         assert!(!plain.contains('\u{200B}'));
+        // The embedded newline/tab are stripped, so the injected text can't forge a separate line: no
+        // plaintext line begins with the attacker's "FORGED LINE" — it stays inside the headline row.
+        assert!(!plain.contains('\t'));
+        assert!(!plain.lines().any(|l| l.starts_with("FORGED LINE")));
         // The unsafe-schemed link is dropped from the plaintext view too (never shown, even as text).
         assert!(!plain.contains("javascript:"));
     }

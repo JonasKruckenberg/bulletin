@@ -77,7 +77,7 @@ async fn insert_private(
 /// minus rendering) — so `thread_maintenance` has stories to read.
 async fn build_stories(pool: &PgPool, subscriber: Uuid) {
     build_private(pool, subscriber).await.unwrap();
-    let clusters = link::store::candidate_clusters(pool, subscriber, None, 3650)
+    let clusters = link::store::candidate_clusters(pool, subscriber, None, 3650, false)
         .await
         .unwrap();
     let prior = link::store::load_prior_members(pool, subscriber)
