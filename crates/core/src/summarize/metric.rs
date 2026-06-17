@@ -10,17 +10,16 @@ use std::time::Duration;
 
 use super::GateViolation;
 
-/// One completed sidecar chat call: wall-time into the latency histogram (keyed by `phase` *only*, so
-/// a fast `connect` failure isn't mixed into the same distribution as a real multi-second generation)
-/// plus an outcome counter (keyed by `phase` + `outcome`) for the success/error split. `phase` is the
-/// call site — `summarize` | `comprehend` | `synthesize` | `label` | `delta`; `outcome` is `ok` or the
-/// [`failure_kind`](super::client) bucket (`timeout` | `connect` | `status` | `decode` | `transport` |
-/// `response`). The histogram's `_count` is total calls per phase; the counter splits that by outcome.
+/// One completed sidecar chat call: wall-time into the latency histogram, keyed by `phase` + `outcome`.
+/// `phase` is the call site — `summarize` | `comprehend` | `synthesize` | `label` | `delta`; `outcome`
+/// is `ok` or the [`failure_kind`](super::client) bucket (`timeout` | `connect` | `status` | `decode` |
+/// `transport` | `response`). The `outcome` label is what keeps the latency view honest: a near-instant
+/// `connect` failure and a 120s `timeout` are recorded too, so without it they would blend into the
+/// generation-latency distribution — filter `outcome="ok"` for clean prompt latency. The histogram's
+/// `_count{phase,outcome}` doubles as the per-outcome call total, so no separate counter is needed.
 pub fn llm_call(phase: &'static str, outcome: &'static str, elapsed: Duration) {
-    metrics::histogram!("bulletin_llm_call_duration_seconds", "phase" => phase)
+    metrics::histogram!("bulletin_llm_call_duration_seconds", "phase" => phase, "outcome" => outcome)
         .record(elapsed.as_secs_f64());
-    metrics::counter!("bulletin_llm_calls_total", "phase" => phase, "outcome" => outcome)
-        .increment(1);
 }
 
 /// The token usage the sidecar reported for one call (the OpenAI-compatible `usage` block), split into

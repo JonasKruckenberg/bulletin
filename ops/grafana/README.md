@@ -37,10 +37,12 @@ datasource (the dashboard exposes a `datasource` variable, so it isn't pinned to
 - **The `bulletin_llm_*` series only exist in a `llm-summarization` build.** They are recorded from
   `bulletin-core` at the single `chat_json` choke point all five `phase`s route through
   (`summarize` | `comprehend` | `synthesize` | `label` | `delta`). `bulletin_llm_call_duration_seconds`
-  is keyed on `phase` only (so a fast `connect` failure doesn't skew the latency distribution); the
-  success/error split lives on `bulletin_llm_calls_total{outcome}`, whose `outcome` reuses the same
-  buckets as the structured logs (`ok` | `timeout` | `connect` | `status` | `decode` | `transport` |
-  `response`). Token counts come from the sidecar's `usage` block and are absent if it omits one.
+  is keyed on `phase` + `outcome` — every call is timed, including failures, so **filter `outcome="ok"`
+  for clean prompt latency** (an instant `connect` failure and a 120s `timeout` are in there too). The
+  `outcome` reuses the structured-log buckets (`ok` | `timeout` | `connect` | `status` | `decode` |
+  `transport` | `response`), and the histogram's `_count{phase,outcome}` doubles as the per-outcome
+  call total (there is no separate calls counter). Token counts come from the sidecar's `usage` block
+  and are absent if it omits one.
 - **The LLM path is best-effort and off the punctual path.** A failed call or a gate rejection
   degrades that cluster/story to its deterministic baseline — never a late or wrong digest. Treat the
   LLM panels as quality/efficiency signals, not delivery SLOs: page on the delivery/queue rows, watch
@@ -57,7 +59,7 @@ datasource (the dashboard exposes a `datasource` variable, so it isn't pinned to
 | Ingestion stalled | `time() - max(bulletin_last_ingest_timestamp_seconds) > 86400` | 0m |
 | Connections errored | `bulletin_connections_errored > 0` | 30m |
 | Metrics going stale | `increase(bulletin_status_gather_failures_total[15m]) > 0` | 0m |
-| LLM sidecar unreachable | `sum(rate(bulletin_llm_calls_total{outcome=~"connect|timeout"}[10m])) / clamp_min(sum(rate(bulletin_llm_calls_total[10m])), 1) > 0.5` | 15m |
+| LLM sidecar unreachable | `sum(rate(bulletin_llm_call_duration_seconds_count{outcome=~"connect|timeout"}[10m])) / clamp_min(sum(rate(bulletin_llm_call_duration_seconds_count[10m])), 1) > 0.5` | 15m |
 
 Tune the "no deliveries" / "ingestion stalled" thresholds to your slowest cadence (weekly digests,
 slow feeds). The LLM-sidecar alert only fires where `llm-summarization` is deployed — skip it

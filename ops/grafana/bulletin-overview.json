@@ -1571,7 +1571,7 @@
       "id": 31,
       "type": "stat",
       "title": "LLM call error ratio (5m)",
-      "description": "Non-ok outcomes over all sidecar calls (bulletin_llm_calls_total). Best-effort path — a failed call degrades that cluster to baseline, so a low steady rate is tolerable; a spike means the local sidecar is down (connect), slow (timeout), or erroring. Empty unless built with --features llm-summarization.",
+      "description": "Non-ok outcomes over all sidecar calls (bulletin_llm_call_duration_seconds_count, the histogram's per-outcome count). Best-effort path — a failed call degrades that cluster to baseline, so a low steady rate is tolerable; a spike means the local sidecar is down (connect), slow (timeout), or erroring. Empty unless built with --features llm-summarization.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1588,7 +1588,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(bulletin_llm_calls_total{outcome!=\"ok\"}[5m])) / clamp_min(sum(rate(bulletin_llm_calls_total[5m])), 1)",
+          "expr": "sum(rate(bulletin_llm_call_duration_seconds_count{outcome!=\"ok\"}[5m])) / clamp_min(sum(rate(bulletin_llm_call_duration_seconds_count[5m])), 1)",
           "refId": "A",
           "legendFormat": "err ratio",
           "instant": true,
@@ -1726,7 +1726,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(bulletin_llm_gate_rejections_total[5m])) / clamp_min(sum(rate(bulletin_llm_calls_total{phase=~\"summarize|synthesize\",outcome=\"ok\"}[5m])), 1)",
+          "expr": "sum(rate(bulletin_llm_gate_rejections_total[5m])) / clamp_min(sum(rate(bulletin_llm_call_duration_seconds_count{phase=~\"summarize|synthesize\",outcome=\"ok\"}[5m])), 1)",
           "refId": "A",
           "legendFormat": "reject ratio",
           "instant": true,
@@ -1839,7 +1839,7 @@
       "id": 35,
       "type": "timeseries",
       "title": "LLM call latency p50 / p95 / p99 by phase",
-      "description": "Real histogram quantiles of per-call wall time, keyed by phase (summarize | comprehend | synthesize | label | delta). bulletin_llm_call_duration_seconds ships explicit buckets (set in metric::init), so histogram_quantile works and aggregates across replicas. Latency is keyed on phase only — a fast connect failure doesn't distort the distribution; the success/error split lives on the next panel.",
+      "description": "Real histogram quantiles of per-call wall time, by phase (summarize | comprehend | synthesize | label | delta). bulletin_llm_call_duration_seconds ships explicit buckets (set in metric::init), so histogram_quantile works and aggregates across replicas. Filtered to outcome=\"ok\" so failure latencies (instant connect, 120s timeout) don't distort the prompt-latency distribution — drop the filter to see failures too, or break down by outcome on the next panel.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1856,7 +1856,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.50, sum by (le, phase) (rate(bulletin_llm_call_duration_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.50, sum by (le, phase) (rate(bulletin_llm_call_duration_seconds_bucket{outcome=\"ok\"}[5m])))",
           "refId": "A",
           "legendFormat": "p50 {{phase}}"
         },
@@ -1865,7 +1865,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, phase) (rate(bulletin_llm_call_duration_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, phase) (rate(bulletin_llm_call_duration_seconds_bucket{outcome=\"ok\"}[5m])))",
           "refId": "B",
           "legendFormat": "p95 {{phase}}"
         },
@@ -1874,7 +1874,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.99, sum by (le, phase) (rate(bulletin_llm_call_duration_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.99, sum by (le, phase) (rate(bulletin_llm_call_duration_seconds_bucket{outcome=\"ok\"}[5m])))",
           "refId": "C",
           "legendFormat": "p99 {{phase}}"
         }
@@ -1912,7 +1912,7 @@
       "id": 36,
       "type": "timeseries",
       "title": "LLM calls by phase & outcome",
-      "description": "Per-second sidecar calls split by phase and outcome (ok | timeout | connect | status | decode | transport | response). 'connect' = sidecar down, 'timeout' = sidecar slow, 'response' = answered but unusable (malformed/empty). The histogram's _count is the per-phase total; this is its outcome breakdown.",
+      "description": "Per-second sidecar calls split by phase and outcome (ok | timeout | connect | status | decode | transport | response), from the latency histogram's _count series. 'connect' = sidecar down, 'timeout' = sidecar slow, 'response' = answered but unusable (malformed/empty).",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1929,7 +1929,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (phase, outcome) (rate(bulletin_llm_calls_total[5m]))",
+          "expr": "sum by (phase, outcome) (rate(bulletin_llm_call_duration_seconds_count[5m]))",
           "refId": "A",
           "legendFormat": "{{phase}} · {{outcome}}"
         }

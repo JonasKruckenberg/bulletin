@@ -344,8 +344,9 @@ async fn chat_json<T: serde::de::DeserializeOwned>(
     schema: serde_json::Value,
 ) -> anyhow::Result<T> {
     // Time and tally every call at the single choke point all five phases route through. The latency
-    // histogram is keyed on `phase` alone; the outcome (`ok` or the `failure_kind` bucket) lands on the
-    // companion counter, so a fast `connect` failure doesn't distort the generation-latency distribution.
+    // histogram is keyed on `phase` + `outcome`, so the percentiles can be read clean (filter
+    // `outcome="ok"`) without losing the failure latencies — a fast `connect` failure and a 120s
+    // `timeout` are recorded too, under their own outcome.
     let started = std::time::Instant::now();
     let result = chat_json_inner(cfg, http, phase, system, user, max_tokens, schema).await;
     let outcome = match &result {

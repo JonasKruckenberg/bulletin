@@ -18,11 +18,11 @@
 
 #[cfg(feature = "llm-summarization")]
 pub mod client;
-#[cfg(feature = "llm-summarization")]
-pub(crate) mod store;
 /// The `bulletin_llm_*` recorders for the summarization path; gated with the rest of the model edge.
 #[cfg(feature = "llm-summarization")]
 mod metric;
+#[cfg(feature = "llm-summarization")]
+pub(crate) mod store;
 
 use std::time::Duration;
 
