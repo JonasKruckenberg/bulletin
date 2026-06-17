@@ -7,6 +7,7 @@
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
+use bulletin_core::digest::subscriber::Recurrence;
 use clap::Subcommand;
 use prost_types::Timestamp;
 use tonic::metadata::{Ascii, MetadataValue};
@@ -254,10 +255,12 @@ pub async fn run(
                 println!("no subscribers");
             }
             for s in rows {
-                // Reconstruct the cadence label from (freq, weekday) the way `Recurrence::label` would.
-                let cadence = match (s.freq.as_str(), s.weekday) {
-                    ("weekly", Some(d)) => format!("weekly({})", weekday_name(d)),
-                    (f, _) => f.to_string(),
+                // Rebuild the core `Recurrence` from the (freq, weekday) columns and let *it* format
+                // the cadence, so the label stays identical to the scheduled path (no client-side
+                // reimplementation to drift from `Recurrence::label`). weekday is present iff weekly.
+                let cadence = match s.weekday {
+                    Some(weekday) => Recurrence::Weekly { weekday }.label(),
+                    None => Recurrence::Daily.label(),
                 };
                 println!(
                     "{}\t{}\t{}\t{}\t{} {}\tmax={}\tnext={}\tlast={}",
@@ -476,14 +479,6 @@ fn fmt_ts(t: &Timestamp) -> String {
     chrono::DateTime::from_timestamp(t.seconds, t.nanos as u32)
         .map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string())
         .unwrap_or_else(|| "?".to_string())
-}
-
-/// `0=Sun .. 6=Sat` → its short name, mirroring the schedule vocabulary.
-fn weekday_name(d: i32) -> &'static str {
-    ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
-        .get(d as usize)
-        .copied()
-        .unwrap_or("?")
 }
 
 /// Reconstruct core's `ScoringConfig` from the wire shape so the JSON `debug config` prints is the

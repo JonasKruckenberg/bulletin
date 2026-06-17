@@ -60,8 +60,9 @@ let
     export BULLETIN_API_ADDR="''${BULLETIN_API_ADDR:-${cfg.api.addr}}"
     ${lib.optionalString (cfg.api.adminKeyFile != null) ''
       # Source the admin bearer so `debug` authenticates to the API (file must be bulletin-readable).
-      if [ -r ${toString cfg.api.adminKeyFile} ]; then
-        set -a; . ${toString cfg.api.adminKeyFile}; set +a
+      # Quote the path so a directory with spaces doesn't word-split into a silent auth failure.
+      if [ -r "${toString cfg.api.adminKeyFile}" ]; then
+        set -a; . "${toString cfg.api.adminKeyFile}"; set +a
       fi
     ''}
     exec ${lib.getExe cfg.package} "$@"

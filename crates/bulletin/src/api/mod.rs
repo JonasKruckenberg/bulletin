@@ -63,10 +63,15 @@ pub async fn serve(
         .build_v1()
         .context("build gRPC reflection service")?;
 
-    // Standard grpc.health.v1 probe alongside `serve`'s HTTP /health.
+    // Standard grpc.health.v1 probe alongside `serve`'s HTTP /health. Mark *both* services serving so a
+    // per-service health check (`grpc_health_probe -service bulletin.v1.UnstableDebugService`) doesn't
+    // read the live debug plane as down.
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter
         .set_serving::<AdminServiceServer<admin::AdminApi>>()
+        .await;
+    health_reporter
+        .set_serving::<UnstableDebugServiceServer<admin::AdminApi>>()
         .await;
 
     tracing::info!(%addr, "gRPC API listening");
