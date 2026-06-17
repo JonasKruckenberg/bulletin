@@ -1,16 +1,18 @@
 # Digest System — LLM Summarization
 
-**Status:** Design doc (2026-06-15). **Phases A–C implemented** (A: 2026-06-15; B + C + the §6
-four-zone email redesign: 2026-06-16) — the cluster/story/thread schema, the write-side summarization
+**Status:** Design doc (2026-06-15). **Phases A–D implemented** (A: 2026-06-15; B + C + the §6
+four-zone email redesign: 2026-06-16; D: 2026-06-17) — the cluster/story/thread schema, the write-side summarization
 pipeline (content hash → grammar-constrained sidecar → faithfulness gate → deterministic baseline), the
 hierarchical pre-summarization (cluster → story synthesis → thread label/delta), and the redesigned item
 row (context eyebrow / headline / grounded summary with entity badges / provenance), behind the
 `llm-summarization` cargo feature as the **sole, compile-time** kill switch (no runtime flag — §2.5's "+
 runtime flag" was dropped in build), off by default. **One deliberate deviation from §6.1:** the amber
 debug block is **kept and enriched** (summary provenance/band, thread label/delta, fused connections),
-not deleted — the audit trace stays in-email for now. **Phase D** (the authored big-picture lead)
-remains. See [`llm-summarization-handoff.md`](llm-summarization-handoff.md) for what's built and the
-next-phase TODO.
+not deleted — the audit trace stays in-email for now. **Phase D** (the authored big-picture lead) was
+implemented 2026-06-17 — the deterministic fire-time lead is now the fallback beneath an optional,
+deadline-bounded best-effort editor's note (the one model call on the punctual path), persisted to the
+new `digest.lead` column. See [`llm-summarization-handoff.md`](llm-summarization-handoff.md) for what's
+built and the next-phase TODO.
 Promotes the roadmap-deferred *LLM
 summarization* item (design §9.5, roadmap M6 backlog) into a concrete build plan, now that the email
 template has summary slots to fill (`digest/render.rs` — the three lorem-ipsum placeholders).
@@ -544,9 +546,16 @@ layer uses.
   member-signature (`summarize::sweep_stories` in the per-subscriber pass); upgrades the item summary
   from the representative-cluster fallback to a fused multi-source rewrite for recurring stories
   (degrading to the representative cluster on cold-start / a down sidecar).
-- **Phase D — Authored big-picture lead (optional).** Replace the deterministic lead with a
-  deadline-bounded best-effort "editor's note" over the selected items' summaries, deterministic lead as
-  the fallback. Only worth it if the templated lead proves too flat.
+- **Phase D — Authored big-picture lead (optional).** ✅ *Implemented 2026-06-17.* Migration `030` adds
+  `digest.lead` (nullable; persisted for explainability parity with `digest.decisions`). The deterministic
+  Phase-A lead becomes the **fallback**: `digest::generate` now composes a deadline-bounded best-effort
+  "editor's note" (`summarize::client::authored_lead` over the selected items' headlines + the threads
+  they advance, `LEAD_SYSTEM_PROMPT`, gated by `clean_lead` — voice/length/URL + numeric grounding), the
+  *one* model call on the punctual path — wrapped in `SummarizationConfig::lead_deadline`
+  (`BULLETIN_LLM_LEAD_DEADLINE_SECS`, default 20s) so it ships the deterministic lead and sends on time
+  the instant it misses ("fall behind, never wrong"). The chosen lead is recorded on `digest.lead`.
+  Feature-off (or a manual `dispatch_now` preview) renders the deterministic lead exactly as before and
+  leaves the column NULL.
 
 ---
 

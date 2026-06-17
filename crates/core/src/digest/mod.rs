@@ -332,6 +332,104 @@ async fn record_candidate_snapshot(
     }
 }
 
+/// Compose the digest's big-picture lead (`llm-summarization.md` §2.4, Phase D) and persist it onto the
+/// `digest` row for the debug trace. With `llm-summarization` this attempts the deadline-bounded
+/// **authored** editor's note, falling back to the deterministic Phase-A lead the instant it misses;
+/// the chosen lead is returned (rendered by the caller) and recorded best-effort. Without the feature
+/// it is a no-op returning `None` — render then composes the deterministic lead at fire time, exactly
+/// as before, and the `digest.lead` column stays NULL (feature-off behavior is unchanged).
+#[cfg(feature = "llm-summarization")]
+async fn digest_lead(
+    pool: &PgPool,
+    digest_id: Uuid,
+    subscriber_id: Uuid,
+    items: &[RenderItem],
+) -> Option<String> {
+    let lead = authored_lead(items).await;
+    // Persist whichever lead will render (authored or the deterministic fallback) — best-effort, never
+    // blocks the send, parity with the decision log.
+    let to_store = lead.clone();
+    let result = with_scope(pool, ScopeCtx::Subscriber(subscriber_id), move |conn| {
+        Box::pin(async move {
+            store::store_lead(&mut *conn, digest_id, &to_store)
+                .await
+                .map_err(Into::into)
+        })
+    })
+    .await;
+    if let Err(e) = result {
+        tracing::warn!(error = %e, "recording digest lead failed (non-fatal)");
+    }
+    Some(lead)
+}
+
+#[cfg(not(feature = "llm-summarization"))]
+async fn digest_lead(_: &PgPool, _: Uuid, _: Uuid, _: &[RenderItem]) -> Option<String> {
+    None
+}
+
+/// The deadline-bounded **authored big-picture lead** (Phase D, §3.1) over the selected items, with the
+/// deterministic Phase-A lead as the fallback. This is the *one* summarization model call on the
+/// punctual path, so it is wrapped in `SummarizationConfig::lead_deadline`: a slow box delays the send
+/// by at most that long, then ships the deterministic lead and goes out on time. Any failure — no usable
+/// headlines, a down sidecar, a gate rejection, or the deadline — degrades to the deterministic lead.
+#[cfg(feature = "llm-summarization")]
+async fn authored_lead(items: &[RenderItem]) -> String {
+    use crate::summarize::{self, SummarizationConfig};
+
+    // The deterministic Phase-A lead, composed from the selected headlines — both the deadline fallback
+    // and the grounding the authored lead's numbers are checked against.
+    let deterministic = render::compose_lead(items);
+
+    let headlines: Vec<String> = items
+        .iter()
+        .map(|i| i.headline.trim().to_string())
+        .filter(|h| !h.is_empty())
+        .collect();
+    if headlines.is_empty() {
+        return deterministic; // nothing to author from (the empty digest never reaches here anyway)
+    }
+    // The threads the selected items advance, deduped in first-seen (rank) order — the §3.6 "name 1–2
+    // threads" inputs.
+    let mut threads: Vec<String> = Vec::new();
+    for label in items
+        .iter()
+        .filter_map(|i| i.thread.as_ref())
+        .map(|t| t.label.trim())
+        .filter(|l| !l.is_empty())
+    {
+        if !threads.iter().any(|t| t == label) {
+            threads.push(label.to_string());
+        }
+    }
+
+    let cfg = SummarizationConfig::from_env();
+    let http = match summarize::build_summarize_http(&cfg, "digest-lead") {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to build lead http client; using deterministic lead");
+            return deterministic;
+        }
+    };
+    match tokio::time::timeout(
+        cfg.lead_deadline,
+        summarize::client::authored_lead(&cfg, &http, &headlines, &threads),
+    )
+    .await
+    {
+        Ok(Some(lead)) => lead,
+        // Transport failure or a gate rejection — `authored_lead` already logged it.
+        Ok(None) => deterministic,
+        Err(_) => {
+            tracing::debug!(
+                deadline_s = cfg.lead_deadline.as_secs(),
+                "digest lead exceeded its deadline; using deterministic lead"
+            );
+            deterministic
+        }
+    }
+}
+
 /// The story ids that made the cut, in render order.
 fn selected_ids(decisions: &[Decision]) -> Vec<Uuid> {
     decisions
@@ -463,6 +561,12 @@ pub async fn generate(
         greeting::seed_for(sub.id, window_end),
         sub.name.as_deref(),
     );
+    // The big-picture lead (`llm-summarization.md` §2.4). With `llm-summarization` this is the
+    // deadline-bounded **authored** editor's note (Phase D), persisted onto the digest for the debug
+    // trace; otherwise `None`, and render composes the deterministic Phase-A lead at fire time — exactly
+    // today's behavior. The one model call on the punctual path, and the only one that can't be skipped:
+    // it is deadline-bounded so a slow box delays the send by at most `lead_deadline`, never more.
+    let lead = digest_lead(pool, digest.id, sub.id, &items).await;
     let message = render::render(
         mailer.from(),
         &sub.email,
@@ -470,6 +574,7 @@ pub async fn generate(
         &sub.timezone,
         &items,
         &greeting,
+        lead.as_deref(),
         content,
     )?;
     mailer.send(message).await?;
@@ -539,6 +644,9 @@ pub async fn dispatch_now(
         greeting::seed_for(sub.id, now),
         sub.name.as_deref(),
     );
+    // A manual preview renders the deterministic Phase-A lead (`None`): it persists nothing, so there is
+    // no digest row to record an authored lead onto, and a debug dispatch shouldn't spend an on-path
+    // model call. The scheduled `generate` is where the Phase-D authored lead lives.
     let message = render::render(
         mailer.from(),
         &sub.email,
@@ -546,6 +654,7 @@ pub async fn dispatch_now(
         &sub.timezone,
         &items,
         &greeting,
+        None,
         content,
     )?;
     mailer.send(message).await?;

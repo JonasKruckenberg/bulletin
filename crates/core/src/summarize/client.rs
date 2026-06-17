@@ -15,12 +15,13 @@ use serde::Deserialize;
 use super::metric;
 use crate::common::event::Event;
 use crate::summarize::{
-    apply_comprehension, baseline, clean_delta, clean_label, comprehend_user_prompt,
+    apply_comprehension, baseline, clean_delta, clean_label, clean_lead, comprehend_user_prompt,
     comprehension_schema, delta_schema, delta_user_prompt, extract_facts, faithful, label_schema,
-    label_user_prompt, response_schema, source_corpus, story_member_corpus, story_user_prompt,
-    synthesize_facts, user_prompt, Band, ClusterSummary, Comprehension, Facts, SummarizationConfig,
-    TldrRun, COMPREHEND_SYSTEM_PROMPT, DELTA_SYSTEM_PROMPT, LABEL_SYSTEM_PROMPT,
-    STORY_SYSTEM_PROMPT, SYSTEM_PROMPT,
+    label_user_prompt, lead_schema, lead_user_prompt, response_schema, source_corpus,
+    story_member_corpus, story_user_prompt, synthesize_facts, user_prompt, Band, ClusterSummary,
+    Comprehension, Facts, SummarizationConfig, TldrRun, COMPREHEND_SYSTEM_PROMPT,
+    DELTA_SYSTEM_PROMPT, LABEL_SYSTEM_PROMPT, LEAD_SYSTEM_PROMPT, STORY_SYSTEM_PROMPT,
+    SYSTEM_PROMPT,
 };
 
 /// Summarize one cluster: extract-then-summarize (§3.2) — hand the model the pre-extracted facts +
@@ -215,6 +216,51 @@ pub async fn delta_thread(
     }
 }
 
+/// Compose the **authored big-picture lead** (Phase D, §2.4/§3.1): an "editor's note" over the
+/// selected items' `headlines` and the `threads` they advance, rephrasing them into one or two
+/// sentences. This is the *one* summarization call that runs on the punctual path — so the caller wraps
+/// it in [`SummarizationConfig::lead_deadline`](crate::summarize::SummarizationConfig::lead_deadline)
+/// and uses the deterministic Phase-A lead the moment it misses.
+///
+/// Best-effort, mirroring the Phase-B label/delta calls — `None` on any transport failure *or* a gate
+/// rejection ([`clean_lead`]: voice + length + URL + numeric grounding against the headlines/threads),
+/// so the caller keeps the deterministic lead. The headlines fed here are themselves already-gated
+/// summaries (§4), so the lead never touches raw events.
+pub async fn authored_lead(
+    cfg: &SummarizationConfig,
+    http: &reqwest::Client,
+    headlines: &[String],
+    threads: &[String],
+) -> Option<String> {
+    // The grounding the lead's numbers are checked against: the same headlines + thread labels it is
+    // composed from. A big-picture lead naturally cites a count ("…and 6 other updates"), so the digest's
+    // own item counts — the total and the "N others" (total − 1) — are grounded too; without them the
+    // §3.4 numeric gate would reject every count-bearing lead (the deterministic lead is built around one).
+    let total = headlines.len();
+    let mut grounding = headlines.join("\n");
+    grounding.push('\n');
+    grounding.push_str(&threads.join("\n"));
+    grounding.push_str(&format!("\n{total} {}", total.saturating_sub(1)));
+
+    let out = chat_json::<LeadOutput>(
+        cfg,
+        http,
+        "lead",
+        LEAD_SYSTEM_PROMPT,
+        lead_user_prompt(headlines, threads),
+        cfg.headline_max_tokens + cfg.tldr_max_tokens,
+        lead_schema(),
+    )
+    .await;
+    match out {
+        Ok(o) => clean_lead(&o.lead, &grounding),
+        Err(e) => {
+            tracing::debug!(error = %e, "digest lead call failed; keeping deterministic lead");
+            None
+        }
+    }
+}
+
 /// Startup reachability gate for the local summarization sidecar (the fail-loud counterpart to the
 /// per-call best-effort degradation). A `llm-summarization` build exists *to* summarize against the
 /// sidecar; if it can't be reached when the worker boots, that is a deployment/config error — a wrong
@@ -351,6 +397,13 @@ struct LabelOutput {
 struct DeltaOutput {
     #[serde(default)]
     delta: String,
+}
+
+/// The Phase-D digest-lead response (just the big-picture sentence); cleaned by [`clean_lead`].
+#[derive(Debug, Deserialize)]
+struct LeadOutput {
+    #[serde(default)]
+    lead: String,
 }
 
 /// POST one grammar-constrained summarization completion and parse the structured output. Errors

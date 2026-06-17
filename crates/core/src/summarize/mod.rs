@@ -80,6 +80,13 @@ pub struct SummarizationConfig {
     /// sized for the worst realistic single call; raise it for slower hardware via
     /// `BULLETIN_LLM_REQUEST_TIMEOUT_SECS`.
     pub request_timeout: Duration,
+    /// Deadline for the **Phase-D authored big-picture lead** (§2.4/§3.1) — the *one* model call that
+    /// runs on the punctual path (after selection, before send), so unlike every other summary it is
+    /// deadline-bounded rather than merely best-effort: if the editor's note doesn't return within this
+    /// window the digest ships the deterministic lead and goes out on time ("fall behind, never wrong").
+    /// Deliberately well under [`request_timeout`](Self::request_timeout) so a slow box delays a send by
+    /// at most this long; tune via `BULLETIN_LLM_LEAD_DEADLINE_SECS`.
+    pub lead_deadline: Duration,
     /// Source-text budget per cluster (§7 long-context cliff): truncate the concatenated event
     /// title+body fed to the model so a small model stays in its faithful regime.
     pub max_source_chars: usize,
@@ -108,6 +115,7 @@ impl Default for SummarizationConfig {
             comprehend: true,
             disable_thinking: true,
             request_timeout: Duration::from_secs(120),
+            lead_deadline: Duration::from_secs(20),
             max_source_chars: 4000,
             max_per_sweep: 200,
         }
@@ -156,12 +164,25 @@ impl SummarizationConfig {
                 }
             }
         }
+        // The Phase-D lead deadline (the one on-path call). A positive whole-second override only.
+        if let Ok(v) = std::env::var("BULLETIN_LLM_LEAD_DEADLINE_SECS") {
+            if let Ok(secs) = v.trim().parse::<u64>() {
+                if secs > 0 {
+                    cfg.lead_deadline = Duration::from_secs(secs);
+                }
+            }
+        }
         if let Some(b) = env_bool("BULLETIN_LLM_COMPREHEND") {
             cfg.comprehend = b;
         }
         if let Some(b) = env_bool("BULLETIN_LLM_DISABLE_THINKING") {
             cfg.disable_thinking = b;
         }
+        // The lead deadline only bounds the punctual send if it sits at or under the per-call HTTP
+        // timeout — past that, `request_timeout` is the real cap and the "at most `lead_deadline`"
+        // guarantee is silently false. Clamp so a misconfigured (or default-vs-lowered-timeout) value
+        // can never exceed it.
+        cfg.lead_deadline = cfg.lead_deadline.min(cfg.request_timeout);
         cfg
     }
 }
@@ -615,6 +636,23 @@ const BANNED_WORDS: &[&str] = &[
     "our",
 ];
 
+/// Token-equality numeric grounding (§3.4), shared by the cluster/story faithfulness gate
+/// ([`faithful`]) and the Phase-D lead gate ([`clean_lead`]) so the two can never drift on what counts
+/// as a grounded number. Returns the first numeric/date token in `output` that does **not** appear (as
+/// the same token, case-insensitively) anywhere in `grounding`, or `None` when every number in the
+/// output is grounded. Both sides go through [`tokenize_numeric`], so they agree on token boundaries and
+/// on unit-suffix stripping ("40m" → "40") — and token-equality (not substring) means an output "40" is
+/// never falsely grounded by a `grounding` "4000".
+fn first_ungrounded_number(output: &str, grounding: &str) -> Option<String> {
+    let grounded: std::collections::HashSet<String> = tokenize_numeric(grounding)
+        .into_iter()
+        .map(|t| t.to_lowercase())
+        .collect();
+    tokenize_numeric(output)
+        .into_iter()
+        .find(|tok| !grounded.contains(&tok.to_lowercase()))
+}
+
 /// The deterministic faithfulness gate (§3.4): the model may *drop* a fact but never *add* one, and
 /// must stay in the house voice. A cheap, post-generation check that
 ///
@@ -654,8 +692,7 @@ pub fn faithful(
 
     // Numbers/dates: every numeric token in the output must be grounded — appear as the *same token*
     // in the facts' numbers/dates or the source text. Token-equality, not substring, so an output "40"
-    // is never falsely grounded by a source "4000". Both sides go through `tokenize_numeric`, so they
-    // agree on token boundaries and on the unit-suffix stripping ("40m" → "40").
+    // is never falsely grounded by a source "4000" (see [`first_ungrounded_number`]).
     let mut grounding: String = facts
         .numbers
         .iter()
@@ -665,15 +702,9 @@ pub fn faithful(
         .join(" ");
     grounding.push(' ');
     grounding.push_str(source_text);
-    let grounded: std::collections::HashSet<String> = tokenize_numeric(&grounding)
-        .into_iter()
-        .map(|t| t.to_lowercase())
-        .collect();
     let output = format!("{} {}", summary.headline, summary.tldr_text);
-    for tok in tokenize_numeric(&output) {
-        if !grounded.contains(&tok.to_lowercase()) {
-            return Err(GateViolation::UngroundedNumber(tok));
-        }
+    if let Some(tok) = first_ungrounded_number(&output, &grounding) {
+        return Err(GateViolation::UngroundedNumber(tok));
     }
 
     // House-voice lint (§3.6 denylist), whole-word + case-insensitive.
@@ -1143,6 +1174,10 @@ const LABEL_MAX: usize = 48;
 const DELTA_MAX: usize = 48;
 /// Max words for a delta flag (§3.6 "≤6 words: a flag, not a sentence").
 const DELTA_MAX_WORDS: usize = 6;
+/// Max chars for the big-picture lead (§2.4/§3.6 "1–2 sentences"). Matches the schema `maxLength`; the
+/// cleaner rejects output exceeding it (defense in depth behind the grammar, degrading to the
+/// deterministic lead — it does not truncate a half-sentence).
+const LEAD_MAX: usize = 320;
 
 /// Clean + gate a model-produced thread **label** (§3.6 backstop): trim, reject empties, over-length
 /// (> [`LABEL_MAX`]), and the house-voice denylist (hype / second-person / `!`). `None` ⇒ the caller
@@ -1278,6 +1313,91 @@ pub fn delta_schema() -> serde_json::Value {
     })
 }
 
+// ── Phase D — the authored big-picture lead (§2.4/§3.1) ──────────────────────────────────────────
+
+/// Clean + gate a model-produced **big-picture lead** (§3.6 backstop), the one summary surface whose
+/// call sits on the punctual path. Trim, reject empties / over-length (> [`LEAD_MAX`]), the house-voice
+/// denylist (hype / second-person / `!`), and any raw URL. Plus a numeric-grounding check, mirroring
+/// the §3.4 cluster gate one level up: every number/date-looking token in the lead must appear (as the
+/// same token) in `grounding` — the concatenated selected headlines + thread labels the lead is
+/// composed from — so the editor's note can rephrase the selected items but never invent a quantity.
+/// `None` ⇒ the caller keeps the deterministic Phase-A lead. (No entity-`ref` check: the lead is plain
+/// prose with no run-list — it *names* threads, it doesn't badge entities.)
+pub fn clean_lead(raw: &str, grounding: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() || s.chars().count() > LEAD_MAX {
+        return None;
+    }
+    if banned_word_in(s).is_some() || url_like_token(s).is_some() {
+        return None;
+    }
+    // Numbers must be grounded in the inputs (the shared §3.4 token-equality check), so a number that
+    // wasn't in any selected headline / thread label (nor the item-count grounding the caller appends)
+    // can't reach the lead.
+    if first_ungrounded_number(s, grounding).is_some() {
+        return None;
+    }
+    Some(s.to_string())
+}
+
+/// The digest-lead system prompt (§3.6) — engineered for a 3–4B model exactly like the others: write
+/// the one "big picture" opening over the selected headlines, name a thread or two, don't list every
+/// item. A constant ⇒ prefix-cached. (The grounding it rephrases — the headlines/thread labels — is in
+/// the user prompt; those inputs are themselves already gate-passed summaries, §4.)
+pub const LEAD_SYSTEM_PROMPT: &str = r#"You write the one-line "big picture" that opens a work digest.
+It sits under a greeting, so do NOT greet. One or two short sentences.
+
+1. Say what dominated, then what else moved. Name one or two threads by name.
+2. Do not list every item. Do not number them. A reader sees the full list below.
+3. Use only the headlines and threads given. Every name, number, and date you write must be in them.
+4. Plain words. Active voice. Do not use: massive, huge, critical (unless given),
+   game-changing, exciting, "!", "you", "we".
+5. Don't paste raw URLs. Name sources plainly.
+6. Output only the JSON the schema asks for. No preamble.
+
+EXAMPLES
+threads: Acme auth migration, Billing rewrite
+headlines:
+- Auth outage traced to the token-rotation deploy
+- SSRF advisory forces a billing PDF mitigation
+- Staging cutover completed for the payments service
+out: {"lead":"An auth outage from the token-rotation deploy led the day on the Acme auth migration, while a suspected SSRF pushed a billing PDF mitigation."}
+
+threads: On-call rotation
+headlines:
+- Pager handoff to the EU team completed
+out: {"lead":"A quiet stretch on the on-call rotation: the pager handed off to the EU team."}"#;
+
+/// The digest-lead user prompt: the selected items' headlines (newest/top-ranked first) + the thread
+/// names they advance, with the concrete ask. Short and concrete over the §4 pre-distilled inputs (the
+/// headlines are already-gated summaries, never raw events), like [`user_prompt`].
+pub fn lead_user_prompt(headlines: &[String], threads: &[String]) -> String {
+    format!(
+        "threads: {}\n\
+         headlines:\n{}\n\n\
+         Write the big-picture opening: 1-2 sentences, what dominated and what else moved. \
+         Name one or two threads. Do not greet, and do not list every item.",
+        list_or_none(threads),
+        bullet_list(headlines),
+    )
+}
+
+/// The digest-lead response schema — a single length-capped `lead` string (no enums; the lead is free
+/// prose over the already-grounded headlines, gated for voice/length/grounding by [`clean_lead`]).
+pub fn lead_schema() -> serde_json::Value {
+    use serde_json::json;
+    json!({
+        "name": "digest_lead",
+        "strict": true,
+        "schema": {
+            "type": "object",
+            "properties": { "lead": { "type": "string", "maxLength": LEAD_MAX } },
+            "required": ["lead"],
+            "additionalProperties": false
+        }
+    })
+}
+
 // ── The sweep (gated) — walk the work queue, summarize best-effort ───────────────────────────────
 
 /// What a summarization sweep did, for logs / metrics.
@@ -1326,7 +1446,10 @@ use crate::common::{db::ScopeCtx, scope::Scope};
 /// in the pass rather than rebuilt per item — shared by all three sweeps (cluster / story / thread) so
 /// client construction lives in one place. `what` names the sweep for the error context.
 #[cfg(feature = "llm-summarization")]
-fn build_summarize_http(cfg: &SummarizationConfig, what: &str) -> anyhow::Result<reqwest::Client> {
+pub(crate) fn build_summarize_http(
+    cfg: &SummarizationConfig,
+    what: &str,
+) -> anyhow::Result<reqwest::Client> {
     use anyhow::Context;
     reqwest::Client::builder()
         .timeout(cfg.request_timeout)
@@ -2256,5 +2379,68 @@ mod tests {
         assert!(lp.contains("repo:acme/auth") && lp.contains("Auth outage"));
         let dp = delta_user_prompt("Acme auth migration", &["Cutover landed".to_string()]);
         assert!(dp.contains("Acme auth migration") && dp.contains("Cutover landed"));
+    }
+
+    // ── Phase D — the authored big-picture lead ───────────────────────────────────────────────────
+
+    #[test]
+    fn clean_lead_gates_voice_length_url_and_grounding() {
+        let grounding = "Auth outage traced to the token-rotation deploy; 12% of logins failed";
+        // A grounded, in-voice lead passes (the 12% is present in the grounding).
+        assert_eq!(
+            clean_lead(
+                "  An auth outage led the day; 12% of logins failed.  ",
+                grounding
+            )
+            .as_deref(),
+            Some("An auth outage led the day; 12% of logins failed.")
+        );
+        // Empty / over-length rejected.
+        assert!(clean_lead("", grounding).is_none());
+        assert!(clean_lead(&"x".repeat(LEAD_MAX + 1), grounding).is_none());
+        // Hype / second-person / `!` rejected (the shared house-voice lint).
+        assert!(clean_lead("A massive outage hit today.", grounding).is_none());
+        assert!(clean_lead("You should read this.", grounding).is_none());
+        // Raw URL rejected.
+        assert!(clean_lead("See https://example.com for details.", grounding).is_none());
+        // An ungrounded number (not in any selected headline) is rejected — no invented quantity.
+        assert!(clean_lead("An auth outage hit 99% of logins.", grounding).is_none());
+
+        // A count-bearing lead ("6 other updates") passes only when the count is in the grounding —
+        // the contract `authored_lead` upholds by appending the digest's item counts (fix for the
+        // gate rejecting every count-bearing big-picture lead).
+        assert!(clean_lead(
+            "An auth outage led the day; 6 other updates followed.",
+            grounding
+        )
+        .is_none());
+        let with_count = format!("{grounding}\n7 6");
+        assert_eq!(
+            clean_lead(
+                "An auth outage led the day; 6 other updates followed.",
+                &with_count
+            )
+            .as_deref(),
+            Some("An auth outage led the day; 6 other updates followed.")
+        );
+    }
+
+    #[test]
+    fn lead_schema_and_prompt_carry_inputs() {
+        let s = serde_json::to_string(&lead_schema()).unwrap();
+        assert!(s.contains("digest_lead") && s.contains("\"maxLength\":320"));
+        let p = lead_user_prompt(
+            &[
+                "Auth outage traced to the deploy".to_string(),
+                "SSRF advisory forces a mitigation".to_string(),
+            ],
+            &["Acme auth migration".to_string()],
+        );
+        assert!(p.contains("Acme auth migration"));
+        assert!(p.contains("Auth outage traced to the deploy"));
+        assert!(p.contains("do not list every item"));
+        // No headlines / no threads degrades to the explicit "(none)" rather than a blank.
+        let empty = lead_user_prompt(&[], &[]);
+        assert!(empty.contains("(none)"));
     }
 }

@@ -35,7 +35,11 @@ fn reason_line(reason: &ItemReason) -> String {
 /// the top-ranked item's headline (what dominated) and notes how much else moved. Falls back to the
 /// raw cluster `title` per item (carried on [`RenderItem::headline`]), so it reads sensibly with the
 /// summarization feature off too. Empty for an empty item list (the caller renders the empty digest).
-fn compose_lead(items: &[RenderItem]) -> String {
+///
+/// This is the **fallback** the optional Phase-D authored lead degrades to: [`render`] takes a
+/// pre-composed lead (the authored one, or this) and shares it across both bodies. `pub(crate)` so the
+/// `generate` flow can compute it as the deadline fallback before the model call.
+pub(crate) fn compose_lead(items: &[RenderItem]) -> String {
     // The dominant line is the top-ranked item's headline (selection is in priority order); fall to
     // the next one only if it has no real content. The predicate is `trim_sentence_end(h)` non-empty,
     // not just `h` non-empty, so a punctuation-only title ("???", "...") is skipped rather than
@@ -126,6 +130,7 @@ impl Default for DigestContent<'_> {
 /// One cluster per item, in the frozen selection order. All the non-item chrome (brand, title,
 /// footer) comes from `content`, so callers fully parametrize what's shown; the subject line is the
 /// per-digest `greeting`, so the inbox preview matches the lead.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render(
     from: &str,
     to: &str,
@@ -133,12 +138,17 @@ pub(crate) fn render(
     timezone: &str,
     items: &[RenderItem],
     greeting: &str,
+    lead: Option<&str>,
     content: &DigestContent<'_>,
 ) -> Result<Message> {
     let tz = subscriber_tz(timezone);
-    // Compose the deterministic big-picture lead once (§2.4) and share it across both bodies, so the
-    // plaintext and HTML views can never carry a different lead for the same digest.
-    let lead = compose_lead(items);
+    // The big-picture lead, shared across both bodies so the plaintext and HTML views can never carry a
+    // different lead for the same digest. The caller passes the lead it composed (the Phase-D authored
+    // editor's note, or — when it missed its deadline / the feature is off — `None`); `None` falls back
+    // to the deterministic compose (§2.4), so the populated digest always opens with a real lead.
+    let lead = lead
+        .map(str::to_owned)
+        .unwrap_or_else(|| compose_lead(items));
     let plain = render_plain(window_end, tz, greeting, &lead, items);
     let html = render_html(window_end, tz, greeting, &lead, items, content);
     // The greeting doubles as the subject line, so the inbox preview opens in the same warm,
