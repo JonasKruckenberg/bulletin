@@ -97,7 +97,10 @@ pub fn first_linkable_token(text: &str) -> Option<String> {
 /// inert in every mail client and reads as the familiar `[.]` security defang.
 fn neutralize(core: &str) -> String {
     let mut s = core.replace('.', "[.]").replace("://", "[:]//");
-    if s.len() >= 7 && s[..7].eq_ignore_ascii_case("mailto:") {
+    // `get(..7)` (not `s[..7]`) so a multibyte char straddling byte 7 — `www.órgano` -> `www[.]órgano`,
+    // where `ó` spans bytes 6–7 — returns `None` instead of panicking. A `mailto:` match is pure ASCII,
+    // so the `[..6]`/`[7..]` slices that follow are then guaranteed char boundaries.
+    if s.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("mailto:")) {
         s = format!("{}[:]{}", &s[..6], &s[7..]);
     }
     s
@@ -210,6 +213,17 @@ mod tests {
         );
         // Multiple tokens, original spacing preserved.
         assert_eq!(defang("  a.com  and b.org "), "  a[.]com  and b[.]org ");
+    }
+
+    #[test]
+    fn defang_handles_multibyte_tokens_without_panicking() {
+        // A non-ASCII char straddling the `mailto:`-probe byte index (7) must not panic the slice.
+        // `www.órgano` -> `www[.]órgano`, where `ó` spans bytes 6–7.
+        assert_eq!(defang("see www.órgano today"), "see www[.]órgano today");
+        assert_eq!(defang("ping www.ça now"), "ping www[.]ça now");
+        // An accented/IDN host in a scheme URL, and a real `mailto:` that must still break.
+        assert_eq!(defang("at https://café.com/ä"), "at https[:]//café[.]com/ä");
+        assert_eq!(defang("mail mailto:tëam@café.org"), "mail mailto[:]tëam@café[.]org");
     }
 
     #[test]

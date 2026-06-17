@@ -215,9 +215,9 @@ fn render_plain(
     // through the feed content it summarized. The HTML view escapes them; the plaintext view has no
     // markup to escape but still strips control/bidi characters so neither can mangle the line.
     let opening = if lead.is_empty() {
-        clean(greeting).into_owned()
+        clean_prose(greeting)
     } else {
-        format!("{} {}", clean(greeting), clean_prose(lead))
+        format!("{} {}", clean_prose(greeting), clean_prose(lead))
     };
     let mut body = format!(
         "{opening}\n\nYour digest for the window ending {}\n\n",
@@ -284,8 +284,9 @@ fn render_plain(
 /// Plaintext fallback for the empty digest: the cheerful counterpart to [`render_plain`], opened
 /// with the time-of-day salutation so it matches the populated digest's voice.
 fn render_empty_plain(window_end: DateTime<Utc>, tz: Tz, salutation: &str) -> String {
-    // The salutation carries the subscriber-set name — strip control/bidi chars for the plaintext view.
-    let salutation = clean(salutation);
+    // The salutation carries the subscriber-set name — defang any link-shaped name and strip
+    // control/bidi chars, the same backstop the populated plaintext view runs over its prose.
+    let salutation = clean_prose(salutation);
     format!(
         "{salutation}. You're all caught up!\n\n\
          No new items in the window ending {}.\n\
@@ -369,7 +370,7 @@ fn render_html(
         .format("%A, %B %-d, %Y")
         .to_string();
     let preheader = format!("{count} new item{plural} in your digest");
-    let greeting = escape(greeting);
+    let greeting = escape_prose(greeting);
     // The big-picture lead is composed once by the caller (§2.4) — deterministic, no model, no lorem.
     // Prefix it with a single space only when present, so an empty lead leaves no stray gap after the
     // greeting (mirrors the plaintext join).
@@ -421,7 +422,7 @@ fn render_empty_html(
         .with_timezone(&tz)
         .format("%A, %B %-d, %Y")
         .to_string();
-    let salutation = escape(salutation);
+    let salutation = escape_prose(salutation);
 
     let masthead = format!(
         r#"{head}<div style="text-align:center;padding:46px 8px 18px 8px;">
