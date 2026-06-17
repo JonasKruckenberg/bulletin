@@ -646,8 +646,12 @@ in
           RestartSec = 5;
           StateDirectory = "bulletin";
           StateDirectoryMode = "0700";
-          # Mark the unit failed if /health doesn't come up → deploy-rs (or any rollback) reverts.
-          ExecStartPost = "${pkgs.curl}/bin/curl --fail --silent --max-time 5 --retry 15 --retry-delay 1 --retry-connrefused http://${cfg.http.addr}/health";
+          # Mark the unit failed if /health doesn't come up → deploy-rs (or any rollback) reverts. With
+          # `llm.enable` the binary now gates startup on the summarization sidecar being reachable (it
+          # won't bind /health until then, and the sidecar may still be loading its GGUF), so widen the
+          # retry window to cover that — an unreachable sidecar still fails the probe and rolls back,
+          # but a slow-loading one isn't mistaken for a dead deploy. Stays tight on the baseline build.
+          ExecStartPost = "${pkgs.curl}/bin/curl --fail --silent --max-time 5 --retry ${toString (if cfg.llm.enable then 90 else 15)} --retry-delay 1 --retry-connrefused http://${cfg.http.addr}/health";
         }
         // lib.optionalAttrs (envSecretFiles != [ ]) {
           # Both secret env files (SMTP creds + the sealed GitHub App credentials) are read as root
