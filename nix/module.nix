@@ -509,32 +509,39 @@ in
       ];
     };
 
-    # Pin the sidecar to **zero network egress** (the design §12 / local-ml-options "no data egress"
-    # invariant — Bulletin summarizes private Slack/GitHub/email content locally). The upstream
-    # `services.llama-cpp` module already sandboxes hard (ProtectSystem=strict, all capabilities
-    # dropped, RestrictAddressFamilies limited to AF_INET/AF_INET6/AF_UNIX), but none of that stops
-    # `llama-server` from opening an *outbound* IP connection — and it never needs one: the GGUF is
-    # fetched out-of-band by the `bulletin-model-fetch` oneshot (it does not auto-download from
-    # HuggingFace), and the only client is the bulletin worker reaching it over loopback. So deny all
-    # IP traffic except loopback at the cgroup-BPF level: non-loopback egress *and* ingress are both
-    # blocked, while the 127.0.0.1 worker ↔ server link keeps working.
-    #
-    # We can't use the stricter `PrivateNetwork = true` ("no network namespace at all"): that hands
-    # the unit its *own* private loopback inside a separate netns, which the host-side worker calling
-    # `http://127.0.0.1:<port>` could not reach. For a loopback-served sidecar the IP allow/deny pair
-    # is the correct mechanism. AF_INET stays permitted because binding 127.0.0.1 requires it.
-    systemd.services.llama-cpp.serviceConfig = lib.mkIf cfg.llm.serveLocally {
-      IPAddressDeny = "any";
-      IPAddressAllow = "localhost";
-    };
+    # Two independent, conditional contributions to the sidecar unit — merged under one attrpath so
+    # they don't collide (`a.b.serviceConfig = …` and `a.b = …` for the same `a.b` is a duplicate-key
+    # error in an attrset literal).
+    systemd.services.llama-cpp = lib.mkMerge [
+      # Pin the sidecar to **zero network egress** (the design §12 / local-ml-options "no data egress"
+      # invariant — Bulletin summarizes private Slack/GitHub/email content locally). The upstream
+      # `services.llama-cpp` module already sandboxes hard (ProtectSystem=strict, all capabilities
+      # dropped, RestrictAddressFamilies limited to AF_INET/AF_INET6/AF_UNIX), but none of that stops
+      # `llama-server` from opening an *outbound* IP connection — and it never needs one: the GGUF is
+      # fetched out-of-band by the `bulletin-model-fetch` oneshot (it does not auto-download from
+      # HuggingFace), and the only client is the bulletin worker reaching it over loopback. So deny all
+      # IP traffic except loopback at the cgroup-BPF level: non-loopback egress *and* ingress are both
+      # blocked, while the 127.0.0.1 worker ↔ server link keeps working.
+      #
+      # We can't use the stricter `PrivateNetwork = true` ("no network namespace at all"): that hands
+      # the unit its *own* private loopback inside a separate netns, which the host-side worker calling
+      # `http://127.0.0.1:<port>` could not reach. For a loopback-served sidecar the IP allow/deny pair
+      # is the correct mechanism. AF_INET stays permitted because binding 127.0.0.1 requires it.
+      (lib.mkIf cfg.llm.serveLocally {
+        serviceConfig = {
+          IPAddressDeny = "any";
+          IPAddressAllow = "localhost";
+        };
+      })
 
-    # When the model is fetched declaratively, gate the sidecar on a verified file: chain
-    # model-fetch → llama-cpp → bulletin so a missing/corrupt GGUF fails at activation (and, under
-    # deploy-rs, rolls the generation back) rather than the worker silently degrading to baselines.
-    systemd.services.llama-cpp = lib.mkIf llmFetchModel {
-      after = [ "bulletin-model-fetch.service" ];
-      requires = [ "bulletin-model-fetch.service" ];
-    };
+      # When the model is fetched declaratively, gate the sidecar on a verified file: chain
+      # model-fetch → llama-cpp → bulletin so a missing/corrupt GGUF fails at activation (and, under
+      # deploy-rs, rolls the generation back) rather than the worker silently degrading to baselines.
+      (lib.mkIf llmFetchModel {
+        after = [ "bulletin-model-fetch.service" ];
+        requires = [ "bulletin-model-fetch.service" ];
+      })
+    ];
 
     # Fetch-on-activation oneshot (docs/llm-summarization.md): download `llm.modelUrl` into the model
     # path and verify its sha256, only when missing or mismatched (idempotent — a present, verified
