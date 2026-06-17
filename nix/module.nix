@@ -47,13 +47,24 @@ let
     else
       cfg.database.url;
 
-  # CLI wrapper on PATH: presets DATABASE_URL + email env to the deployed values so operators run
-  # `sudo -u bulletin bulletin debug …` (seeding, status, the digest-explain loop) without flags.
+  # CLI wrapper on PATH: presets the env the operator CLI needs so `sudo -u bulletin bulletin debug …`
+  # (seeding, status, the digest-explain loop) runs without flags. `debug` is now a gRPC client of the
+  # admin API, so it needs the API address + admin bearer; it sources `api.adminKeyFile` (which must be
+  # bulletin-readable) to present the key. DATABASE_URL + email are still preset for the other CLI
+  # commands an operator might run by hand (e.g. `migrate`).
   cliWrapper = pkgs.writeShellScriptBin "bulletin" ''
     export DATABASE_URL="''${DATABASE_URL:-${toString databaseUrl}}"
     export BULLETIN_EMAIL_TRANSPORT="''${BULLETIN_EMAIL_TRANSPORT:-${cfg.email.transport}}"
     export BULLETIN_EMAIL_FROM="''${BULLETIN_EMAIL_FROM:-${cfg.email.from}}"
     export BULLETIN_EMAIL_FILE_DIR="''${BULLETIN_EMAIL_FILE_DIR:-/var/lib/bulletin/outbox}"
+    export BULLETIN_API_ADDR="''${BULLETIN_API_ADDR:-${cfg.api.addr}}"
+    ${lib.optionalString (cfg.api.adminKeyFile != null) ''
+      # Source the admin bearer so `debug` authenticates to the API (file must be bulletin-readable).
+      # Quote the path so a directory with spaces doesn't word-split into a silent auth failure.
+      if [ -r "${toString cfg.api.adminKeyFile}" ]; then
+        set -a; . "${toString cfg.api.adminKeyFile}"; set +a
+      fi
+    ''}
     exec ${lib.getExe cfg.package} "$@"
   '';
 
@@ -93,7 +104,8 @@ let
   # GitHub App credentials), so neither enters the Nix store.
   envSecretFiles =
     lib.optional (cfg.email.smtpSecretFile != null) cfg.email.smtpSecretFile
-    ++ lib.optional (cfg.github.secretFile != null) cfg.github.secretFile;
+    ++ lib.optional (cfg.github.secretFile != null) cfg.github.secretFile
+    ++ lib.optional (cfg.api.adminKeyFile != null) cfg.api.adminKeyFile;
 
   # systemd hardening shared by both units. Verified not to break the PG unix socket (AF_UNIX),
   # outbound HTTPS for RSS polling, or future SMTP (AF_INET*). Plain Rust has no JIT, so
@@ -189,6 +201,33 @@ in
       type = lib.types.str;
       default = "127.0.0.1:9464";
       description = "Bind address for the Prometheus `/metrics` exporter.";
+    };
+
+    api = {
+      addr = lib.mkOption {
+        type = lib.types.str;
+        default = "127.0.0.1:50051";
+        description = ''
+          Bind address for the gRPC admin API (started as part of `bulletin all`), and the address the
+          `bulletin debug …` CLI dials. Loopback by default — the `debug` CLI is now a thin client of
+          this API, so it runs against the live engine without the DB credential or the SMTP secret.
+        '';
+      };
+      adminKeyFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = null;
+        example = "/run/agenix/bulletin-api-admin-key";
+        description = ''
+          Path to an env file holding `BULLETIN_API_ADMIN_KEY=<high-entropy key>` (one `KEY=value`
+          line). It is loaded into the `bulletin` service via systemd `EnvironmentFile` AND sourced by
+          the `bulletin` CLI wrapper, so the engine accepts admin RPCs and the `debug` CLI presents the
+          matching bearer. **Make it readable by the `bulletin` user** (e.g. agenix `owner = "bulletin"`)
+          so the CLI wrapper — run via `sudo -u bulletin` — can source it.
+
+          Absent ⇒ the admin plane is fail-closed: every admin RPC is rejected and `bulletin debug …`
+          cannot talk to the engine. Set it to use the CLI or the API.
+        '';
+      };
     };
 
     log = {
@@ -607,6 +646,7 @@ in
         BULLETIN_LOG_FORMAT = cfg.log.format;
         BULLETIN_HTTP_ADDR = cfg.http.addr;
         BULLETIN_METRICS_ADDR = cfg.metrics.addr;
+        BULLETIN_API_ADDR = cfg.api.addr;
         BULLETIN_EMAIL_TRANSPORT = cfg.email.transport;
         BULLETIN_EMAIL_FROM = cfg.email.from;
         BULLETIN_EMAIL_FILE_DIR = "%S/bulletin/outbox";
