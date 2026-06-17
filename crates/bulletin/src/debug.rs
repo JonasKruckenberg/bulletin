@@ -1,14 +1,23 @@
-//! The `bulletin debug …` inspection commands: seed/list connections and subscribers, run the
-//! pipeline stages inline, and dump state. Kept out of `main.rs` so it stays a thin dispatcher.
+//! The `bulletin debug …` inspection commands. **A thin gRPC client of the admin plane** (`bulletin
+//! api`) — even when run locally. Each command builds a request, calls the matching admin RPC, and
+//! prints the response; it opens no database and builds no mailer, so an operator can run it without
+//! the runtime DB credential or the SMTP secret (the engine behind the API holds those and does the
+//! work). Kept out of `main.rs` so it stays a thin dispatcher.
 
-use anyhow::Result;
-use bulletin_core::status::StatusReport;
-use bulletin_core::{cluster, digest, ingest, status};
+use std::net::SocketAddr;
+
+use anyhow::{Context, Result};
+use bulletin_core::digest::subscriber::Recurrence;
 use clap::Subcommand;
-use sqlx::PgPool;
+use prost_types::Timestamp;
+use tonic::metadata::{Ascii, MetadataValue};
+use tonic::transport::Endpoint;
+use tonic::Request;
 use uuid::Uuid;
 
-use crate::transport::EmailConfig;
+use crate::api::proto;
+use proto::admin_service_client::AdminServiceClient;
+use proto::unstable_debug_service_client::UnstableDebugServiceClient;
 
 #[derive(Subcommand)]
 pub enum DebugCommand {
@@ -118,7 +127,36 @@ pub enum DebugCommand {
     Status,
 }
 
-pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> Result<()> {
+/// Dispatch a `debug` command against the admin plane at `api_addr`, presenting `admin_key` as the
+/// bearer. The CLI is a pure gRPC client here: no DB pool, no mailer — the engine does the work.
+pub async fn run(
+    api_addr: SocketAddr,
+    admin_key: Option<String>,
+    command: DebugCommand,
+) -> Result<()> {
+    // Dial the API over plaintext h2 (loopback by default; front with TLS off-box). The bearer is
+    // attached by an interceptor so every RPC on this client is authenticated uniformly.
+    let channel = Endpoint::from_shared(format!("http://{api_addr}"))
+        .context("build API endpoint")?
+        .connect()
+        .await
+        .with_context(|| {
+            format!("connect to bulletin api at {api_addr} (is `bulletin api` running?)")
+        })?;
+
+    let token: Option<MetadataValue<Ascii>> = match admin_key {
+        Some(k) => Some(
+            format!("Bearer {}", k.trim())
+                .parse()
+                .context("--api-admin-key is not a valid bearer token")?,
+        ),
+        None => None,
+    };
+    // Two clients over the one channel: the wire-stable `AdminService` and the `UnstableDebugService`.
+    // Both present the same admin bearer (attached by the interceptor).
+    let mut admin = AdminServiceClient::with_interceptor(channel.clone(), bearer(token.clone()));
+    let mut dbg = UnstableDebugServiceClient::with_interceptor(channel, bearer(token));
+
     match command {
         DebugCommand::ConnectionAdd {
             source,
@@ -126,24 +164,23 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> R
             poll_interval,
             owner,
         } => {
-            // Shared validation (source vocabulary, the private-source-must-be-owned guard, and the
-            // GitHub installation_id → provider_account_id routing key) lives in `core` so the CLI and
-            // the gRPC admin API can't drift on what a valid connection is.
-            let conn = ingest::prepare_connection(&source, &config, poll_interval, owner)
-                .map_err(|e| anyhow::anyhow!(e))?;
-            let id = ingest::store::insert_connection(
-                pool,
-                conn.source,
-                conn.config,
-                conn.poll_interval_secs,
-                conn.owner,
-                conn.provider_account_id.as_deref(),
-            )
-            .await?;
-            println!("{id}");
+            let conn = admin
+                .create_connection(proto::CreateConnectionRequest {
+                    source,
+                    config_json: config,
+                    poll_interval_secs: poll_interval,
+                    owner: owner.map(|o| o.to_string()),
+                })
+                .await?
+                .into_inner();
+            println!("{}", conn.id);
         }
         DebugCommand::ConnectionList => {
-            let rows = ingest::store::list_connections(pool).await?;
+            let rows = admin
+                .list_connections(proto::ListConnectionsRequest {})
+                .await?
+                .into_inner()
+                .connections;
             if rows.is_empty() {
                 println!("no connections");
             }
@@ -151,33 +188,37 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> R
                 println!(
                     "{}\t{}\t{}\tpoll={}s\tnext={}\tconfig={}",
                     r.id,
-                    r.source.as_str(),
+                    r.source,
                     r.status,
                     r.poll_interval_secs,
-                    r.next_poll_at.format("%Y-%m-%dT%H:%M:%SZ"),
-                    r.config,
+                    req_ts(&r.next_poll_at),
+                    r.config_json,
                 );
             }
         }
         DebugCommand::ConnectionRm { id } => {
-            if ingest::store::delete_connection(pool, id).await? {
+            let deleted = admin
+                .delete_connection(proto::DeleteConnectionRequest { id: id.to_string() })
+                .await?
+                .into_inner()
+                .deleted;
+            if deleted {
                 println!("deleted {id}");
             } else {
                 println!("not found: {id}");
             }
         }
         DebugCommand::EventList { limit } => {
-            let events = ingest::store::list_events(pool, limit).await?;
+            let events = admin
+                .list_events(proto::ListEventsRequest { limit })
+                .await?
+                .into_inner()
+                .events;
             if events.is_empty() {
                 println!("no events");
             }
             for ev in events {
-                println!(
-                    "{}\t{}\t{}",
-                    ev.ingest_time.format("%Y-%m-%dT%H:%M:%SZ"),
-                    ev.source.as_str(),
-                    ev.title,
-                );
+                println!("{}\t{}\t{}", req_ts(&ev.ingest_time), ev.source, ev.title);
                 for link in &ev.links {
                     println!("  {link}");
                 }
@@ -191,63 +232,82 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> R
             timezone,
             digest_time,
         } => {
-            // Shared cadence/timezone/time validation lives in `core` (with up-front IANA tz checking),
-            // so the CLI and the gRPC admin API parse a schedule identically.
-            let schedule =
-                digest::subscriber::validate_schedule(&freq, weekday, &timezone, &digest_time)
-                    .map_err(|e| anyhow::anyhow!(e))?;
-            let id = digest::subscriber::insert_subscriber(
-                pool,
-                &email,
-                name.as_deref(),
-                schedule.recurrence,
-                &schedule.timezone,
-                schedule.digest_time,
-            )
-            .await?;
-            println!("{id}");
+            let sub = admin
+                .create_subscriber(proto::CreateSubscriberRequest {
+                    email,
+                    name,
+                    freq,
+                    weekday,
+                    timezone,
+                    digest_time,
+                })
+                .await?
+                .into_inner();
+            println!("{}", sub.id);
         }
         DebugCommand::SubscriberList => {
-            let rows = digest::subscriber::list_subscribers(pool).await?;
+            let rows = admin
+                .list_subscribers(proto::ListSubscribersRequest {})
+                .await?
+                .into_inner()
+                .subscribers;
             if rows.is_empty() {
                 println!("no subscribers");
             }
             for s in rows {
+                // Rebuild the core `Recurrence` from the (freq, weekday) columns and let *it* format
+                // the cadence, so the label stays identical to the scheduled path (no client-side
+                // reimplementation to drift from `Recurrence::label`). weekday is present iff weekly.
+                let cadence = match s.weekday {
+                    Some(weekday) => Recurrence::Weekly { weekday }.label(),
+                    None => Recurrence::Daily.label(),
+                };
                 println!(
                     "{}\t{}\t{}\t{}\t{} {}\tmax={}\tnext={}\tlast={}",
                     s.id,
                     s.email,
                     s.name.as_deref().unwrap_or("-"),
-                    s.recurrence.label(),
-                    s.digest_time.format("%H:%M"),
+                    cadence,
+                    s.digest_time,
                     s.timezone,
                     s.max_items,
-                    s.next_run_at.format("%Y-%m-%dT%H:%M:%SZ"),
-                    s.last_run_at
-                        .map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
-                        .unwrap_or_else(|| "never".to_string()),
+                    req_ts(&s.next_run_at),
+                    opt_ts(&s.last_run_at),
                 );
             }
         }
         DebugCommand::SubscriberRm { id } => {
-            if digest::subscriber::delete_subscriber(pool, id).await? {
+            let deleted = admin
+                .delete_subscriber(proto::DeleteSubscriberRequest { id: id.to_string() })
+                .await?
+                .into_inner()
+                .deleted;
+            if deleted {
                 println!("deleted {id}");
             } else {
                 println!("not found: {id}");
             }
         }
-        DebugCommand::BuildRun => match cluster::build(pool).await? {
-            Some(stats) => println!(
-                "built {} group(s); watermark → {}",
-                stats.dirty_groups,
-                stats.built_through.format("%Y-%m-%dT%H:%M:%SZ")
-            ),
-            None => println!("skipped (another build in progress)"),
-        },
+        DebugCommand::BuildRun => {
+            let r = dbg.run_build(proto::RunBuildRequest {}).await?.into_inner();
+            if r.skipped {
+                println!("skipped (another build in progress)");
+            } else {
+                println!(
+                    "built {} group(s); watermark → {}",
+                    r.dirty_groups,
+                    req_ts(&r.built_through)
+                );
+            }
+        }
         DebugCommand::DigestRun { subscriber } => {
-            let sender = email.build_sender()?;
-            let outcome = digest::generate(pool, &sender, subscriber, &email.content()).await?;
-            println!("{outcome:?}");
+            let outcome = dbg
+                .run_digest(proto::RunDigestRequest {
+                    subscriber: subscriber.to_string(),
+                })
+                .await?
+                .into_inner();
+            println!("{}", format_outcome(&outcome));
         }
         DebugCommand::DigestDispatch {
             subscriber,
@@ -256,58 +316,101 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> R
             if lookback_days < 1 {
                 anyhow::bail!("--lookback-days must be >= 1");
             }
-            let sender = email.build_sender()?;
-            let outcome =
-                digest::dispatch_now(pool, &sender, subscriber, lookback_days, &email.content())
-                    .await?;
-            println!("{outcome:?}");
+            let outcome = dbg
+                .dispatch_digest(proto::DispatchDigestRequest {
+                    subscriber: subscriber.to_string(),
+                    lookback_days,
+                })
+                .await?
+                .into_inner();
+            println!("{}", format_outcome(&outcome));
         }
         DebugCommand::DigestList { limit } => {
-            let rows = digest::store::list_digests(pool, limit).await?;
+            let rows = admin
+                .list_digests(proto::ListDigestsRequest { limit })
+                .await?
+                .into_inner()
+                .digests;
             if rows.is_empty() {
                 println!("no digests");
             }
-            for (d, email, item_count) in rows {
+            for d in rows {
                 let status = d
                     .delivered_at
-                    .map(|t| format!("delivered {}", t.format("%Y-%m-%dT%H:%M:%SZ")))
+                    .as_ref()
+                    .map(|t| format!("delivered {}", fmt_ts(t)))
                     .unwrap_or_else(|| "pending".to_string());
                 println!(
                     "{}\t{}\t{}\titems={}\twindow_end={}",
                     d.id,
-                    email,
+                    d.subscriber_email,
                     status,
-                    item_count,
-                    d.window_end.format("%Y-%m-%dT%H:%M:%SZ"),
+                    d.item_count,
+                    req_ts(&d.window_end),
                 );
             }
         }
         DebugCommand::DigestExplain { subscriber } => {
-            print_explain(&digest::explain(pool, subscriber).await?);
+            let rows = dbg
+                .explain_digest(proto::ExplainDigestRequest {
+                    subscriber: subscriber.to_string(),
+                })
+                .await?
+                .into_inner()
+                .rows;
+            print_explain(&rows);
         }
         DebugCommand::DigestEval {
             subscriber,
             limit,
             config,
-        } => match config {
-            None => print!("{}", digest::eval_report(pool, subscriber, limit).await?),
-            Some(path) => {
-                let trial: bulletin_core::digest::select::ScoringConfig =
-                    serde_json::from_str(&std::fs::read_to_string(&path)?).map_err(|e| {
-                        anyhow::anyhow!("parse trial config {}: {e}", path.display())
-                    })?;
-                let (base, trial_m) = digest::eval_sweep(pool, subscriber, limit, trial).await?;
-                println!("== current config ==");
-                print!("{base}");
-                println!("\n== trial config ({}) ==", path.display());
-                print!("{trial_m}");
+        } => {
+            // Read + validate any trial config locally (so the path shows in a parse error), then send
+            // it as canonical JSON; the engine replays history under it.
+            let trial_config_json = match &config {
+                None => None,
+                Some(path) => {
+                    let cfg: bulletin_core::digest::select::ScoringConfig =
+                        serde_json::from_str(&std::fs::read_to_string(path)?).map_err(|e| {
+                            anyhow::anyhow!("parse trial config {}: {e}", path.display())
+                        })?;
+                    Some(serde_json::to_string(&cfg)?)
+                }
+            };
+            let resp = dbg
+                .eval_digest(proto::EvalDigestRequest {
+                    subscriber: subscriber.to_string(),
+                    limit,
+                    trial_config_json,
+                })
+                .await?
+                .into_inner();
+            match (resp.trial, &config) {
+                (Some(trial), Some(path)) => {
+                    println!("== current config ==");
+                    print!("{}", resp.baseline);
+                    println!("\n== trial config ({}) ==", path.display());
+                    print!("{trial}");
+                }
+                _ => print!("{}", resp.baseline),
             }
-        },
+        }
+        DebugCommand::DigestProvenance { story_id } => {
+            let entries = dbg
+                .get_digest_provenance(proto::GetDigestProvenanceRequest {
+                    story_id: story_id.to_string(),
+                })
+                .await?
+                .into_inner()
+                .entries;
+            print_provenance(story_id, &entries);
+        }
         DebugCommand::Config => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&digest::get_config(pool).await?)?
-            );
+            let cfg = dbg
+                .get_config(proto::GetConfigRequest {})
+                .await?
+                .into_inner();
+            println!("{}", serde_json::to_string_pretty(&to_core_config(&cfg))?);
         }
         DebugCommand::ConfigSet {
             relevance_floor,
@@ -319,51 +422,96 @@ pub async fn run(pool: &PgPool, email: &EmailConfig, command: DebugCommand) -> R
             note_cap,
             resurface_penalty,
         } => {
-            let mut cfg = digest::get_config(pool).await?;
-            if let Some(v) = relevance_floor {
-                cfg.relevance_floor = v;
-            }
-            if let Some(v) = scope_bonus {
-                cfg.scope_bonus = v;
-            }
-            if let Some(v) = severity_weight {
-                cfg.severity_weight = v;
-            }
-            if let Some(v) = recency_half_life_days {
-                cfg.recency_half_life_days = v;
-            }
-            if let Some(v) = thread_half_life_days {
-                cfg.thread_half_life_days = v;
-            }
-            if let Some(v) = story_cap {
-                cfg.story_cap = v;
-            }
-            if let Some(v) = note_cap {
-                cfg.note_cap = v;
-            }
-            if let Some(v) = resurface_penalty {
-                cfg.resurface_penalty = v;
-            }
-            digest::set_config(pool, cfg).await?;
-            println!("{}", serde_json::to_string_pretty(&cfg)?);
-        }
-        DebugCommand::DigestProvenance { story_id } => {
-            print_provenance(story_id, &digest::provenance(pool, story_id).await?);
+            let cfg = dbg
+                .set_config(proto::SetConfigRequest {
+                    relevance_floor,
+                    scope_bonus,
+                    severity_weight,
+                    recency_half_life_days,
+                    thread_half_life_days,
+                    story_cap: story_cap.map(|v| v as u64),
+                    note_cap: note_cap.map(|v| v as u64),
+                    resurface_penalty,
+                })
+                .await?
+                .into_inner();
+            println!("{}", serde_json::to_string_pretty(&to_core_config(&cfg))?);
         }
         DebugCommand::Status => {
-            print_status(&status::gather(pool).await?);
+            let report = admin
+                .get_status(proto::GetStatusRequest {})
+                .await?
+                .into_inner();
+            print_status(&report);
         }
     }
     Ok(())
+}
+
+/// Builds a tonic client interceptor that attaches the admin bearer to every request. Returned as a
+/// `Clone` closure so the two clients (stable + unstable) can each own a copy. With no key configured
+/// it attaches nothing and the server fails the call closed.
+fn bearer(
+    token: Option<MetadataValue<Ascii>>,
+) -> impl FnMut(Request<()>) -> Result<Request<()>, tonic::Status> + Clone {
+    move |mut req: Request<()>| {
+        if let Some(t) = &token {
+            req.metadata_mut().insert("authorization", t.clone());
+        }
+        Ok(req)
+    }
+}
+
+/// A required protobuf timestamp (semantically non-null, but always `Option` on the wire) → the
+/// engine's canonical `YYYY-MM-DDTHH:MM:SSZ`, with a `?` fallback if the server somehow omitted it.
+fn req_ts(t: &Option<Timestamp>) -> String {
+    t.as_ref().map(fmt_ts).unwrap_or_else(|| "?".to_string())
+}
+
+/// An optional protobuf timestamp → the canonical format, or `never` when absent (the dashboard idiom).
+fn opt_ts(t: &Option<Timestamp>) -> String {
+    t.as_ref()
+        .map(fmt_ts)
+        .unwrap_or_else(|| "never".to_string())
+}
+
+fn fmt_ts(t: &Timestamp) -> String {
+    chrono::DateTime::from_timestamp(t.seconds, t.nanos as u32)
+        .map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_else(|| "?".to_string())
+}
+
+/// Reconstruct core's `ScoringConfig` from the wire shape so the JSON `debug config` prints is the
+/// exact serde form `digest-eval --config` round-trips.
+fn to_core_config(c: &proto::ScoringConfig) -> bulletin_core::digest::select::ScoringConfig {
+    bulletin_core::digest::select::ScoringConfig {
+        relevance_floor: c.relevance_floor,
+        scope_bonus: c.scope_bonus,
+        severity_weight: c.severity_weight,
+        recency_half_life_days: c.recency_half_life_days,
+        thread_half_life_days: c.thread_half_life_days,
+        story_cap: c.story_cap as usize,
+        note_cap: c.note_cap as usize,
+        resurface_penalty: c.resurface_penalty,
+    }
+}
+
+/// Render a `DigestOutcome` the way the old inline `{outcome:?}` did, from the wire kind + count.
+fn format_outcome(o: &proto::DigestOutcome) -> String {
+    match o.kind.as_str() {
+        "delivered" => format!("Delivered {{ items: {} }}", o.items),
+        "empty" => "Empty".to_string(),
+        "already_delivered" => "AlreadyDelivered".to_string(),
+        "not_yet_due" => "NotYetDue".to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// Renders a `digest-explain` dry-run: one tab-separated row per candidate **story** (verdict,
 /// position or recency rank, time, representative source + title), and — indented beneath a fused
 /// story — each connected cluster with the `link_reason` for why it joined (the M3 cross-source
 /// value). Closes with a one-line tally. Read top-down to see where the cap fell.
-fn print_explain(rows: &[digest::ExplainRow]) {
-    use bulletin_core::digest::select::Verdict;
-
+fn print_explain(rows: &[proto::ExplainRow]) {
     if rows.is_empty() {
         println!("no candidate stories in this subscriber's lookback");
         return;
@@ -371,41 +519,39 @@ fn print_explain(rows: &[digest::ExplainRow]) {
 
     let (mut selected, mut over_cap, mut dropped) = (0, 0, 0);
     for r in rows {
-        let (verdict, slot) = match r.verdict {
-            Verdict::Selected { position } => {
+        let slot = match r.verdict.as_str() {
+            "SELECTED" => {
                 selected += 1;
-                ("SELECTED", format!("pos={position}"))
+                format!("pos={}", r.position.unwrap_or(0))
             }
-            Verdict::OverCap { rank } => {
+            "OVER_CAP" => {
                 over_cap += 1;
-                ("OVER_CAP", format!("rank={rank}"))
+                format!("rank={}", r.rank.unwrap_or(0))
             }
-            Verdict::Dropped { cause } => {
+            "DROPPED" => {
                 dropped += 1;
-                ("DROPPED", format!("{cause:?}"))
+                r.drop_cause.clone().unwrap_or_default()
             }
-        };
-        let (source, title) = match &r.item {
-            Some(item) => (item.source.as_str(), item.title.as_str()),
-            None => ("?", "<empty story>"),
+            _ => String::new(),
         };
         // The M4 scoring outcome (design §10.2): format · richness · relevance · priority.
-        let reason = &r.reason;
         println!(
-            "{verdict}\t{slot}\t{}\t{}\t{}\t[{} {} rel={:.2} pri={:.3}]\t{}",
-            r.last_event_time.format("%Y-%m-%dT%H:%M:%SZ"),
-            source,
+            "{}\t{}\t{}\t{}\t{}\t[{} {} rel={:.2} pri={:.3}]\t{}",
+            r.verdict,
+            slot,
+            req_ts(&r.last_event_time),
+            r.source,
             r.story_id,
-            reason.format.as_str(),
-            reason.richness,
-            reason.relevance,
-            reason.priority,
-            title,
+            r.format,
+            r.richness,
+            r.relevance,
+            r.priority,
+            r.title,
         );
-        for conn in r.item.iter().flat_map(|i| i.connections.iter()) {
+        for conn in &r.connections {
             println!(
                 "    ↳ [{}] {} — {}",
-                conn.source.as_str(),
+                conn.source,
                 conn.title,
                 conn.link_reason.as_deref().unwrap_or("linked"),
             );
@@ -416,19 +562,14 @@ fn print_explain(rows: &[digest::ExplainRow]) {
 
 /// Renders a story's provenance timeline (design §10.1) — one event per line, oldest-first, each with
 /// its time, source, title, and backing link. The "show the data behind this story" drill-down.
-fn print_provenance(story_id: Uuid, entries: &[digest::store::TimelineEntry]) {
+fn print_provenance(story_id: Uuid, entries: &[proto::TimelineEntry]) {
     if entries.is_empty() {
         println!("no events behind story {story_id} (unknown, tombstoned, or empty)");
         return;
     }
     println!("timeline for story {story_id} ({} events):", entries.len());
     for e in entries {
-        println!(
-            "{}\t{}\t{}",
-            e.event_time.format("%Y-%m-%dT%H:%M:%SZ"),
-            e.source.as_str(),
-            e.title,
-        );
+        println!("{}\t{}\t{}", req_ts(&e.event_time), e.source, e.title);
         if let Some(link) = &e.link {
             println!("  {link}");
         }
@@ -439,77 +580,72 @@ fn print_provenance(story_id: Uuid, entries: &[digest::store::TimelineEntry]) {
 /// materialization freshness (unbuilt events, build lag, latest ingest), projection backlog
 /// (subscribers due now, pending digests), and queue depth. Build lag no longer gates digests —
 /// a due subscriber fires regardless; it just means very recent events may ride the next one.
-fn print_status(r: &StatusReport) {
-    fn ts(t: Option<chrono::DateTime<chrono::Utc>>) -> String {
-        t.map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
-            .unwrap_or_else(|| "never".to_string())
-    }
-
-    let c = &r.connections;
+fn print_status(r: &proto::StatusReport) {
+    let c = r.connections.unwrap_or_default();
     println!(
         "connections  {} total ({} active, {} paused, {} errored); {} due now",
         c.total, c.active, c.paused, c.errored, c.due_now
     );
 
-    let e = &r.events;
+    let e = r.events.clone().unwrap_or_default();
     println!(
         "events       {} total, {} unbuilt; latest ingest {}",
         e.total,
         e.unbuilt,
-        ts(e.latest_ingest)
+        opt_ts(&e.latest_ingest)
     );
-    for (source, n) in &e.by_source {
-        println!("               {source}: {n}");
+    for sc in &e.by_source {
+        println!("               {}: {}", sc.source, sc.count);
     }
 
-    let b = &r.build;
+    let b = r.build.unwrap_or_default();
     println!(
         "build        built_through {} ({}s behind now)",
-        b.built_through.format("%Y-%m-%dT%H:%M:%SZ"),
+        req_ts(&b.built_through),
         b.lag_secs
     );
 
-    let cl = &r.clusters;
+    let cl = r.clusters.unwrap_or_default();
     println!(
         "clusters     {} total; latest updated {}",
         cl.total,
-        ts(cl.latest_updated)
+        opt_ts(&cl.latest_updated)
     );
 
-    let s = &r.subscribers;
+    let s = r.subscribers.unwrap_or_default();
     println!(
         "subscribers  {} total ({} daily, {} weekly); {} due now; next run {}",
         s.total,
         s.daily,
         s.weekly,
         s.due_now,
-        ts(s.next_run)
+        opt_ts(&s.next_run)
     );
 
-    let d = &r.digests;
+    let d = r.digests.unwrap_or_default();
     println!(
         "digests      {} total ({} pending, {} delivered); last delivered {}",
         d.total,
         d.pending,
         d.delivered,
-        ts(d.last_delivered)
+        opt_ts(&d.last_delivered)
     );
 
-    match &r.queue {
-        None => println!("queue        not initialized (run `migrate`)"),
-        Some(rows) if rows.is_empty() => println!("queue        empty"),
-        Some(rows) => {
-            println!("queue        (apalis jobs by type)");
-            for q in rows {
-                let oldest = q
-                    .oldest_pending_secs
-                    .map(|s| format!("; oldest pending {s}s"))
-                    .unwrap_or_default();
-                println!(
-                    "               {}: {} pending, {} running, {} done, {} failed, {} killed{}",
-                    q.job_type, q.pending, q.running, q.done, q.failed, q.killed, oldest,
-                );
-            }
+    if !r.queue_initialized {
+        println!("queue        not initialized (run `migrate`)");
+    } else if r.queue.is_empty() {
+        println!("queue        empty");
+    } else {
+        println!("queue        (apalis jobs by type)");
+        for q in &r.queue {
+            let oldest = q
+                .oldest_pending_secs
+                .map(|s| format!("; oldest pending {s}s"))
+                .unwrap_or_default();
+            println!(
+                "               {}: {} pending, {} running, {} done, {} failed, {} killed{}",
+                q.job_type, q.pending, q.running, q.done, q.failed, q.killed, oldest,
+            );
         }
     }
 }

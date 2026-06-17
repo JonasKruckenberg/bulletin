@@ -26,6 +26,33 @@ service AdminService {
   rpc GetStatus(GetStatusRequest) returns (StatusReport);
   rpc ListEvents(ListEventsRequest) returns (ListEventsResponse);
   rpc ListDigests(ListDigestsRequest) returns (ListDigestsResponse);
+
+}
+
+// The UNSTABLE debug/operator plane. This is a *separate service* on purpose: the instability is
+// encoded in the service name itself, so it survives code generation — it shows up as
+// `UnstableDebugService` in the generated server trait + client, in gRPC reflection, and on the wire
+// path (`/bulletin.v1.UnstableDebugService/…`). A comment alone would vanish at codegen; the name
+// does not.
+//
+// These RPCs back the `bulletin debug …` operator commands (build-run / digest-run / digest-dispatch /
+// digest-explain / digest-eval / digest-provenance / config / config-set) and are EXEMPT from the v1
+// wire-compatibility guarantee on AdminService: their request/response shapes (and the messages they
+// use) may change or be removed in any release without a version bump. They exist to drive the
+// first-party CLI — do NOT build external integrations on them; use AdminService for that.
+//
+// It runs under the same admin bearer + `ScopeCtx::Admin` as AdminService. The two send RPCs deliver
+// server-side, so the operator running the CLI needs no SMTP credential — the engine holds it; the
+// selection/eval RPCs are read-only dry-runs.
+service UnstableDebugService {
+  rpc RunBuild(RunBuildRequest) returns (RunBuildResponse);
+  rpc RunDigest(RunDigestRequest) returns (DigestOutcome);
+  rpc DispatchDigest(DispatchDigestRequest) returns (DigestOutcome);
+  rpc ExplainDigest(ExplainDigestRequest) returns (ExplainDigestResponse);
+  rpc EvalDigest(EvalDigestRequest) returns (EvalDigestResponse);
+  rpc GetDigestProvenance(GetDigestProvenanceRequest) returns (GetDigestProvenanceResponse);
+  rpc GetConfig(GetConfigRequest) returns (ScoringConfig);
+  rpc SetConfig(SetConfigRequest) returns (ScoringConfig);
 }
 
 // ── Connections ────────────────────────────────────────────────────────────
@@ -138,4 +165,104 @@ message DigestSummary {
   google.protobuf.Timestamp window_end = 3;
   optional google.protobuf.Timestamp delivered_at = 4;
   int64 item_count = 5;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// UNSTABLE: debug/operator messages. Everything below backs the `bulletin debug …` CLI and is EXEMPT
+// from the v1 wire-compatibility guarantee — these shapes may change or disappear in any release
+// without a version bump. Not for external integration.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+// ── Pipeline build (debug build-run) ─────────────────────────────────────────
+message RunBuildRequest {}
+message RunBuildResponse {
+  bool skipped = 1;                                // another build already in progress
+  uint64 dirty_groups = 2;                         // groups (re)built this run; 0 when skipped
+  optional google.protobuf.Timestamp built_through = 3;  // new watermark; absent when skipped
+}
+
+// ── Digest send (debug digest-run / digest-dispatch) ─────────────────────────
+// Delivered server-side by the engine's own mailer, so the caller carries no SMTP credential.
+message RunDigestRequest { string subscriber = 1; }
+message DispatchDigestRequest {
+  string subscriber = 1;
+  int32 lookback_days = 2;                         // 0 ⇒ default (7)
+}
+// Mirrors core's DigestOutcome. `items` is meaningful only for kind = "delivered".
+message DigestOutcome {
+  string kind = 1;                                 // delivered | empty | already_delivered | not_yet_due
+  uint64 items = 2;
+}
+
+// ── Selection dry-run (debug digest-explain) ─────────────────────────────────
+message ExplainDigestRequest { string subscriber = 1; }
+message ExplainDigestResponse { repeated ExplainRow rows = 1; }
+// One candidate story's verdict + the scoring rationale behind it. Exactly one of position / rank /
+// drop_cause is set, keyed to `verdict`.
+message ExplainRow {
+  string verdict = 1;                              // SELECTED | OVER_CAP | DROPPED
+  optional uint64 position = 2;                    // set iff SELECTED
+  optional uint64 rank = 3;                        // set iff OVER_CAP
+  optional string drop_cause = 4;                  // set iff DROPPED
+  google.protobuf.Timestamp last_event_time = 5;
+  string source = 6;                               // representative source ("?" for an empty story)
+  string story_id = 7;
+  string format = 8;                               // story | note
+  string richness = 9;
+  float relevance = 10;
+  float priority = 11;
+  string title = 12;
+  repeated ExplainConnection connections = 13;     // the fused clusters (the cross-source value)
+}
+message ExplainConnection {
+  string source = 1;
+  string title = 2;
+  optional string link_reason = 3;
+}
+
+// ── Eval harness (debug digest-eval) ─────────────────────────────────────────
+message EvalDigestRequest {
+  string subscriber = 1;
+  int64 limit = 2;                                 // 0 ⇒ default (50)
+  optional string trial_config_json = 3;           // a ScoringConfig JSON ⇒ A/B sweep vs the live config
+}
+message EvalDigestResponse {
+  // The metrics report(s), pre-rendered by core's Metrics formatter — the wire carries no layout, the
+  // single source of formatting truth stays in core. `trial` is present iff trial_config_json was set.
+  string baseline = 1;
+  optional string trial = 2;
+}
+
+// ── Story provenance (debug digest-provenance) ───────────────────────────────
+message GetDigestProvenanceRequest { string story_id = 1; }
+message GetDigestProvenanceResponse { repeated TimelineEntry entries = 1; }
+message TimelineEntry {
+  google.protobuf.Timestamp event_time = 1;
+  string source = 2;
+  string title = 3;
+  optional string link = 4;
+}
+
+// ── Scoring config (debug config / config-set) ───────────────────────────────
+message ScoringConfig {
+  float relevance_floor = 1;
+  float scope_bonus = 2;
+  float severity_weight = 3;
+  double recency_half_life_days = 4;
+  double thread_half_life_days = 5;
+  uint64 story_cap = 6;
+  uint64 note_cap = 7;
+  float resurface_penalty = 8;
+}
+message GetConfigRequest {}
+// Sparse update: only the fields present change; the server merges onto the live config and returns it.
+message SetConfigRequest {
+  optional float relevance_floor = 1;
+  optional float scope_bonus = 2;
+  optional float severity_weight = 3;
+  optional double recency_half_life_days = 4;
+  optional double thread_half_life_days = 5;
+  optional uint64 story_cap = 6;
+  optional uint64 note_cap = 7;
+  optional float resurface_penalty = 8;
 }

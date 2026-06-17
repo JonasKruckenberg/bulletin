@@ -79,8 +79,17 @@ is the only switch — without it `summarize_public` is an empty no-op and no su
   `PROMPT_VERSION` *config* env — not an enable flag), `baseUrl`, `model`, `promptVersion`,
   `serveLocally` (provisions `services.llama-cpp` on the port parsed from `baseUrl`), `package`,
   `modelPath`.
-- The worker is `wants`/`after` (not `requires`) the sidecar — summarization is best-effort, so a
-  down/slow sidecar never blocks the worker or a digest.
+- The worker is `wants`/`after` (not `requires`) the sidecar — summarization is best-effort *once
+  running*, so a down/slow sidecar mid-sweep never blocks the worker or a digest (clusters degrade to
+  baseline and retry).
+- **Startup is the exception — a fail-loud gate.** A `llm-summarization` build verifies the sidecar is
+  reachable (`{BASE_URL}/models`) before the worker starts / before `all` binds `/health`
+  (`ensure_sidecar_ready` → `summarize::client::ensure_reachable`). An unreachable sidecar at boot is a
+  deploy/config error (wrong `BULLETIN_LLM_BASE_URL`, sidecar absent, model failed to load), not a
+  transient blip, so it is a **hard error**: the unit never reports healthy and the deploy rolls back,
+  rather than silently shipping deterministic baselines forever. The wait window (the sidecar may still
+  be loading its GGUF) is bounded by `BULLETIN_LLM_STARTUP_TIMEOUT_SECS` (default `60`); the systemd
+  `ExecStartPost` health probe is widened to match when `llm.enable`.
 
 ---
 
@@ -162,8 +171,10 @@ is the only switch — without it `summarize_public` is an empty no-op and no su
     retries, as for any other sidecar failure.
 - **Operational knobs are env-tunable** (no recompile): `BULLETIN_LLM_REQUEST_TIMEOUT_SECS` (raise on
   slow hardware — default `120`), `BULLETIN_LLM_COMPREHEND` (`false` drops the extra per-cluster
-  comprehension call to halve sidecar load when timeouts bite), and `BULLETIN_LLM_DISABLE_THINKING`
-  (clear for a model that genuinely needs thinking). See `SummarizationConfig::from_env`.
+  comprehension call to halve sidecar load when timeouts bite), `BULLETIN_LLM_DISABLE_THINKING`
+  (clear for a model that genuinely needs thinking), and `BULLETIN_LLM_STARTUP_TIMEOUT_SECS` (how long
+  the startup reachability gate waits for the sidecar before failing — default `60`). See
+  `SummarizationConfig::from_env` / `ensure_sidecar_ready`.
 - **The model path is never exercised in CI** (no sidecar). All *pure* logic is unit-tested (11 tests
   in `summarize::tests`); the network round-trip needs a live `llama-server`. To smoke-test locally:
   run a llama.cpp server, build with `--features llm-summarization`, set `BULLETIN_LLM_BASE_URL`,

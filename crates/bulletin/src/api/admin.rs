@@ -3,24 +3,39 @@
 //! handler), so each handler is pure "convert → call core → convert"; the `core` store fns open their
 //! own `ScopeCtx::Admin` transaction, so there's no scope ceremony here either.
 
-use bulletin_core::{digest, ingest, status};
+use bulletin_core::digest::select::ScoringConfig;
+use bulletin_core::{cluster, digest, ingest, status};
 use sqlx::PgPool;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
+use crate::transport::EmailConfig;
+
 use super::proto::admin_service_server::AdminService;
+use super::proto::unstable_debug_service_server::UnstableDebugService;
 use super::{convert, error, proto};
 
 /// The default row cap for the list RPCs when the caller leaves `limit` unset — matches the CLI's.
 const DEFAULT_LIST_LIMIT: i64 = 20;
+/// The default eval window when the caller leaves `limit` unset — matches the CLI's `digest-eval`.
+const DEFAULT_EVAL_LIMIT: i64 = 50;
+/// The default ad-hoc dispatch lookback when the caller leaves it unset — matches the CLI.
+const DEFAULT_LOOKBACK_DAYS: i32 = 7;
 
+/// Clone is cheap (the pool is an `Arc` handle, the email config is small) and lets the one instance
+/// back both gRPC services — the stable `AdminService` and the `UnstableDebugService` — each registered
+/// behind its own copy of the auth interceptor.
+#[derive(Clone)]
 pub struct AdminApi {
     pool: PgPool,
+    /// Email delivery config the engine owns. The send RPCs build the mailer here, server-side, so
+    /// the caller (the `debug` CLI) never needs the SMTP credential to fire a digest.
+    email: EmailConfig,
 }
 
 impl AdminApi {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new(pool: PgPool, email: EmailConfig) -> Self {
+        Self { pool, email }
     }
 }
 
@@ -181,5 +196,193 @@ impl AdminService for AdminApi {
                 .map(|(d, email, count)| convert::digest_summary(d, email, count))
                 .collect(),
         }))
+    }
+}
+
+/// The UNSTABLE debug/operator plane (mirrors the `bulletin debug …` commands). A distinct service so
+/// its instability is in the name — it can't be mistaken for the wire-stable `AdminService`. Same
+/// `AdminApi` backs both: identical auth (admin bearer) and scope (`ScopeCtx::Admin`).
+#[tonic::async_trait]
+impl UnstableDebugService for AdminApi {
+    async fn run_build(
+        &self,
+        _req: Request<proto::RunBuildRequest>,
+    ) -> Result<Response<proto::RunBuildResponse>, Status> {
+        let resp = match cluster::build(&self.pool)
+            .await
+            .map_err(error::internal("run build"))?
+        {
+            Some(stats) => proto::RunBuildResponse {
+                skipped: false,
+                dirty_groups: stats.dirty_groups as u64,
+                built_through: Some(convert::ts(stats.built_through)),
+            },
+            None => proto::RunBuildResponse {
+                skipped: true,
+                dirty_groups: 0,
+                built_through: None,
+            },
+        };
+        Ok(Response::new(resp))
+    }
+
+    async fn run_digest(
+        &self,
+        req: Request<proto::RunDigestRequest>,
+    ) -> Result<Response<proto::DigestOutcome>, Status> {
+        let subscriber = parse_uuid(&req.into_inner().subscriber, "subscriber")?;
+        let sender = self.build_sender()?;
+        let outcome = digest::generate(&self.pool, &sender, subscriber, &self.email.content())
+            .await
+            .map_err(error::internal("generate digest"))?;
+        Ok(Response::new(convert::digest_outcome(outcome)))
+    }
+
+    async fn dispatch_digest(
+        &self,
+        req: Request<proto::DispatchDigestRequest>,
+    ) -> Result<Response<proto::DigestOutcome>, Status> {
+        let r = req.into_inner();
+        let subscriber = parse_uuid(&r.subscriber, "subscriber")?;
+        // 0 ⇒ default; a negative window is rejected (the CLI guarded `>= 1` inline).
+        let lookback_days = if r.lookback_days == 0 {
+            DEFAULT_LOOKBACK_DAYS
+        } else if r.lookback_days < 1 {
+            return Err(Status::invalid_argument("lookback_days must be >= 1"));
+        } else {
+            r.lookback_days
+        };
+        let sender = self.build_sender()?;
+        let outcome = digest::dispatch_now(
+            &self.pool,
+            &sender,
+            subscriber,
+            lookback_days,
+            &self.email.content(),
+        )
+        .await
+        .map_err(error::internal("dispatch digest"))?;
+        Ok(Response::new(convert::digest_outcome(outcome)))
+    }
+
+    async fn explain_digest(
+        &self,
+        req: Request<proto::ExplainDigestRequest>,
+    ) -> Result<Response<proto::ExplainDigestResponse>, Status> {
+        let subscriber = parse_uuid(&req.into_inner().subscriber, "subscriber")?;
+        let rows = digest::explain(&self.pool, subscriber)
+            .await
+            .map_err(error::internal("explain digest"))?;
+        Ok(Response::new(proto::ExplainDigestResponse {
+            rows: rows.into_iter().map(convert::explain_row).collect(),
+        }))
+    }
+
+    async fn eval_digest(
+        &self,
+        req: Request<proto::EvalDigestRequest>,
+    ) -> Result<Response<proto::EvalDigestResponse>, Status> {
+        let r = req.into_inner();
+        let subscriber = parse_uuid(&r.subscriber, "subscriber")?;
+        let limit = if r.limit > 0 {
+            r.limit
+        } else {
+            DEFAULT_EVAL_LIMIT
+        };
+        // The metrics report is rendered by core's `Metrics` Display so layout stays in one place.
+        let resp = match r.trial_config_json {
+            None => proto::EvalDigestResponse {
+                baseline: digest::eval_report(&self.pool, subscriber, limit)
+                    .await
+                    .map_err(error::internal("eval report"))?
+                    .to_string(),
+                trial: None,
+            },
+            Some(json) => {
+                let trial: ScoringConfig = serde_json::from_str(&json)
+                    .map_err(|e| Status::invalid_argument(format!("parse trial config: {e}")))?;
+                let (base, trial_m) = digest::eval_sweep(&self.pool, subscriber, limit, trial)
+                    .await
+                    .map_err(error::internal("eval sweep"))?;
+                proto::EvalDigestResponse {
+                    baseline: base.to_string(),
+                    trial: Some(trial_m.to_string()),
+                }
+            }
+        };
+        Ok(Response::new(resp))
+    }
+
+    async fn get_digest_provenance(
+        &self,
+        req: Request<proto::GetDigestProvenanceRequest>,
+    ) -> Result<Response<proto::GetDigestProvenanceResponse>, Status> {
+        let story_id = parse_uuid(&req.into_inner().story_id, "story_id")?;
+        let entries = digest::provenance(&self.pool, story_id)
+            .await
+            .map_err(error::internal("digest provenance"))?;
+        Ok(Response::new(proto::GetDigestProvenanceResponse {
+            entries: entries.into_iter().map(convert::timeline_entry).collect(),
+        }))
+    }
+
+    async fn get_config(
+        &self,
+        _req: Request<proto::GetConfigRequest>,
+    ) -> Result<Response<proto::ScoringConfig>, Status> {
+        let cfg = digest::get_config(&self.pool)
+            .await
+            .map_err(error::internal("get config"))?;
+        Ok(Response::new(convert::scoring_config(cfg)))
+    }
+
+    async fn set_config(
+        &self,
+        req: Request<proto::SetConfigRequest>,
+    ) -> Result<Response<proto::ScoringConfig>, Status> {
+        let r = req.into_inner();
+        // Sparse merge: load the live config, overwrite only the fields the caller sent — same
+        // semantics as `debug config-set`, just executed engine-side.
+        let mut cfg = digest::get_config(&self.pool)
+            .await
+            .map_err(error::internal("get config"))?;
+        if let Some(v) = r.relevance_floor {
+            cfg.relevance_floor = v;
+        }
+        if let Some(v) = r.scope_bonus {
+            cfg.scope_bonus = v;
+        }
+        if let Some(v) = r.severity_weight {
+            cfg.severity_weight = v;
+        }
+        if let Some(v) = r.recency_half_life_days {
+            cfg.recency_half_life_days = v;
+        }
+        if let Some(v) = r.thread_half_life_days {
+            cfg.thread_half_life_days = v;
+        }
+        if let Some(v) = r.story_cap {
+            cfg.story_cap = v as usize;
+        }
+        if let Some(v) = r.note_cap {
+            cfg.note_cap = v as usize;
+        }
+        if let Some(v) = r.resurface_penalty {
+            cfg.resurface_penalty = v;
+        }
+        digest::set_config(&self.pool, cfg)
+            .await
+            .map_err(error::internal("set config"))?;
+        Ok(Response::new(convert::scoring_config(cfg)))
+    }
+}
+
+impl AdminApi {
+    /// Build the engine's mailer for a send RPC. A misconfigured transport is a *server* config fault
+    /// (the caller can't fix it), so it surfaces as `Internal` rather than `InvalidArgument`.
+    fn build_sender(&self) -> Result<crate::transport::Sender, Status> {
+        self.email
+            .build_sender()
+            .map_err(|e| Status::internal(format!("build mailer: {e}")))
     }
 }

@@ -3,8 +3,10 @@
 //! engine already materialized.
 
 use bulletin_core::common::event::Event;
-use bulletin_core::digest::store::DigestRow;
+use bulletin_core::digest::select::{ScoringConfig, Verdict};
+use bulletin_core::digest::store::{DigestRow, TimelineEntry};
 use bulletin_core::digest::subscriber::SubscriberRow;
+use bulletin_core::digest::{DigestOutcome, ExplainRow};
 use bulletin_core::ingest::store::ConnectionRow;
 use bulletin_core::status::{
     BuildStatus, ClusterStats, ConnectionStats, DigestStats, EventStats, QueueStats, StatusReport,
@@ -163,5 +165,83 @@ fn queue_stats(s: QueueStats) -> proto::QueueStats {
         failed: s.failed,
         killed: s.killed,
         oldest_pending_secs: s.oldest_pending_secs,
+    }
+}
+
+/// A digest send result. `items` is meaningful only for `Delivered`; the other arms carry 0, matching
+/// how the CLI renders them.
+pub fn digest_outcome(o: DigestOutcome) -> proto::DigestOutcome {
+    let (kind, items) = match o {
+        DigestOutcome::Delivered { items } => ("delivered", items as u64),
+        DigestOutcome::Empty => ("empty", 0),
+        DigestOutcome::AlreadyDelivered => ("already_delivered", 0),
+        DigestOutcome::NotYetDue => ("not_yet_due", 0),
+    };
+    proto::DigestOutcome {
+        kind: kind.to_string(),
+        items,
+    }
+}
+
+/// One `digest-explain` candidate row: its verdict (with the keyed detail — selected position,
+/// over-cap rank, or drop cause), the representative source/title the email would show, the scoring
+/// rationale, and the fused clusters. An empty story (no resolved render item) reports `"?"` / the
+/// `<empty story>` sentinel, mirroring the prior CLI rendering.
+pub fn explain_row(r: ExplainRow) -> proto::ExplainRow {
+    let (verdict, position, rank, drop_cause) = match r.verdict {
+        Verdict::Selected { position } => ("SELECTED", Some(position as u64), None, None),
+        Verdict::OverCap { rank } => ("OVER_CAP", None, Some(rank as u64), None),
+        Verdict::Dropped { cause } => ("DROPPED", None, None, Some(format!("{cause:?}"))),
+    };
+    let (source, title) = match &r.item {
+        Some(item) => (item.source.as_str().to_string(), item.title.clone()),
+        None => ("?".to_string(), "<empty story>".to_string()),
+    };
+    let connections = r
+        .item
+        .iter()
+        .flat_map(|i| i.connections.iter())
+        .map(|c| proto::ExplainConnection {
+            source: c.source.as_str().to_string(),
+            title: c.title.clone(),
+            link_reason: c.link_reason.clone(),
+        })
+        .collect();
+    proto::ExplainRow {
+        verdict: verdict.to_string(),
+        position,
+        rank,
+        drop_cause,
+        last_event_time: Some(ts(r.last_event_time)),
+        source,
+        story_id: r.story_id.to_string(),
+        format: r.reason.format.as_str().to_string(),
+        richness: r.reason.richness,
+        relevance: r.reason.relevance,
+        priority: r.reason.priority,
+        title,
+        connections,
+    }
+}
+
+pub fn timeline_entry(e: TimelineEntry) -> proto::TimelineEntry {
+    proto::TimelineEntry {
+        event_time: Some(ts(e.event_time)),
+        source: e.source.as_str().to_string(),
+        title: e.title,
+        link: e.link,
+    }
+}
+
+pub fn scoring_config(c: ScoringConfig) -> proto::ScoringConfig {
+    proto::ScoringConfig {
+        relevance_floor: c.relevance_floor,
+        scope_bonus: c.scope_bonus,
+        severity_weight: c.severity_weight,
+        recency_half_life_days: c.recency_half_life_days,
+        thread_half_life_days: c.thread_half_life_days,
+        story_cap: c.story_cap as u64,
+        note_cap: c.note_cap as u64,
+        resurface_penalty: c.resurface_penalty,
     }
 }

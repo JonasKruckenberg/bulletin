@@ -311,7 +311,11 @@ suggested alert rules.
 
 ## Seeding & ops
 
-The `bulletin` CLI is on PATH and presets `DATABASE_URL`, so run it as the service user:
+`bulletin debug …` is a thin **gRPC client of the admin API** (`bulletin api`, started as part of
+`bulletin all`) — even locally. It opens no database and builds no mailer, so an operator needs
+neither the runtime DB credential nor the SMTP secret to seed connections or *dispatch a digest*; the
+engine behind the API holds those and does the work. The CLI wrapper on PATH presets `BULLETIN_API_ADDR`
+and sources `api.adminKeyFile`, so run it as the service user:
 
 ```sh
 sudo -u bulletin bulletin debug connection-add --source rss --config '{"url":"https://…/feed.xml"}'
@@ -319,13 +323,19 @@ sudo -u bulletin bulletin debug subscriber-add  --email you@proton.me --name "Yo
 sudo -u bulletin bulletin debug status
 ```
 
+This requires `services.bulletin.api.adminKeyFile` to be set (a bulletin-readable env file holding
+`BULLETIN_API_ADMIN_KEY=…`). Without it the admin plane is fail-closed — every admin RPC is rejected
+and the CLI can't reach the engine.
+
 ## Iteration loop
 
 Tuning digest *logic* needs neither Nix nor a deploy:
 
 - **Tier 0 — local, zero prod risk:** `pg_dump -Fc` the server DB, restore into the local nix
-  dev Postgres, then `cargo run -p bulletin -- --database-url postgres:///bulletin?host=/tmp
-  debug digest-explain <id>`. Native incremental compile; iterate freely.
+  dev Postgres, run an engine against it — `cargo run -p bulletin -- --database-url
+  postgres:///bulletin?host=/tmp --api-admin-key dev api` — then point the CLI at it: `cargo run
+  -p bulletin -- --api-admin-key dev debug digest-explain <id>`. Native incremental compile;
+  iterate freely.
 - **Tier 1 — live data, no deploy:** `sudo -u bulletin bulletin debug digest-explain <id>` on
   the server. `digest-explain` is **read-only** (no writes, no send) — safe to re-run after
   every change. Do *not* loop on `digest-run`: it sends and advances the subscriber watermark

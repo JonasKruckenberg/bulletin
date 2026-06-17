@@ -18,9 +18,9 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
     /// Runtime DB connection string — the **least-privilege role** (`bulletin_app`: non-owner,
-    /// no `BYPASSRLS`) that `serve` / `worker` / `debug` log in as. Under it the two-context RLS
-    /// policies (design §12) physically confine each query to its scope. Required for every role,
-    /// but not for the offline `secrets` key tooling.
+    /// no `BYPASSRLS`) that `serve` / `worker` / `api` log in as. Under it the two-context RLS
+    /// policies (design §12) physically confine each query to its scope. Required for those roles, but
+    /// not for the offline `secrets` tooling or the `debug` CLI (now a gRPC client of `api`).
     #[arg(long, env = "DATABASE_URL")]
     database_url: Option<String>,
     /// Migration DB connection string — the **owner/migration role** that owns the DDL and runs
@@ -35,13 +35,14 @@ struct Cli {
     /// Bind address for the Prometheus metrics exporter (`worker` / `all`).
     #[arg(long, env = "BULLETIN_METRICS_ADDR", default_value = "127.0.0.1:9464")]
     metrics_addr: SocketAddr,
-    /// Bind address for the gRPC service API (`api` / `all`). Loopback by default — front it with TLS
-    /// before exposing it off-box.
+    /// Bind address for the gRPC service API (`api` / `all`), and the address the `debug` CLI dials as
+    /// a client. Loopback by default — front it with TLS before exposing it off-box.
     #[arg(long, env = "BULLETIN_API_ADDR", default_value = "127.0.0.1:50051")]
     api_addr: SocketAddr,
-    /// Bearer key authorizing the gRPC **admin plane** (`api` / `all`). Absent ⇒ every admin RPC is
-    /// rejected (fail-closed). Sealing it under the master key is future work; a plain env value is
-    /// accepted now, like the dev webhook-secret fallback.
+    /// Bearer key authorizing the gRPC **admin plane**. On `api` / `all` it gates every admin RPC
+    /// (absent ⇒ all rejected, fail-closed); on `debug` it is the bearer the CLI presents to the API.
+    /// Sealing it under the master key is future work; a plain env value is accepted now, like the dev
+    /// webhook-secret fallback.
     #[arg(long, env = "BULLETIN_API_ADMIN_KEY")]
     api_admin_key: Option<String>,
     /// Log output format: `text` (human) or `json` (one structured line per event, for Loki).
@@ -51,7 +52,7 @@ struct Cli {
     /// the runtime roles unseal at startup, plus the `secrets` tools that produce them.
     #[command(flatten)]
     secrets: secrets::SecretConfig,
-    /// Email delivery config (worker + `debug digest-run`); defaults to local file transport.
+    /// Email delivery config (worker + the `api` digest-send RPCs); defaults to local file transport.
     #[command(flatten)]
     email: transport::EmailConfig,
 }
@@ -64,8 +65,8 @@ impl Cli {
     }
 }
 
-/// Shared error text for the two places that resolve the runtime DB URL (the `database_url` accessor
-/// and the `Debug` arm, which can't use it because `cli.command` is already partially moved).
+/// Shared error text for resolving the runtime DB URL (the `database_url` accessor and the `Migrate`
+/// arm, which falls back to it when no migration URL is set).
 const DATABASE_URL_REQUIRED: &str = "DATABASE_URL is required (set --database-url or the env var)";
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -138,32 +139,49 @@ async fn main() -> Result<()> {
             metric::init(cli.metrics_addr)?;
             let pool = connect_pool(cli.database_url()?).await?;
             let connectors = cli.secrets.connector_ctx()?;
+            // Fail loud if this is an LLM build and the sidecar isn't reachable (no-op otherwise).
+            ensure_sidecar_ready().await?;
             tracing::info!("starting worker");
             worker::start(pool, cli.email.clone(), connectors).await?;
         }
         Command::Api => {
             let pool = connect_pool(cli.database_url()?).await?;
             tracing::info!(addr = %cli.api_addr, "starting gRPC API server");
-            api::serve(cli.api_addr, pool, cli.api_admin_key.clone()).await?;
+            api::serve(
+                cli.api_addr,
+                pool,
+                cli.api_admin_key.clone(),
+                cli.email.clone(),
+            )
+            .await?;
         }
         Command::All => {
             metric::init(cli.metrics_addr)?;
             let pool = connect_pool(cli.database_url()?).await?;
             let webhook_secret = cli.secrets.webhook_secret()?;
             let connectors = cli.secrets.connector_ctx()?;
+            // Verify the summarization sidecar *before* binding `/health` (no-op without the
+            // `llm-summarization` feature). A feature build that can't reach its sidecar then never
+            // reports healthy, so the deploy's `ExecStartPost` health probe fails and the rollout rolls
+            // back — instead of silently serving deterministic baselines.
+            ensure_sidecar_ready().await?;
             tracing::info!(addr = %cli.http_addr, "starting server + worker + api");
             tokio::try_join!(
                 serve(cli.http_addr, pool.clone(), webhook_secret),
                 worker::start(pool.clone(), cli.email.clone(), connectors),
-                api::serve(cli.api_addr, pool, cli.api_admin_key.clone())
+                api::serve(
+                    cli.api_addr,
+                    pool,
+                    cli.api_admin_key.clone(),
+                    cli.email.clone()
+                )
             )?;
         }
         Command::Debug { command } => {
-            // `command` is moved out here, so reach the URL by field (the `&self` method would
-            // borrow the partially-moved `cli`).
-            let url = cli.database_url.as_deref().context(DATABASE_URL_REQUIRED)?;
-            let pool = connect_pool(url).await?;
-            debug::run(&pool, &cli.email, command).await?;
+            // `debug` is a thin gRPC client of the admin plane (`bulletin api`) — even locally. It
+            // never opens the DB or builds a mailer, so it needs neither DATABASE_URL nor the SMTP
+            // secret; the engine behind the API holds those and does the work.
+            debug::run(cli.api_addr, cli.api_admin_key.clone(), command).await?;
         }
     }
 
@@ -175,6 +193,45 @@ async fn connect_pool(database_url: &str) -> Result<PgPool> {
     bulletin_core::connect(database_url)
         .await
         .context("failed to connect to database")
+}
+
+/// Startup gate: in an `llm-summarization` build, refuse to run the worker if the local summarization
+/// sidecar can't be reached. The feature *is* the summarization edge, so an unreachable sidecar at boot
+/// is a deployment/config error (wrong `BULLETIN_LLM_BASE_URL`, sidecar down, model didn't load) we want
+/// to fail loudly on — not paper over by silently shipping deterministic baselines. Gives the sidecar a
+/// bounded window to come up (it may still be loading its GGUF), tunable via
+/// `BULLETIN_LLM_STARTUP_TIMEOUT_SECS` (default 60). Once past this gate the *running* path stays
+/// best-effort: a transient blip mid-sweep degrades and retries, never blocking a digest.
+#[cfg(feature = "llm-summarization")]
+async fn ensure_sidecar_ready() -> Result<()> {
+    use std::time::Duration;
+    let cfg = bulletin_core::summarize::SummarizationConfig::from_env();
+    let timeout_secs = std::env::var("BULLETIN_LLM_STARTUP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(60);
+    tracing::info!(
+        base_url = %cfg.base_url,
+        timeout_s = timeout_secs,
+        "verifying summarization sidecar is reachable"
+    );
+    bulletin_core::summarize::client::ensure_reachable(&cfg, Duration::from_secs(timeout_secs))
+        .await
+        .context(
+            "summarization sidecar unreachable at startup (llm-summarization build). Bring up the \
+             llama-server sidecar and check BULLETIN_LLM_BASE_URL, or build without the \
+             llm-summarization feature to run the deterministic baseline",
+        )?;
+    tracing::info!("summarization sidecar reachable");
+    Ok(())
+}
+
+/// Without the `llm-summarization` feature there is no sidecar to gate on — the deterministic build runs
+/// unconditionally.
+#[cfg(not(feature = "llm-summarization"))]
+async fn ensure_sidecar_ready() -> Result<()> {
+    Ok(())
 }
 
 /// The HTTP server (`serve` / `all`): liveness `/health` + the webhook catcher (`/webhooks/github`),
