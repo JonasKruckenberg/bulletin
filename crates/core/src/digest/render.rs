@@ -2,6 +2,8 @@
 //! to a `Mailer` the binary supplies (file or SMTP) — so the transport/config stays runtime-side
 //! while the deliver *flow* lives here in the digest slice.
 
+use std::borrow::Cow;
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
@@ -207,10 +209,14 @@ fn render_plain(
     items: &[RenderItem],
 ) -> String {
     // Join the lead onto the greeting only when there is one, so an empty lead leaves no dangling space.
+    // Both are untrusted: the greeting carries the subscriber-set name, and the lead is composed from
+    // item headlines — which are LLM output, and an LLM is steerable by indirect prompt injection
+    // through the feed content it summarized. The HTML view escapes them; the plaintext view has no
+    // markup to escape but still strips control/bidi characters so neither can mangle the line.
     let opening = if lead.is_empty() {
-        greeting.to_string()
+        clean(greeting).into_owned()
     } else {
-        format!("{greeting} {lead}")
+        format!("{} {}", clean(greeting), clean(lead))
     };
     let mut body = format!(
         "{opening}\n\nYour digest for the window ending {}\n\n",
@@ -221,21 +227,26 @@ fn render_plain(
             "{}. [{}] {}\n",
             i + 1,
             item.reason.format.as_str().to_uppercase(),
-            item.headline
+            clean(&item.headline)
         ));
         // The context eyebrow (§6.1 zone 1): the thread label + delta flag, when threaded. Plaintext
         // shows the label regardless of band (no "possibly"/omit budgeting — that's a visual nicety).
         if let Some(tag) = item.thread.as_ref().filter(|t| !t.label.trim().is_empty()) {
             match tag.delta.as_deref().filter(|d| !d.trim().is_empty()) {
-                Some(delta) => body.push_str(&format!("   ~ {} · {delta}\n", tag.label)),
-                None => body.push_str(&format!("   ~ {}\n", tag.label)),
+                Some(delta) => {
+                    body.push_str(&format!("   ~ {} · {}\n", clean(&tag.label), clean(delta)))
+                }
+                None => body.push_str(&format!("   ~ {}\n", clean(&tag.label))),
             }
         }
         // The grounded one-sentence tldr (§6.1 zone 3), when a summary has run; omitted otherwise.
         if !item.summary.trim().is_empty() {
-            body.push_str(&format!("   {}\n", item.summary));
+            body.push_str(&format!("   {}\n", clean(&item.summary)));
         }
-        if let Some(link) = &item.link {
+        // Only print a link the HTML view would also make live (http/https/mailto) — an unsafe scheme is
+        // dropped rather than shown as text, so the two views agree and no `javascript:`/`data:` URL ever
+        // reaches the reader. Sanitized of control/bidi characters by `safe_href`.
+        if let Some(link) = item.link.as_deref().and_then(safe_href) {
             body.push_str(&format!("   {link}\n"));
         }
         body.push_str(&format!(
@@ -249,12 +260,16 @@ fn render_plain(
         body.push_str(&format!("   why: {}\n", reason_line(&item.reason)));
         // The cross-source connections fused into this story, each with why it belongs (§8.2).
         for conn in &item.connections {
-            body.push_str(&format!("   ↳ {} [{}]", conn.title, conn.source.as_str()));
+            body.push_str(&format!(
+                "   ↳ {} [{}]",
+                clean(&conn.title),
+                conn.source.as_str()
+            ));
             if let Some(reason) = &conn.link_reason {
-                body.push_str(&format!(" — {reason}"));
+                body.push_str(&format!(" — {}", clean(reason)));
             }
             body.push('\n');
-            if let Some(link) = &conn.link {
+            if let Some(link) = conn.link.as_deref().and_then(safe_href) {
                 body.push_str(&format!("     {link}\n"));
             }
         }
@@ -266,6 +281,8 @@ fn render_plain(
 /// Plaintext fallback for the empty digest: the cheerful counterpart to [`render_plain`], opened
 /// with the time-of-day salutation so it matches the populated digest's voice.
 fn render_empty_plain(window_end: DateTime<Utc>, tz: Tz, salutation: &str) -> String {
+    // The salutation carries the subscriber-set name — strip control/bidi chars for the plaintext view.
+    let salutation = clean(salutation);
     format!(
         "{salutation}. You're all caught up!\n\n\
          No new items in the window ending {}.\n\
@@ -529,10 +546,10 @@ fn date_rule(date: &str) -> String {
 /// [`soft_divider`], not a rule.
 fn render_story_row(position: usize, item: &RenderItem, tz: Tz) -> String {
     let headline_text = escape(&item.headline);
-    let headline = match &item.link {
+    let headline = match item.link.as_deref().and_then(safe_href) {
         Some(link) => format!(
             r#"<a class="headline" href="{}" style="display:block;margin-top:10px;font-family:{SERIF};font-size:22px;font-weight:700;line-height:1.32;color:{INK};text-decoration:none;">{headline_text}</a>"#,
-            escape(link)
+            escape_attr(&link)
         ),
         None => format!(
             r#"<span class="headline" style="display:block;margin-top:10px;font-family:{SERIF};font-size:22px;font-weight:700;line-height:1.32;color:{INK};">{headline_text}</span>"#
@@ -751,10 +768,10 @@ fn debug_trace_block(position: usize, item: &RenderItem, tz: Tz) -> String {
 /// can still out-rank a Story (it's interleaved in global priority order).
 fn render_note_row(item: &RenderItem, tz: Tz) -> String {
     let headline_text = escape(&item.headline);
-    let headline = match &item.link {
+    let headline = match item.link.as_deref().and_then(safe_href) {
         Some(link) => format!(
             r#"<a href="{}" style="display:block;margin-top:8px;font-family:{SERIF};font-size:17px;font-weight:700;line-height:1.4;color:{INK};text-decoration:none;">{headline_text}</a>"#,
-            escape(link)
+            escape_attr(&link)
         ),
         None => format!(
             r#"<span style="display:block;margin-top:8px;font-family:{SERIF};font-size:17px;font-weight:700;line-height:1.4;color:{INK};">{headline_text}</span>"#
@@ -805,21 +822,73 @@ fn render_eyebrow(thread: Option<&ThreadTag>) -> String {
     )
 }
 
-/// Minimal HTML escaping for untrusted feed text, safe in both element-text and double-quoted
-/// attribute contexts (the two places we interpolate).
-fn escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(c),
-        }
+/// Characters we drop from untrusted feed/model text *before* HTML-escaping it — a class that can
+/// never legitimately appear in a calm editorial digest line and that "renders weirdly" (or worse) when
+/// it does:
+///
+/// - **C0/C1 control codes** (`U+0000`–`U+001F`, `U+007F`–`U+009F`) — non-printing bytes that can
+///   smuggle a scheme past a URL check or, in the plaintext view, **forge a line**: a newline in an
+///   untrusted headline would inject an attacker-controlled row outside the numbered list (the HTML view
+///   collapses whitespace, the plaintext view does not, so the control chars must go before either);
+/// - **bidi embeddings, overrides and isolates** (`U+202A`–`U+202E`, `U+2066`–`U+2069`) — the
+///   Trojan-Source / spoofing family that visually reorders text so a headline reads as something it
+///   isn't;
+/// - **zero-width and join controls + BOM** (`U+200B`–`U+200F`, `U+2060`–`U+2064`, `U+FEFF`) — invisible
+///   characters that hide content or split words the eye can't see.
+///
+/// Tab and newline are stripped along with the rest of the C0 range: these are single-line digest fields
+/// (headline, tldr, label, delta, connection title), so an embedded tab/newline is never legitimate and
+/// is exactly what enables plaintext line-forgery. Everything else printable passes through to [`escape`].
+fn is_unsafe_char(c: char) -> bool {
+    matches!(c,
+        '\u{0000}'..='\u{001F}' | '\u{007F}'..='\u{009F}'
+        | '\u{200B}'..='\u{200F}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}'
+        | '\u{202A}'..='\u{202E}' | '\u{FEFF}'
+    )
+}
+
+/// Drop the [`is_unsafe_char`] class (control / bidi / zero-width) from untrusted feed/model text — the
+/// shared Trojan-Source sanitization both the HTML escapers and the plaintext sinks run, so a hostile or
+/// malformed feed can't reorder, hide, or forge a line. No HTML escaper covers this class (it's a Unicode
+/// concern, not a markup one), so it's ours. Returns `Borrowed` when the text is already clean (the
+/// common case), allocating only when something must actually be removed.
+fn clean(s: &str) -> Cow<'_, str> {
+    if s.chars().any(is_unsafe_char) {
+        Cow::Owned(s.chars().filter(|c| !is_unsafe_char(*c)).collect())
+    } else {
+        Cow::Borrowed(s)
     }
-    out
+}
+
+/// HTML entity-encode untrusted feed/model text for an **element-text** context (between tags) — the
+/// vast majority of our interpolations: headlines, summaries, labels, badge surfaces, chrome. [`clean`]s
+/// the Trojan-Source class first, then delegates the entity-encoding to `html_escape::encode_text`
+/// (escapes `&`, `<`, `>`) rather than hand-rolling it. Attribute values use [`escape_attr`] instead.
+fn escape(s: &str) -> String {
+    html_escape::encode_text(&clean(s)).into_owned()
+}
+
+/// HTML entity-encode untrusted text for a **double-quoted attribute** value — the one such sink is the
+/// link `href`. `html_escape::encode_double_quoted_attribute` escapes `&` and `"` so the value can never
+/// close the attribute, after the same [`clean`]. (`encode_text` is *not* safe here — it leaves `"` intact.)
+fn escape_attr(s: &str) -> String {
+    html_escape::encode_double_quoted_attribute(&clean(s)).into_owned()
+}
+
+/// A feed-supplied URL we are willing to emit as a live `href` / link target, or `None` to render the
+/// item **unlinked**. Feed links are untrusted: a `javascript:`, `data:`, or `vbscript:` URL executes
+/// (or renders attacker markup) in the mail clients that honour it, and HTML-escaping does not stop it —
+/// escaping only neutralizes the quotes that would break the attribute, not the scheme inside it. So we
+/// allowlist **only** the schemes a digest link can legitimately use — `http`, `https`, `mailto`. We
+/// WHATWG-parse the link with the `url` crate and check the normalized `scheme()`, rather than
+/// prefix-matching the raw string: the parser strips the control characters that could hide a scheme,
+/// rejects malformed and relative/scheme-relative URLs, and normalizes the scheme, so the allowlist can't
+/// be slipped by casing or whitespace tricks. Anything that doesn't parse, or parses to a scheme outside
+/// the allowlist, drops to `None` and the caller shows plain text. The serializer percent-encodes any
+/// control characters, so the result is clean; callers still HTML-escape it via [`escape_attr`].
+fn safe_href(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url.trim()).ok()?;
+    matches!(parsed.scheme(), "http" | "https" | "mailto").then(|| parsed.to_string())
 }
 
 #[cfg(test)]
@@ -926,9 +995,11 @@ mod tests {
         // No raw injection survives.
         assert!(!html.contains("<script>"));
         assert!(html.contains("Tom &amp; Jerry &lt;script&gt;"));
-        // The attribute-breaking quote in the link is neutralised.
+        // The attribute-breaking quote in the link is neutralised: WHATWG-parsing percent-encodes the
+        // `"`/`<`/`>` (so `"` becomes `%22`), and the attribute encoder entitizes the `&` separator — so
+        // nothing can close the href and inject markup.
         assert!(!html.contains(r#"a=1&b=2"></a>"#));
-        assert!(html.contains("&amp;b=2&quot;"));
+        assert!(html.contains("a=1&amp;b=2%22"));
     }
 
     #[test]
@@ -1307,5 +1378,112 @@ mod tests {
 
         assert!(plain.starts_with("Good evening. You're all caught up!"));
         assert!(plain.contains("2026-06-13 09:00 UTC"));
+    }
+
+    // ── Untrusted-input hardening (feed text AND LLM output) ─────────────────────────────────────
+    //
+    // The headline/tldr/label/surface fields are LLM output, and an LLM is steerable by *indirect
+    // prompt injection* through the feed content it summarized — so they are exactly as untrusted as
+    // the raw feed, and the faithfulness gate (grounding/voice/length) is not an injection defense.
+    // The renderer is the trust boundary: it escapes/cleans every interpolated string by sink,
+    // regardless of provenance. These tests pin that down.
+
+    #[test]
+    fn llm_and_feed_text_is_escaped_and_stripped_in_html() {
+        // A prompt-injected summary tries to smuggle script markup and Trojan-Source spoofing chars
+        // (a bidi override + a zero-width space) through the headline and the tldr.
+        let evil_headline = "Safe news\u{202E}<script>alert(1)</script>\u{200B}";
+        let evil_tldr = "A summary with <img src=x onerror=alert(1)> then \u{202E}reversed.";
+        let item = summarized(
+            "raw",
+            evil_headline,
+            evil_tldr,
+            Some("https://example.com"),
+            SourceKind::Rss,
+        );
+        let html = render_one(&item);
+
+        // No live markup survives from either field; the angle brackets are entitized.
+        assert!(!html.contains("<script>"));
+        assert!(!html.contains("<img"));
+        assert!(html.contains("&lt;script&gt;"));
+        // The bidi-override and zero-width characters are stripped entirely.
+        assert!(!html.contains('\u{202E}'));
+        assert!(!html.contains('\u{200B}'));
+    }
+
+    #[test]
+    fn unsafe_link_schemes_drop_to_plain_text() {
+        // A javascript:/data:/vbscript: feed link must never become a live href — HTML-escaping does
+        // not stop the scheme. The item renders unlinked instead, and the payload never appears.
+        for scheme in [
+            "javascript:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "vbscript:msgbox(1)",
+        ] {
+            let item = summarized("raw", "H", "S", Some(scheme), SourceKind::Rss);
+            let html = render_one(&item);
+            assert!(!html.contains(r#"href="javascript:"#));
+            assert!(!html.contains(r#"href="data:"#));
+            assert!(!html.contains(r#"href="vbscript:"#));
+            assert!(!html.contains("<script>"));
+            // Unlinked: the headline is a span, not an anchor.
+            assert!(html.contains(r#"<span class="headline""#));
+        }
+        // A legitimate https link is still emitted as a live href.
+        let ok = summarized(
+            "raw",
+            "H",
+            "S",
+            Some("https://example.com/x"),
+            SourceKind::Rss,
+        );
+        assert!(render_one(&ok).contains(r#"href="https://example.com/x""#));
+    }
+
+    #[test]
+    fn malicious_entity_badge_surface_is_escaped() {
+        // The model chooses each entity badge's `surface` display text — escape it like any other run.
+        let item = RenderItem {
+            summary: "x".to_string(),
+            summary_runs: vec![TldrRun::Ref {
+                entity: "repo:acme/auth".to_string(),
+                surface: "<script>alert(1)</script>".to_string(),
+            }],
+            summary_band: Band::Confirmed,
+            ..item("t", None, SourceKind::Github)
+        };
+        let html = render_one(&item);
+        assert!(!html.contains("<script>"));
+        assert!(html.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn plaintext_lead_and_fields_are_stripped_of_control_chars() {
+        // The plaintext lead is composed from (LLM) headlines and has no markup to escape, but bidi /
+        // zero-width characters must still be stripped so they can't reorder or hide the line.
+        // The headline also carries an embedded newline (line-forgery) and tab.
+        let items = vec![summarized(
+            "raw",
+            "Headline\u{202E}flip\u{200B}\nFORGED LINE\there",
+            "Body\u{202E}text",
+            Some("javascript:alert(1)"),
+            SourceKind::Rss,
+        )];
+        let plain = render_plain(
+            Utc.with_ymd_and_hms(2026, 6, 13, 9, 0, 0).unwrap(),
+            Tz::UTC,
+            "Good morning.",
+            &compose_lead(&items),
+            &items,
+        );
+        assert!(!plain.contains('\u{202E}'));
+        assert!(!plain.contains('\u{200B}'));
+        // The embedded newline/tab are stripped, so the injected text can't forge a separate line: no
+        // plaintext line begins with the attacker's "FORGED LINE" — it stays inside the headline row.
+        assert!(!plain.contains('\t'));
+        assert!(!plain.lines().any(|l| l.starts_with("FORGED LINE")));
+        // The unsafe-schemed link is dropped from the plaintext view too (never shown, even as text).
+        assert!(!plain.contains("javascript:"));
     }
 }

@@ -30,12 +30,27 @@ use crate::link::{Assignment, LinkCluster, PriorMember};
 /// (The other half of the design's blocking seed — public clusters matching the subscriber's
 /// *affinity* — lands with relevance in M4; until then the in-floor arm carries the public set.)
 /// Ordered by id for a deterministic linking input.
+///
+/// When `require_summary` is set (the `llm-summarization` build — the caller passes the compile-time
+/// feature), a cluster is a candidate **only once it carries a gate-passed model summary** (`summary`'s
+/// `band` is `confirmed`/`probable`). A cluster that was never summarized, or whose model output the
+/// faithfulness gate rejected to the deterministic `uncertain` baseline, is *withheld* and slips to a
+/// later digest once the off-path sweep summarizes it — so the LLM build never ships an item without a
+/// real grounded summary. With the feature off this is `false` and the deterministic digest is unchanged
+/// (gating on a summary that is never produced would empty every digest). Strict, with no age valve: a
+/// prolonged sidecar outage withholds those clusters until it recovers rather than degrading to baseline.
 pub async fn candidate_clusters(
     executor: impl PgExecutor<'_>,
     subscriber_id: Uuid,
     last_run: Option<DateTime<Utc>>,
     horizon_days: i32,
+    require_summary: bool,
 ) -> Result<Vec<LinkCluster>, sqlx::Error> {
+    // The summary gate is a bound bool ($4), not interpolated SQL: when `require_summary` is false the
+    // `$4` arm short-circuits the predicate true (allow all); when true, the cluster must carry a
+    // gate-passed model summary. `band` is read from the `summary` jsonb — a never-summarized cluster
+    // ('{}') has no band and a rejected baseline bands `uncertain`, so both are excluded. Applied to the
+    // two public-candidate arms (in_floor, cross_boundary), never to the private_strong seed.
     sqlx::query(
         "WITH floor AS (SELECT LEAST($2, now() - make_interval(days => $3)) AS lo),
               in_floor AS (
@@ -44,11 +59,14 @@ pub async fn candidate_clusters(
                   FROM cluster
                   WHERE (scope_kind = 'public' OR scope_subscriber_id = $1)
                     AND updated_at >= (SELECT lo FROM floor)
+                    AND (NOT $4 OR summary ->> 'band' IN ('confirmed', 'probable'))
               ),
               -- The strong keys (cve:/url:, mirrors entity::link_strength) the subscriber's *active*
               -- private clusters carry — floored like in_floor, so the seed scales with recent
               -- private activity (a fresh incident), not lifetime history. NULL when they have
-              -- none, which makes the seed below a no-op.
+              -- none, which makes the seed below a no-op. (Ungated: an unsummarized private incident
+              -- can still pull in its related public advisory, which is itself summary-gated below;
+              -- the incident itself stays out of the candidate set via the in_floor gate.)
               private_strong AS (
                   SELECT array_agg(DISTINCT e) AS keys
                   FROM cluster c, unnest(c.entities) AS e
@@ -64,6 +82,7 @@ pub async fn candidate_clusters(
                   FROM cluster
                   WHERE scope_kind = 'public'
                     AND entities && (SELECT keys FROM private_strong)
+                    AND (NOT $4 OR summary ->> 'band' IN ('confirmed', 'probable'))
               )
          SELECT * FROM in_floor
          UNION
@@ -73,6 +92,7 @@ pub async fn candidate_clusters(
     .bind(subscriber_id)
     .bind(last_run)
     .bind(horizon_days)
+    .bind(require_summary)
     .try_map(|row: PgRow| {
         let scope_kind: String = row.get("scope_kind");
         Ok(LinkCluster {

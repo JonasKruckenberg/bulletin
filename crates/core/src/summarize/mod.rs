@@ -91,8 +91,10 @@ impl Default for SummarizationConfig {
             base_url: "http://127.0.0.1:8080/v1".to_string(),
             model: "qwen3.5-4b-instruct".to_string(),
             // Bumped to 2 with the comprehension pass: facts now carry event_type/state/certainty, so
-            // a re-summarize of the corpus picks up the richer (and hedge-aware) phrasing.
-            prompt_version: 2,
+            // a re-summarize of the corpus picks up the richer (and hedge-aware) phrasing. Bumped to 3
+            // with the "don't paste raw URLs" rule (+ the deterministic url_like_token gate), so the
+            // corpus re-summarizes without the leaked raw source links.
+            prompt_version: 3,
             headline_max_tokens: 24,
             tldr_max_tokens: 96,
             comprehension_max_tokens: 256,
@@ -584,6 +586,11 @@ pub enum GateViolation {
     UngroundedNumber(String),
     /// A banned hype word or second-person address slipped through (§3.6 denylist).
     BannedWord(String),
+    /// A raw URL (a scheme, or a `www.`/`mailto:` prefix) leaked into the prose. The model names sources;
+    /// it doesn't paste links (the interface carries them). Rejected because a pasted URL reads as an
+    /// artifact *and* because some mail clients auto-linkify one in displayed text — a link surface
+    /// outside the renderer's scheme allowlist. Bare domains (`databricks.com`) are allowed.
+    UrlInProse(String),
     /// The headline or tldr exceeds its length budget.
     TooLong,
 }
@@ -670,6 +677,12 @@ pub fn faithful(
         return Err(GateViolation::BannedWord(w));
     }
 
+    // No web addresses in the prose: the model names sources and the interface carries the link, so a
+    // leaked URL is both an artifact and a client-autolink surface outside the renderer's allowlist.
+    if let Some(u) = url_like_token(&output) {
+        return Err(GateViolation::UrlInProse(u));
+    }
+
     Ok(())
 }
 
@@ -685,6 +698,29 @@ pub fn banned_word_in(text: &str) -> Option<String> {
     }
     if text.contains('!') {
         return Some("!".to_string());
+    }
+    None
+}
+
+/// The first raw-URL token in `text`, or `None` for clean prose — the deterministic backstop to the
+/// prompt's "don't paste raw URLs" rule, shared by the cluster/story gate and the label/delta cleaners.
+///
+/// Scoped to the unambiguous, autolink-prone forms only: a scheme (`://`), or a `www.`/`mailto:` prefix.
+/// **Bare links are allowed** — naming a source as `databricks.com` or `github.com/acme/auth` is fine and
+/// common in prose, and `escape`/`safe_href` keep the rendered output inert regardless. Only a pasted raw
+/// URL is rejected. This deliberately never trips on the filenames, ratios, and `.com` product names a
+/// developer digest is full of (`main.rs`, `9.5/10`, `Booking.com`): a leaked raw URL costs one baseline,
+/// while a clean summary is never thrown away over a bare domain.
+pub fn url_like_token(text: &str) -> Option<String> {
+    for raw in text.split_whitespace() {
+        let tok = raw.trim_matches(|c: char| !c.is_alphanumeric());
+        // ASCII-case-insensitive prefix test, no per-token allocation.
+        let prefix = |p: &str| {
+            tok.len() >= p.len() && tok.as_bytes()[..p.len()].eq_ignore_ascii_case(p.as_bytes())
+        };
+        if tok.contains("://") || prefix("www.") || prefix("mailto:") {
+            return Some(tok.to_string());
+        }
     }
     None
 }
@@ -765,7 +801,9 @@ You rephrase the facts. You add nothing.
    reportedly, proposed). asserted -> say it plainly. Never change a fact's certainty.
 4. Plain words. Active voice. Do not use: massive, huge, critical (unless in the
    source), game-changing, exciting, "!", "you", "we".
-5. Output only the JSON the schema asks for. No preamble.
+5. Don't paste raw URLs (no "http://...", no "www..."). Name sources plainly;
+   the reader's interface shows the link.
+6. Output only the JSON the schema asks for. No preamble.
 
 EXAMPLES
 facts: {event: deploy broke logins, state: resolved, certainty: asserted,
@@ -985,7 +1023,8 @@ You write ONE headline and ONE tldr for the whole thing. You add nothing.
 5. Each fact has "certainty". tentative -> hedge (suspected, appears to). asserted -> say it plainly.
 6. Plain words. Active voice. Do not use: massive, huge, critical (unless in the source),
    game-changing, exciting, "!", "you", "we".
-7. Output only the JSON the schema asks for. No preamble.
+7. Don't paste raw URLs (no "http://...", no "www...").
+8. Output only the JSON the schema asks for. No preamble.
 
 EXAMPLE
 members:
@@ -1110,7 +1149,7 @@ pub fn clean_label(raw: &str) -> Option<String> {
     if s.is_empty() || s.chars().count() > LABEL_MAX {
         return None;
     }
-    if banned_word_in(s).is_some() {
+    if banned_word_in(s).is_some() || url_like_token(s).is_some() {
         return None;
     }
     Some(s.to_string())
@@ -1131,7 +1170,7 @@ pub fn clean_delta(raw: &str) -> Option<String> {
     {
         return None;
     }
-    if banned_word_in(s).is_some() {
+    if banned_word_in(s).is_some() || url_like_token(s).is_some() {
         return None;
     }
     Some(s.to_string())
@@ -1853,6 +1892,58 @@ mod tests {
     }
 
     #[test]
+    fn url_like_token_catches_raw_urls_only() {
+        // Only the unambiguous raw-URL forms are caught: a scheme, or a www./mailto: prefix.
+        assert!(url_like_token("see https://www.databricks.com/x for more").is_some());
+        assert!(url_like_token("reach us at www.example.org").is_some());
+        assert!(url_like_token("mail mailto:ops@example.com now").is_some());
+        // The jammed-together leakage (domain glued to a scheme URL) still trips on the scheme.
+        assert!(url_like_token("databricks.comhttps://www.databricks.com/l").is_some());
+        // Case-insensitive prefix; trailing punctuation doesn't hide a scheme.
+        assert!(url_like_token("(see HTTPS://example.com).").is_some());
+        assert!(url_like_token("WWW.example.com").is_some());
+
+        // Bare links are ALLOWED — a named source (domain or domain/path) is fine, as are the
+        // filenames, ratios, and product names a developer digest is full of.
+        for ok in [
+            "published on databricks.com today",
+            "at github.com/acme/auth/pull/1",
+            "(see status.claude.com).",
+            "the Booking.com outage",
+            "the fix landed in main.rs after review",
+            "see README.md for the steps",
+            "an ASP.NET handler regressed",
+            "Node.js 22 shipped",
+            "rated 9.5/10 by users",
+            "a 24/7 on-call rotation",
+        ] {
+            assert!(url_like_token(ok).is_none(), "false positive on: {ok}");
+        }
+    }
+
+    #[test]
+    fn gate_rejects_a_raw_url_but_allows_a_bare_domain() {
+        let facts = Facts::default();
+        let leaked = ClusterSummary {
+            headline: "Databricks launches LTAP".to_string(),
+            tldr_text: "Databricks announced LTAP. https://databricks.com/ltap".to_string(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            faithful(&leaked, &facts, "Databricks announced LTAP"),
+            Err(GateViolation::UrlInProse(_))
+        ));
+
+        // A bare domain named in prose is allowed (it passes the URL check).
+        let bare = ClusterSummary {
+            headline: "Databricks launches LTAP".to_string(),
+            tldr_text: "Databricks announced LTAP on databricks.com.".to_string(),
+            ..Default::default()
+        };
+        assert!(faithful(&bare, &facts, "Databricks announced LTAP").is_ok());
+    }
+
+    #[test]
     fn baseline_is_true_and_uncertain() {
         let b = baseline("Title here", 3, &["github", "slack"], Facts::default());
         assert_eq!(b.headline, "Title here");
@@ -2001,7 +2092,7 @@ mod tests {
     #[test]
     fn summary_model_string() {
         let cfg = SummarizationConfig::default();
-        assert_eq!(cfg.summary_model(), "qwen3.5-4b-instruct@2");
+        assert_eq!(cfg.summary_model(), "qwen3.5-4b-instruct@3");
     }
 
     // ── Phase C — story synthesis ────────────────────────────────────────────────────────────────

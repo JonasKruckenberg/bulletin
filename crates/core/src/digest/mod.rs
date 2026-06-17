@@ -89,10 +89,19 @@ async fn link_and_select(
     // so, and now the DB enforces it (design §12).
     let (clusters, prior, shown) = with_scope(pool, ScopeCtx::Subscriber(sub_id), move |conn| {
         Box::pin(async move {
-            let clusters =
-                link::store::candidate_clusters(&mut *conn, sub_id, last_run, horizon_days)
-                    .await
-                    .context("collect candidate clusters")?;
+            // With `llm-summarization` compiled in, withhold clusters that don't yet carry a
+            // gate-passed model summary — they slip to a later digest rather than shipping without one
+            // (docs/llm-summarization.md; the strict, no-valve policy). The deterministic build passes
+            // `false` and is unchanged.
+            let clusters = link::store::candidate_clusters(
+                &mut *conn,
+                sub_id,
+                last_run,
+                horizon_days,
+                cfg!(feature = "llm-summarization"),
+            )
+            .await
+            .context("collect candidate clusters")?;
             let prior = link::store::load_prior_members(&mut *conn, sub_id)
                 .await
                 .context("load prior story assignment")?;
