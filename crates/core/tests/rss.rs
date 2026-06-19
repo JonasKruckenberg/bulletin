@@ -74,6 +74,31 @@ fn parse_rss_returns_items() {
 }
 
 #[test]
+fn parse_rss_caps_body_on_word_boundary() {
+    // A body well over the stored cap, of repeated whole words, so a correct truncation must land on a
+    // word boundary (never a split token like a half-number the miner would treat as grounded).
+    let long = "alpha ".repeat(500); // ~3000 chars of rendered text
+    let xml = format!(
+        r#"<?xml version="1.0"?>
+<rss version="2.0"><channel><title>t</title><link>https://e.com</link><description>d</description>
+<item><guid>g1</guid><title>T</title><link>https://e.com/1</link>
+<description><![CDATA[<p>{long}</p>]]></description></item>
+</channel></rss>"#
+    );
+    let items = parse_feed(xml.as_bytes()).unwrap();
+    let body = items[0].body.as_deref().expect("item has a description body");
+
+    assert!(
+        body.chars().count() <= 2000,
+        "body must be capped, was {} chars",
+        body.chars().count()
+    );
+    // Cut on a whitespace boundary: the final token is a complete "alpha", with no trailing space.
+    assert!(body.ends_with("alpha"), "body must end on a whole word: {body:?}");
+    assert!(!body.ends_with(' '), "no dangling trailing space: {body:?}");
+}
+
+#[test]
 fn parse_atom_returns_items() {
     let items = parse_feed(ATOM_XML.as_bytes()).unwrap();
 

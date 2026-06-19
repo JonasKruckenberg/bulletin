@@ -2,6 +2,7 @@ use crate::common::{event::EventBuilder, kind::SourceKind};
 use crate::ingest::{Batch, Connection, SourceError};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::io::BufReader;
 
 /// Per-connection config persisted in `connection.config`: just the feed URL.
@@ -33,6 +34,18 @@ pub struct RssItem {
 /// cap here to keep DB rows and the model's input bounded.
 const MAX_BODY_CHARS: usize = 2000;
 
+/// Max HTML handed to the renderer. `RENDER_WIDTH` only *wraps* lines — it does not bound how much
+/// html2text parses and renders — so without this a full-article `<content>` would be parsed and
+/// rendered in full only for ~all of it to be discarded by [`MAX_BODY_CHARS`]. A few KB of markup
+/// comfortably yields the kept text, so render at most the leading slice (html2text tolerates a
+/// truncated fragment) to keep ingest work proportional to what we store, not to feed size.
+const MAX_BODY_HTML_CHARS: usize = 16_000;
+
+/// Wrap width handed to html2text. Immaterial to the result — the rendered line breaks are collapsed
+/// straight back out below — but it must clear the renderer's internal minimum; a roomy value avoids
+/// needless mid-text wraps.
+const RENDER_WIDTH: usize = 200;
+
 /// Render a feed item's HTML body fragment to the plain text we store and summarize: strip the markup
 /// with `html2text`, normalize whitespace, and cap the length. `None` for empty/blank input (or markup
 /// that renders to nothing), so a content-less item keeps `body = None`.
@@ -44,8 +57,15 @@ fn body_text(html: &str) -> Option<String> {
     if html.trim().is_empty() {
         return None;
     }
+    // Bound the work before rendering: only allocate a truncated copy when the markup actually exceeds
+    // the cap (byte length ≥ char count, so a shorter byte length needs no truncation).
+    let bounded: Cow<str> = if html.len() > MAX_BODY_HTML_CHARS {
+        Cow::Owned(html.chars().take(MAX_BODY_HTML_CHARS).collect())
+    } else {
+        Cow::Borrowed(html)
+    };
     let rendered = html2text::config::plain_no_decorate()
-        .string_from_read(html.as_bytes(), MAX_BODY_CHARS)
+        .string_from_read(bounded.as_bytes(), RENDER_WIDTH)
         .ok()?;
     // Collapse all runs of whitespace (incl. the wrapper's line breaks) to single spaces — the body is
     // grounding for the model and the entity/number miners, not displayed, so flat prose is cleanest.
@@ -53,7 +73,22 @@ fn body_text(html: &str) -> Option<String> {
     if normalized.is_empty() {
         return None;
     }
-    Some(normalized.chars().take(MAX_BODY_CHARS).collect())
+    Some(truncate_on_word_boundary(normalized, MAX_BODY_CHARS))
+}
+
+/// Cap `s` to `max_chars`, cutting on a whitespace boundary so the stored body never ends in a split
+/// token — a half-truncated number would otherwise be mined as a (bogus) grounded quantity. Falls back
+/// to a hard char cut only when the truncated prefix holds no space at all (one pathological long
+/// token). `s` is already whitespace-normalized to single spaces, so the split is on `' '`.
+fn truncate_on_word_boundary(s: String, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s;
+    }
+    let truncated: String = s.chars().take(max_chars).collect();
+    match truncated.rsplit_once(' ') {
+        Some((head, _)) if !head.is_empty() => head.to_string(),
+        _ => truncated,
+    }
 }
 
 pub struct RssConnection {
