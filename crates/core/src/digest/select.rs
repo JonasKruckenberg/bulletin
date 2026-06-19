@@ -260,6 +260,12 @@ pub fn apply_thread_weights(candidates: &mut [Candidate], weights: &BTreeMap<Can
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DropCause {
+    /// The candidate's `last_event_time` predates the subscriber's cadence display floor — too stale
+    /// to *surface*, even though it stays a candidate so linking/threading can still use it for
+    /// context. The candidate window reaches 30 days back for thread context (intentional), but a
+    /// daily/weekly digest only displays items recent enough for that cadence; this is how an
+    /// aged-out item is excluded from selection without losing its linking value.
+    StaleForCadence,
     /// Relevance fell below `relevance_floor` (design §8.4 gate; a "don't care" pushes it here).
     BelowFloor,
 }
@@ -403,11 +409,18 @@ impl Gated {
 /// `max_items` is the subscriber's overall ceiling, applied *on top of* the per-format caps: a digest
 /// never renders more than `min(max_items, story_cap + note_cap)` items, the lowest-priority overflow
 /// falling to `OverCap`.
+///
+/// `display_floor` is the cadence freshness gate: a candidate whose `last_event_time` is older than
+/// it is too stale to *surface* and drops with [`DropCause::StaleForCadence`] before ranking — even
+/// though the caller still hands it 30-day-deep candidates so linking/threading keep their context
+/// (the floor only governs *display*, not candidacy). It is injected (no ambient clock) so `select`
+/// stays pure; the caller derives it as `now − recurrence.display_window()`.
 pub fn select(
     candidates: Vec<Candidate>,
     cfg: &ScoringConfig,
     max_items: usize,
     now: DateTime<Utc>,
+    display_floor: DateTime<Utc>,
 ) -> Vec<Decision> {
     // 1. Gate. Dropped candidates get a terminal Decision now; the rest carry forward to ranking.
     let mut gated: Vec<Gated> = Vec::new();
@@ -418,6 +431,25 @@ pub fn select(
         // own demotion (otherwise a damped Story would "graduate" back next fire, oscillating).
         let (natural_format, natural_phrase) = richness(c);
         let r = relevance(c, cfg);
+        // Order: the cadence freshness gate runs *first*. An item too stale to surface has aged out
+        // of this digest entirely, so it shouldn't even be relevance-gated — its drop cause is its
+        // age, not its score. (Relevance is also not recency-decayed, so without this an old item
+        // would sail past the floor and fill a slot when fresh content is thin — the bug this fixes.)
+        if c.last_event_time < display_floor {
+            dropped.push(Decision {
+                id: c.id,
+                last_event_time: c.last_event_time,
+                relevance: r,
+                priority: 0.0,
+                natural_format,
+                format: natural_format,
+                richness: natural_phrase.to_string(),
+                verdict: Verdict::Dropped {
+                    cause: DropCause::StaleForCadence,
+                },
+            });
+            continue;
+        }
         if r < cfg.relevance_floor {
             dropped.push(Decision {
                 id: c.id,
@@ -513,6 +545,13 @@ mod tests {
         Utc.timestamp_opt(secs, 0).single().unwrap()
     }
 
+    /// A display floor far enough in the past that no fixture trips the cadence gate — the existing
+    /// tests exercise relevance/recency/cap behavior, not the freshness gate, so they pin it open.
+    fn no_floor() -> DateTime<Utc> {
+        // ~100 years before the epoch — well before any fixture's `last_event_time` (which start at 0).
+        at(-3_000_000_000)
+    }
+
     /// A bare longform single-event public story — classifies as a Story, base relevance.
     fn story(id: u128, secs: i64) -> Candidate {
         Candidate::new(Uuid::from_u128(id), at(secs), Vec::new())
@@ -558,7 +597,7 @@ mod tests {
             last_event_time: at(100),
             format: Format::Story,
         });
-        let out = select(vec![c], &cfg, 1000, at(100));
+        let out = select(vec![c], &cfg, 1000, at(100), no_floor());
         assert_eq!(out[0].format, Format::Note);
         assert_eq!(out[0].richness, "still developing");
     }
@@ -573,7 +612,7 @@ mod tests {
             last_event_time: at(100),
             format: Format::Story,
         });
-        let out = select(vec![c], &cfg, 1000, at(100));
+        let out = select(vec![c], &cfg, 1000, at(100), no_floor());
         assert_eq!(
             out[0].format,
             Format::Note,
@@ -594,7 +633,7 @@ mod tests {
             last_event_time: at(100),
             format: Format::Story,
         });
-        let out = select(vec![c], &cfg, 1000, at(200));
+        let out = select(vec![c], &cfg, 1000, at(200), no_floor());
         assert_eq!(out[0].format, Format::Story);
         assert_ne!(out[0].richness, "still developing");
     }
@@ -608,7 +647,7 @@ mod tests {
             last_event_time: at(100),
             format: Format::Note, // last shown as a Note, no new events
         });
-        let out = select(vec![c], &cfg, 1000, at(100));
+        let out = select(vec![c], &cfg, 1000, at(100), no_floor());
         assert_eq!(out[0].format, Format::Story);
         assert_ne!(out[0].richness, "still developing");
     }
@@ -622,7 +661,7 @@ mod tests {
             format: Format::Story,
         });
         let fresh = story(2, 100); // same recency, never shown
-        let out = select(vec![stale, fresh], &cfg, 1000, at(100));
+        let out = select(vec![stale, fresh], &cfg, 1000, at(100), no_floor());
         // The fresh Story out-ranks the damped "still developing" note.
         assert_eq!(out[0].id, Uuid::from_u128(2));
         assert_eq!(out[0].format, Format::Story);
@@ -637,7 +676,7 @@ mod tests {
         let bare = story(1, 100);
         let mut private = story(2, 100);
         private.has_private = true;
-        let out = select(vec![bare, private], &cfg, 1000, at(100));
+        let out = select(vec![bare, private], &cfg, 1000, at(100), no_floor());
         assert_eq!(selected_ids(&out), vec![Uuid::from_u128(2)]);
         let dropped = out.iter().find(|d| d.id == Uuid::from_u128(1)).unwrap();
         assert!(matches!(
@@ -649,12 +688,40 @@ mod tests {
     }
 
     #[test]
+    fn display_floor_drops_stale_candidates_before_ranking() {
+        // The candidate set reaches back for linking context, but only items newer than the cadence
+        // display floor may surface. A stale item drops with `StaleForCadence` and isn't selected; a
+        // fresh item is selected — even at a 0 relevance floor that would otherwise admit both.
+        let cfg = ScoringConfig::default();
+        let stale = story(1, 100); // older than the floor → too stale to surface
+        let fresh = story(2, 300); // newer than the floor → surfaces
+        let floor = at(200);
+        let out = select(vec![stale, fresh], &cfg, 1000, at(300), floor);
+
+        assert_eq!(
+            selected_ids(&out),
+            vec![Uuid::from_u128(2)],
+            "only the fresh item is selected"
+        );
+        let dropped = out.iter().find(|d| d.id == Uuid::from_u128(1)).unwrap();
+        assert!(
+            matches!(
+                dropped.verdict,
+                Verdict::Dropped {
+                    cause: DropCause::StaleForCadence
+                }
+            ),
+            "the stale item drops for cadence, not relevance"
+        );
+    }
+
+    #[test]
     fn negative_thread_term_drops_below_floor() {
         // "Don't care" drives a thread term negative; base 1.0 + (−1.5) < 0 floor → dropped.
         let cfg = ScoringConfig::default();
         let mut c = story(1, 100);
         c.relevance = -1.5;
-        let out = select(vec![c], &cfg, 1000, at(100));
+        let out = select(vec![c], &cfg, 1000, at(100), no_floor());
         assert!(matches!(out[0].verdict, Verdict::Dropped { .. }));
     }
 
@@ -663,7 +730,7 @@ mod tests {
         let cfg = ScoringConfig::default();
         let older = story(1, 0);
         let newer = story(2, 10 * 86_400);
-        let out = select(vec![older, newer], &cfg, 1000, at(10 * 86_400));
+        let out = select(vec![older, newer], &cfg, 1000, at(10 * 86_400), no_floor());
         assert_eq!(out[0].id, Uuid::from_u128(2));
     }
 
@@ -678,7 +745,7 @@ mod tests {
         let mut invested = story(1, 100);
         invested.relevance = 5.0;
         let fresher = story(2, 300);
-        let out = select(vec![invested, fresher], &cfg, 1000, at(300));
+        let out = select(vec![invested, fresher], &cfg, 1000, at(300), no_floor());
         assert_eq!(selected_ids(&out), vec![Uuid::from_u128(1)]);
     }
 
@@ -707,6 +774,7 @@ mod tests {
             &cfg,
             1000,
             at(1000),
+            no_floor(),
         );
         let sel = selected_ids(&out);
         assert_eq!(sel.len(), 2, "one Story + one Note within the caps");
@@ -729,6 +797,7 @@ mod tests {
             &cfg,
             2,
             at(400),
+            no_floor(),
         );
         assert_eq!(
             selected_ids(&out),
@@ -754,7 +823,13 @@ mod tests {
         };
         let ten_days = 10 * 86_400;
         let now = at(ten_days);
-        let out = select(vec![invested(0), story(2, ten_days)], &cfg, 1, now);
+        let out = select(
+            vec![invested(0), story(2, ten_days)],
+            &cfg,
+            1,
+            now,
+            no_floor(),
+        );
         assert_eq!(
             selected_ids(&out),
             vec![Uuid::from_u128(1)],
@@ -763,7 +838,13 @@ mod tests {
 
         // 90 days on, the thread term has decayed away and the fresh story wins.
         let ninety = 90 * 86_400;
-        let out = select(vec![invested(0), story(2, ninety)], &cfg, 1, at(ninety));
+        let out = select(
+            vec![invested(0), story(2, ninety)],
+            &cfg,
+            1,
+            at(ninety),
+            no_floor(),
+        );
         assert_eq!(
             selected_ids(&out),
             vec![Uuid::from_u128(2)],
@@ -778,7 +859,13 @@ mod tests {
         let mut note = story(1, 100 * 86_400);
         note.content_depth = ContentKind::Announcement;
         let stale_story = story(2, 0);
-        let out = select(vec![stale_story, note], &cfg, 1000, at(100 * 86_400));
+        let out = select(
+            vec![stale_story, note],
+            &cfg,
+            1000,
+            at(100 * 86_400),
+            no_floor(),
+        );
         assert_eq!(out[0].id, Uuid::from_u128(1));
         assert_eq!(out[0].format, Format::Note);
     }
@@ -811,7 +898,7 @@ mod tests {
             let cands: Vec<Candidate> = specs.into_iter().filter(|c| seen.insert(c.id)).collect();
             let n = cands.len();
             let cfg = ScoringConfig { story_cap, note_cap, ..Default::default() };
-            let out = select(cands, &cfg, 1000, at(1000));
+            let out = select(cands, &cfg, 1000, at(1000), no_floor());
 
             prop_assert_eq!(out.len(), n);
             let mut ids: Vec<Uuid> = out.iter().map(|d| d.id).collect();
@@ -838,7 +925,7 @@ mod tests {
                 .collect();
             let n = cands.len();
             let cfg = ScoringConfig { story_cap: 1000, note_cap: 1000, ..Default::default() };
-            let out = select(cands, &cfg, 1000, at(1000));
+            let out = select(cands, &cfg, 1000, at(1000), no_floor());
             let sel: Vec<_> = out.iter().filter(|d| matches!(d.verdict, Verdict::Selected { .. })).collect();
             prop_assert_eq!(sel.len(), n, "0 floor admits everything");
             for w in sel.windows(2) {

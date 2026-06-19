@@ -186,7 +186,14 @@ async fn link_and_select(
         max_items,
         candidates: candidates.clone(),
     };
-    let decisions = select(candidates, &cfg, max_items, now);
+    // Cadence display floor: the candidate set reaches `CONTEXT_HORIZON_DAYS` (30d) back for
+    // linking/threading context, but this subscriber's digest should only *surface* items recent
+    // enough for their chosen cadence (one cadence + grace; see [`Recurrence::display_window`]).
+    // Items older than the floor stay candidates (so linking still uses them) but `select` excludes
+    // them from selection with `StaleForCadence` — fixing stale items filling slots when fresh
+    // content is thin (relevance ranking only decays with age, it never gates on it).
+    let display_floor = now - sub.recurrence.display_window();
+    let decisions = select(candidates, &cfg, max_items, now, display_floor);
     Ok((assignment.stories, decisions, story_entities, snapshot))
 }
 

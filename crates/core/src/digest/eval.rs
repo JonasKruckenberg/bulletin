@@ -13,6 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::digest::select::{
@@ -24,12 +25,20 @@ use crate::digest::select::{
 /// fresh decision log to feed [`evaluate`]. This is what lets an operator A/B a `digest_config` change
 /// over real history without a deploy (and how a later ML signal proves its marginal lift). Entities
 /// are dropped from the replayed reason (metrics don't read them); the rest of the reason is faithful.
+///
+/// The cadence display floor is pinned **fully open** here (`DateTime::<Utc>::MIN`): a replay
+/// deliberately re-scores the *whole* frozen candidate snapshot under the trial `ScoringConfig`, and
+/// the snapshot doesn't carry the subscriber's recurrence (only `now`/`max_items`/`candidates`).
+/// Gating by an inferred cadence would silently drop snapshot candidates and change historical eval
+/// semantics; the sweep is about the scoring config, not freshness, so an open floor preserves the
+/// existing replay determinism (every snapshot candidate is re-scored, none gated by age).
 pub fn replay(snapshot: &ReplaySnapshot, cfg: &ScoringConfig) -> Vec<DecisionRecord> {
     select(
         snapshot.candidates.clone(),
         cfg,
         snapshot.max_items,
         snapshot.now,
+        DateTime::<Utc>::MIN_UTC,
     )
     .into_iter()
     .map(|d| DecisionRecord {
@@ -94,6 +103,9 @@ pub struct Metrics {
     pub over_cap: usize,
     /// Σ stories gated out below the relevance floor.
     pub dropped_below_floor: usize,
+    /// Σ stories dropped as too stale for the subscriber's cadence display window (aged past the
+    /// freshness floor — kept as candidates for linking context, but not surfaced).
+    pub dropped_stale_for_cadence: usize,
     /// Selected stories classified as a Story / as a Note (catches an all-Story or all-Note digest).
     pub selected_stories: usize,
     pub selected_notes: usize,
@@ -131,6 +143,7 @@ pub fn evaluate(digests: &[Vec<DecisionRecord>], grades: &HashMap<Uuid, Grade>) 
         selected: 0,
         over_cap: 0,
         dropped_below_floor: 0,
+        dropped_stale_for_cadence: 0,
         selected_stories: 0,
         selected_notes: 0,
         empty_digests: 0,
@@ -172,6 +185,9 @@ pub fn evaluate(digests: &[Vec<DecisionRecord>], grades: &HashMap<Uuid, Grade>) 
                 Verdict::Dropped {
                     cause: DropCause::BelowFloor,
                 } => m.dropped_below_floor += 1,
+                Verdict::Dropped {
+                    cause: DropCause::StaleForCadence,
+                } => m.dropped_stale_for_cadence += 1,
                 Verdict::Selected { .. } => {}
             }
         }
@@ -268,6 +284,7 @@ impl std::fmt::Display for Metrics {
         writeln!(f, "  cap-limited       {}", self.cap_limited_digests)?;
         writeln!(f, "over-cap drops      {}", self.over_cap)?;
         writeln!(f, "below-floor drops   {}", self.dropped_below_floor)?;
+        writeln!(f, "stale-cadence drops {}", self.dropped_stale_for_cadence)?;
         match (self.precision, self.ndcg) {
             (Some(p), ndcg) => {
                 writeln!(
@@ -470,7 +487,10 @@ mod tests {
 
             let m = evaluate(&digests, &grades);
             // Every candidate gets exactly one verdict, so the three buckets partition the total.
-            prop_assert_eq!(m.selected + m.over_cap + m.dropped_below_floor, m.candidates);
+            prop_assert_eq!(
+                m.selected + m.over_cap + m.dropped_below_floor + m.dropped_stale_for_cadence,
+                m.candidates
+            );
             prop_assert_eq!(m.selected_stories + m.selected_notes, m.selected);
             if let Some(p) = m.precision { prop_assert!((0.0..=1.0).contains(&p)); }
             if let Some(n) = m.ndcg { prop_assert!((0.0..=1.0 + 1e-9).contains(&n)); }
