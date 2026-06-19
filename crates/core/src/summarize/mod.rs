@@ -2028,9 +2028,15 @@ pub async fn sweep_stories(
                 let error = failure.describe();
                 with_scope(pool, ctx, move |conn| {
                     Box::pin(async move {
-                        store::record_story_summary_failure(conn, sid, next_attempts, &error, quarantine)
-                            .await
-                            .context("record story summary failure")
+                        store::record_story_summary_failure(
+                            conn,
+                            sid,
+                            next_attempts,
+                            &error,
+                            quarantine,
+                        )
+                        .await
+                        .context("record story summary failure")
                     })
                 })
                 .await?;

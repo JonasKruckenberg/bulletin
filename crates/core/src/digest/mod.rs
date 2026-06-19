@@ -99,15 +99,10 @@ async fn link_and_select(
             // model summary (`band` confirmed/probable) — it slips to a later digest rather than shipping
             // without one. A cluster still being (re)summarized or quarantined for operator review simply
             // doesn't appear here; it never blocks the digest, it just isn't in it yet.
-            let clusters = link::store::candidate_clusters(
-                &mut *conn,
-                sub_id,
-                last_run,
-                horizon_days,
-                true,
-            )
-            .await
-            .context("collect candidate clusters")?;
+            let clusters =
+                link::store::candidate_clusters(&mut *conn, sub_id, last_run, horizon_days, true)
+                    .await
+                    .context("collect candidate clusters")?;
             let prior = link::store::load_prior_members(&mut *conn, sub_id)
                 .await
                 .context("load prior story assignment")?;
@@ -446,7 +441,9 @@ async fn authored_lead(items: &[RenderItem], job_attempt: u32) -> Option<String>
     // apalis attempt index is 1-based, so subtract 1: the very first attempt starts at offset 0, i.e.
     // `for_attempt(0)` (the deterministic base seed) is exercised on a healthy first try before any
     // escalation, matching the rest of the pipeline.
-    let seed_base = job_attempt.saturating_sub(1).saturating_mul(LEAD_SEED_RETRIES as u32) as i32;
+    let seed_base = job_attempt
+        .saturating_sub(1)
+        .saturating_mul(LEAD_SEED_RETRIES as u32) as i32;
     for i in 0..LEAD_SEED_RETRIES {
         let cfg = base.for_attempt(seed_base + i);
         match tokio::time::timeout(

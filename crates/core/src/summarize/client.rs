@@ -19,9 +19,9 @@ use crate::summarize::{
     comprehension_schema, delta_schema, delta_user_prompt, extract_facts, faithful, label_schema,
     label_user_prompt, lead_schema, lead_user_prompt, response_schema, source_corpus,
     story_member_corpus, story_user_prompt, synthesize_facts, user_prompt, Band, ClusterSummary,
-    Comprehension, Facts, LeadOutcome, SummarizationConfig, SummaryFailure, SummaryOutcome, TldrRun,
-    COMPREHEND_SYSTEM_PROMPT, DELTA_SYSTEM_PROMPT, LABEL_SYSTEM_PROMPT, LEAD_SYSTEM_PROMPT,
-    STORY_SYSTEM_PROMPT, SYSTEM_PROMPT,
+    Comprehension, Facts, LeadOutcome, SummarizationConfig, SummaryFailure, SummaryOutcome,
+    TldrRun, COMPREHEND_SYSTEM_PROMPT, DELTA_SYSTEM_PROMPT, LABEL_SYSTEM_PROMPT,
+    LEAD_SYSTEM_PROMPT, STORY_SYSTEM_PROMPT, SYSTEM_PROMPT,
 };
 
 /// Summarize one cluster: extract-then-summarize (§3.2) — hand the model the pre-extracted facts +
