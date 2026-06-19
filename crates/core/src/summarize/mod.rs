@@ -860,6 +860,40 @@ pub fn user_prompt(facts: &Facts, source_text: &str) -> String {
     )
 }
 
+/// The **headline-only** user prompt (§5.1 depth gate): same facts/entity/source framing as
+/// [`user_prompt`], but the ask is a single headline — no tldr. Used for a Note-depth cluster (one whose
+/// richest event is below Longform), where a multi-sentence tldr would only paraphrase the headline into
+/// a vague Story. The model is asked for the one most important thing and nothing else.
+pub fn headline_only_user_prompt(facts: &Facts, source_text: &str) -> String {
+    let entity_list = list_or_none(&facts.entities);
+    let facts_json = serde_json::to_string(facts).unwrap_or_else(|_| "{}".to_string());
+    format!(
+        "facts: {facts_json}\n\
+         allowed entity ids (use only these for refs): {entity_list}\n\
+         source:\n{source_text}\n\n\
+         Write: headline (<= 90 chars): the one most important thing."
+    )
+}
+
+/// The **headline-only** response schema — like [`response_schema`] but a single length-capped
+/// `headline` string and no `tldr` array. Paired with [`headline_only_user_prompt`] for a Note-depth
+/// cluster: a headline-only response leaves `ModelOutput.tldr` (which is `#[serde(default)]`) empty, so
+/// the resulting summary carries an empty `tldr`/`tldr_text`. The `maxLength` matches the headline cap
+/// in [`response_schema`] and the [`faithful`] gate (90 chars).
+pub fn headline_only_schema() -> serde_json::Value {
+    use serde_json::json;
+    json!({
+        "name": "cluster_headline",
+        "strict": true,
+        "schema": {
+            "type": "object",
+            "properties": { "headline": { "type": "string", "maxLength": 90 } },
+            "required": ["headline"],
+            "additionalProperties": false
+        }
+    })
+}
+
 /// The response JSON schema (§3.3) for `response_format: json_schema` — llama.cpp's GBNF token-masking
 /// turns this into a grammar that **guarantees structurally valid JSON**. It does real work beyond
 /// validity: `maxLength` on the headline (length control), and the tldr's entity `ref` constrained to
@@ -2286,6 +2320,38 @@ mod tests {
         };
         s.rebuild_tldr_text();
         assert!(faithful(&s, &facts, "").is_ok());
+    }
+
+    #[test]
+    fn gate_passes_a_headline_only_summary() {
+        // A Note-depth cluster yields a headline with an empty tldr/tldr_text. The gate must tolerate
+        // it: no entity refs, no numbers, and length 0 is under the tldr budget.
+        let facts = Facts {
+            entities: vec!["repo:acme/auth".to_string()],
+            ..Facts::default()
+        };
+        let s = ClusterSummary {
+            headline: "Auth service published a new release".to_string(),
+            tldr: Vec::new(),
+            tldr_text: String::new(),
+            ..Default::default()
+        };
+        assert!(faithful(&s, &facts, "").is_ok());
+    }
+
+    #[test]
+    fn headline_only_schema_has_headline_and_no_tldr() {
+        let schema = headline_only_schema();
+        let props = &schema["schema"]["properties"];
+        assert!(props.get("headline").is_some(), "must expose a headline");
+        assert!(props.get("tldr").is_none(), "must NOT expose a tldr");
+    }
+
+    #[test]
+    fn headline_only_user_prompt_asks_only_for_headline() {
+        let prompt = headline_only_user_prompt(&Facts::default(), "some source");
+        assert!(prompt.contains("headline"), "must ask for a headline");
+        assert!(!prompt.contains("tldr"), "must NOT ask for a tldr");
     }
 
     #[test]

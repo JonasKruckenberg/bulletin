@@ -14,14 +14,16 @@ use serde::Deserialize;
 
 use super::metric;
 use crate::common::event::Event;
+use crate::common::kind::ContentKind;
 use crate::summarize::{
     apply_comprehension, clean_delta, clean_label, clean_lead, comprehend_user_prompt,
-    comprehension_schema, delta_schema, delta_user_prompt, extract_facts, faithful, label_schema,
-    label_user_prompt, lead_schema, lead_user_prompt, response_schema, source_corpus,
-    story_member_corpus, story_user_prompt, synthesize_facts, user_prompt, Band, ClusterSummary,
-    Comprehension, Facts, LeadOutcome, SummarizationConfig, SummaryFailure, SummaryOutcome,
-    TldrRun, COMPREHEND_SYSTEM_PROMPT, DELTA_SYSTEM_PROMPT, LABEL_SYSTEM_PROMPT,
-    LEAD_SYSTEM_PROMPT, STORY_SYSTEM_PROMPT, SYSTEM_PROMPT,
+    comprehension_schema, delta_schema, delta_user_prompt, extract_facts, faithful,
+    headline_only_schema, headline_only_user_prompt, label_schema, label_user_prompt, lead_schema,
+    lead_user_prompt, response_schema, source_corpus, story_member_corpus, story_user_prompt,
+    synthesize_facts, user_prompt, Band, ClusterSummary, Comprehension, Facts, LeadOutcome,
+    SummarizationConfig, SummaryFailure, SummaryOutcome, TldrRun, COMPREHEND_SYSTEM_PROMPT,
+    DELTA_SYSTEM_PROMPT, LABEL_SYSTEM_PROMPT, LEAD_SYSTEM_PROMPT, STORY_SYSTEM_PROMPT,
+    SYSTEM_PROMPT,
 };
 
 /// Summarize one cluster: extract-then-summarize (§3.2) — hand the model the pre-extracted facts +
@@ -92,7 +94,19 @@ async fn generate_candidate(
         }
     }
 
-    let candidate = call_model(cfg, http, &facts, &source).await?;
+    // Depth-gate the summary's richness (§5.1): a cluster is only as deep as its richest event
+    // (`ContentKind` is `Ord`: Message < Announcement < Longform). Only a Longform cluster earns a
+    // multi-sentence tldr (a Story); a thinner one gets a headline-only Note, sparing both the vague
+    // headline-paraphrase and the tldr token budget. An empty cluster shouldn't reach here, but default
+    // to Longform if it somehow does — don't regress a real cluster to a Note.
+    let depth = events
+        .iter()
+        .map(|e| e.content_kind)
+        .max()
+        .unwrap_or(ContentKind::Longform);
+    let want_tldr = depth == ContentKind::Longform;
+
+    let candidate = call_model(cfg, http, &facts, &source, want_tldr).await?;
 
     // Stitch the grounding facts back on and derive the flat text from the structured runs.
     let mut summary = ClusterSummary {
@@ -460,20 +474,39 @@ struct LeadOutput {
 
 /// POST one grammar-constrained summarization completion and parse the structured output. Errors
 /// bubble up to the caller, which degrades to baseline.
+///
+/// `want_tldr` gates the summary's depth (§5.1): `true` for a Longform cluster asks for the full
+/// headline + multi-sentence tldr; `false` for a Note-depth cluster asks for a **headline only** (a
+/// tighter schema/prompt and no tldr token budget), and the absent tldr deserializes to the empty
+/// `ModelOutput.tldr` default — yielding a summary with an empty `tldr`/`tldr_text`.
 async fn call_model(
     cfg: &SummarizationConfig,
     http: &reqwest::Client,
     facts: &Facts,
     source: &str,
+    want_tldr: bool,
 ) -> anyhow::Result<ModelOutput> {
+    let (user, max_tokens, schema) = if want_tldr {
+        (
+            user_prompt(facts, source),
+            cfg.headline_max_tokens + cfg.tldr_max_tokens + 64,
+            response_schema(&facts.entities),
+        )
+    } else {
+        (
+            headline_only_user_prompt(facts, source),
+            cfg.headline_max_tokens + 16,
+            headline_only_schema(),
+        )
+    };
     chat_json(
         cfg,
         http,
         "summarize",
         SYSTEM_PROMPT,
-        user_prompt(facts, source),
-        cfg.headline_max_tokens + cfg.tldr_max_tokens + 64,
-        response_schema(&facts.entities),
+        user,
+        max_tokens,
+        schema,
     )
     .await
 }

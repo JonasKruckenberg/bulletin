@@ -1,4 +1,7 @@
-use crate::common::{event::EventBuilder, kind::SourceKind};
+use crate::common::{
+    event::EventBuilder,
+    kind::{ContentKind, SourceKind},
+};
 use crate::ingest::{Batch, Connection, SourceError};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -33,6 +36,13 @@ pub struct RssItem {
 /// needs a few paragraphs of grounding (and `source_corpus` re-budgets across the cluster on top), so
 /// cap here to keep DB rows and the model's input bounded.
 const MAX_BODY_CHARS: usize = 2000;
+
+/// Body length (chars) at or above which an RSS item is treated as [`ContentKind::Longform`] — enough
+/// material to ground a multi-sentence Story tldr. Below it (and for body-less items) the item is an
+/// [`ContentKind::Announcement`]: a thin headline-bearing update that should render as a Note, not be
+/// padded into a vague Story. The depth signal is set here, in the connector, because source semantics
+/// live in the adapter (design §5.1) — deriving it downstream from length would be a gameable heuristic.
+const LONGFORM_MIN_CHARS: usize = 400;
 
 /// Max HTML handed to the renderer. `RENDER_WIDTH` only *wraps* lines — it does not bound how much
 /// html2text parses and renders — so without this a full-article `<content>` would be parsed and
@@ -240,6 +250,14 @@ impl Connection for RssConnection {
         let event_time = item.published.unwrap_or_else(Utc::now);
         let links: Vec<String> = item.link.into_iter().collect();
 
+        // Depth gate: only a body with real substance (>= LONGFORM_MIN_CHARS) earns Longform — and with
+        // it a Story-depth multi-sentence tldr. A thin or body-less item is an Announcement, so the
+        // summarizer renders it as a headline-only Note rather than padding it into a vague Story.
+        let content_kind = match &item.body {
+            Some(body) if body.chars().count() >= LONGFORM_MIN_CHARS => ContentKind::Longform,
+            _ => ContentKind::Announcement,
+        };
+
         let mut builder = EventBuilder::new(
             SourceKind::Rss,
             item.id.clone(),
@@ -247,10 +265,55 @@ impl Connection for RssConnection {
             item.title,
             item.id, // group_key = stable_id: each article is its own cluster
         )
+        .content_kind(content_kind)
         .links(links);
         if let Some(body) = item.body {
             builder = builder.body(body);
         }
         vec![builder]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ingest::Connection;
+
+    /// Build a minimal `RssItem` with the given body and run it through `to_events`, returning the
+    /// resulting event's `content_kind` (the only field these depth-gate tests inspect).
+    fn content_kind_for(body: Option<&str>) -> ContentKind {
+        let conn = RssConnection::new("http://example.invalid/feed");
+        let item = RssItem {
+            id: "id-1".to_string(),
+            title: "A title".to_string(),
+            body: body.map(str::to_owned),
+            link: Some("http://example.invalid/article".to_string()),
+            published: None,
+        };
+        let event = conn
+            .to_events(item)
+            .pop()
+            .expect("one event")
+            .finalize(None);
+        event.content_kind
+    }
+
+    #[test]
+    fn bodyless_item_is_announcement() {
+        assert_eq!(content_kind_for(None), ContentKind::Announcement);
+    }
+
+    #[test]
+    fn short_body_is_announcement() {
+        // A body shorter than LONGFORM_MIN_CHARS is too thin to ground a Story tldr → Note depth.
+        let short = "x".repeat(LONGFORM_MIN_CHARS - 1);
+        assert_eq!(content_kind_for(Some(&short)), ContentKind::Announcement);
+    }
+
+    #[test]
+    fn long_body_is_longform() {
+        // A body at/above the threshold carries enough material for a Story-depth summary.
+        let long = "x".repeat(LONGFORM_MIN_CHARS);
+        assert_eq!(content_kind_for(Some(&long)), ContentKind::Longform);
     }
 }
