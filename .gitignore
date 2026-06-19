@@ -1,5 +1,6 @@
 target/
 .postgres/
+.claude/
 
 # nix build out-links
 /result
