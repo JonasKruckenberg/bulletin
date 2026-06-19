@@ -57,6 +57,11 @@ const STORY_CAP: usize = 5;
 const NOTE_CAP: usize = 20;
 /// Re-surface damping (design §9.4): a no-news re-surface keeps this fraction of its priority.
 const RESURFACE_PENALTY: f32 = 0.25;
+/// Max stale "still developing" re-surfaces per digest. Damping only sinks a no-news re-surface in the
+/// *ranking*; on its own it can't stop a quiet period from backfilling the whole Note cap with recycled
+/// items (the "15 still-developing notes" padding). This is the hard budget that does: a few carry the
+/// thread, the rest fall to over-cap. Fresh content is never affected — it isn't re-surfaced.
+const RESURFACE_CAP: usize = 5;
 
 /// Story (rich, multi-faceted) vs Note (atomic, thin) — a **rendering** classification from the
 /// candidate's richness, not importance (design §8.4: a high-priority Note can sit above a
@@ -114,6 +119,10 @@ pub struct ScoringConfig {
     /// (design §9.4 re-surface suppression) — it fades to a "still developing" note and eventually
     /// out. `1.0` disables the penalty.
     pub resurface_penalty: f32,
+    /// Max stale "still developing" re-surfaces rendered per digest — the hard cap on recycled-note
+    /// padding the priority damping alone can't enforce. Fresh content isn't re-surfaced, so it's
+    /// untouched by this; a generous value effectively disables the cap.
+    pub resurface_cap: usize,
 }
 
 impl Default for ScoringConfig {
@@ -127,6 +136,7 @@ impl Default for ScoringConfig {
             story_cap: STORY_CAP,
             note_cap: NOTE_CAP,
             resurface_penalty: RESURFACE_PENALTY,
+            resurface_cap: RESURFACE_CAP,
         }
     }
 }
@@ -376,6 +386,9 @@ struct Gated {
     /// The format actually rendered — `natural_format`, or `Note` when re-surface-demoted.
     format: Format,
     richness: &'static str,
+    /// True when this is a stale, no-news re-surface (demoted to "still developing") — so the cap pass
+    /// can hold it to the small `resurface_cap` budget instead of letting it pad the Note cap.
+    resurfaced: bool,
 }
 
 impl Gated {
@@ -436,6 +449,7 @@ pub fn select(
         let mut p = priority(c, cfg, now);
         let mut format = natural_format;
         let mut richness_phrase = natural_phrase;
+        let mut resurfaced = false;
         // Re-surface suppression (design §9.4): a story already shown to this subscriber with no new
         // events since — and not graduating Note → Story (natural richness grew) — fades to a compact
         // "still developing" note and is priority-damped, so it sinks and eventually ages out. A
@@ -447,6 +461,7 @@ pub fn select(
                 format = Format::Note;
                 richness_phrase = "still developing";
                 p *= cfg.resurface_penalty;
+                resurfaced = true;
             }
         }
         gated.push(Gated {
@@ -457,6 +472,7 @@ pub fn select(
             natural_format,
             format,
             richness: richness_phrase,
+            resurfaced,
         });
     }
 
@@ -473,7 +489,7 @@ pub fn select(
     //    global priority order (Stories and Notes interleave by priority). A Note is never dropped
     //    *for being a Note* — only for losing the Note cap race; same for Stories. `position` doubles
     //    as the count of items selected so far, so it enforces the overall ceiling.
-    let (mut stories, mut notes, mut position) = (0usize, 0usize, 0usize);
+    let (mut stories, mut notes, mut resurfaced, mut position) = (0usize, 0usize, 0usize, 0usize);
     let mut selected: Vec<Decision> = Vec::new();
     let mut over_cap: Vec<Decision> = Vec::new();
     for (rank, g) in gated.into_iter().enumerate() {
@@ -481,8 +497,14 @@ pub fn select(
             Format::Story => (&mut stories, cfg.story_cap),
             Format::Note => (&mut notes, cfg.note_cap),
         };
-        let verdict = if *count < cap && position < max_items {
+        // A stale "still developing" re-surface also has to win a slot in the small re-surface budget,
+        // on top of its format cap — so a quiet fire can't backfill the digest with recycled notes.
+        let resurface_ok = !g.resurfaced || resurfaced < cfg.resurface_cap;
+        let verdict = if *count < cap && resurface_ok && position < max_items {
             *count += 1;
+            if g.resurfaced {
+                resurfaced += 1;
+            }
             let pos = position;
             position += 1;
             Verdict::Selected { position: pos }
@@ -626,6 +648,57 @@ mod tests {
         // The fresh Story out-ranks the damped "still developing" note.
         assert_eq!(out[0].id, Uuid::from_u128(2));
         assert_eq!(out[0].format, Format::Story);
+    }
+
+    #[test]
+    fn resurface_cap_holds_back_recycled_note_padding() {
+        // A quiet fire of nothing-but-stale re-surfaces: damping ranks them but can't bound them, so
+        // without the cap they'd backfill the Note slots. With `resurface_cap`, only that many render;
+        // the rest fall to over-cap rather than padding the digest.
+        let cfg = ScoringConfig {
+            resurface_cap: 3,
+            ..Default::default()
+        };
+        let stale: Vec<Candidate> = (0..10)
+            .map(|i| {
+                let mut c = story(i + 1, 100 + i as i64); // distinct recency for a stable order
+                c.last_shown = Some(Shown {
+                    last_event_time: c.last_event_time,
+                    format: Format::Story,
+                });
+                c
+            })
+            .collect();
+        let out = select(stale, &cfg, 1000, at(1000));
+        let selected: Vec<&Decision> = out.iter().filter(|d| d.is_selected()).collect();
+        assert_eq!(selected.len(), 3, "only resurface_cap stale notes render");
+        assert!(selected.iter().all(|d| d.richness == "still developing"));
+        // The rest aren't dropped (still above the floor) — they're held over-cap.
+        let over = out
+            .iter()
+            .filter(|d| matches!(d.verdict, Verdict::OverCap { .. }))
+            .count();
+        assert_eq!(over, 7);
+    }
+
+    #[test]
+    fn fresh_notes_are_untouched_by_the_resurface_cap() {
+        // The cap is specific to stale re-surfaces — fresh (never-shown) notes fill the Note cap as
+        // before, even with a tiny resurface budget.
+        let cfg = ScoringConfig {
+            resurface_cap: 0,
+            note_cap: 5,
+            ..Default::default()
+        };
+        let fresh: Vec<Candidate> = (0..5)
+            .map(|i| {
+                let mut c = story(i + 1, 100 + i as i64);
+                c.content_depth = ContentKind::Announcement; // thin → Note
+                c
+            })
+            .collect();
+        let out = select(fresh, &cfg, 1000, at(1000));
+        assert_eq!(out.iter().filter(|d| d.is_selected()).count(), 5);
     }
 
     #[test]

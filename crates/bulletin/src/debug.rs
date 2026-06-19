@@ -122,6 +122,8 @@ pub enum DebugCommand {
         note_cap: Option<usize>,
         #[arg(long)]
         resurface_penalty: Option<f32>,
+        #[arg(long)]
+        resurface_cap: Option<usize>,
     },
     /// Print a single-glance snapshot of pipeline state (events, clusters, queue, …)
     Status,
@@ -421,6 +423,7 @@ pub async fn run(
             story_cap,
             note_cap,
             resurface_penalty,
+            resurface_cap,
         } => {
             let cfg = dbg
                 .set_config(proto::SetConfigRequest {
@@ -432,6 +435,7 @@ pub async fn run(
                     story_cap: story_cap.map(|v| v as u64),
                     note_cap: note_cap.map(|v| v as u64),
                     resurface_penalty,
+                    resurface_cap: resurface_cap.map(|v| v as u64),
                 })
                 .await?
                 .into_inner();
@@ -493,6 +497,7 @@ fn to_core_config(c: &proto::ScoringConfig) -> bulletin_core::digest::select::Sc
         story_cap: c.story_cap as usize,
         note_cap: c.note_cap as usize,
         resurface_penalty: c.resurface_penalty,
+        resurface_cap: c.resurface_cap as usize,
     }
 }
 

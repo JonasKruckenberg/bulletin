@@ -97,9 +97,18 @@ pub async fn maintain(
                 .context("read maintenance watermark")?;
 
             // ── inputs ────────────────────────────────────────────────────────────
-            let sources = store::co_occurrence_sources(&mut *conn, subscriber_id, window_start)
+            let mut sources = store::co_occurrence_sources(&mut *conn, subscriber_id, window_start)
                 .await
                 .context("load co-occurrence sources")?;
+            // Drop `domain:`/`url:` from the thread spine. Every item from one feed shares its
+            // `domain:`, so co-occurring on it buckets a "life" by *publisher* — a thread spined on
+            // `domain:tagesschau.de` is just "everything from tagesschau". `url:` is per-article and
+            // never co-occurs across stories, so it only adds noise. Both stay on the cluster for
+            // story *linking* (entity.rs); here, where we build the engaged co-occurrence graph, we
+            // want only the distinctive entities a life is actually *about*.
+            for s in &mut sources {
+                s.entities.retain(is_thread_spine_entity);
+            }
             let edges = identity::store::load_edges(&mut *conn, subscriber_id)
                 .await
                 .context("load identity edges")?;
@@ -109,9 +118,18 @@ pub async fn maintain(
             let care = feedback::thread_care_since(&mut *conn, subscriber_id, since)
                 .await
                 .context("load thread care feedback")?;
-            let prior = store::load_threads(&mut *conn, subscriber_id)
+            let mut prior = store::load_threads(&mut *conn, subscriber_id)
                 .await
                 .context("load prior threads")?;
+            // Apply the same spine rule to the *prior* side. Threads persisted before this rule landed
+            // may still carry `domain:`/`url:` in their stored spine; left unfiltered, id-forwarding
+            // would compare a filtered candidate against an unfiltered existing spine — diluting the
+            // Jaccard overlap below `match_threshold` and spuriously minting a duplicate thread (or
+            // wrongly decaying a legacy publisher-spined one). Filtering here keeps both sides on the
+            // same basis, and re-persists the cleaned spine on this pass (self-healing, no data migration).
+            for t in &mut prior {
+                t.entities.retain(is_thread_spine_entity);
+            }
 
             // ── identity resolution (graded lexical + feedback must_link, honour cannot_link) ────────────
             let mut nodes: BTreeSet<CanonicalId> = BTreeSet::new();
@@ -247,6 +265,14 @@ pub async fn maintain(
         })
     })
     .await
+}
+
+/// Whether an entity belongs on a thread's co-occurrence spine. `domain:` buckets a life by
+/// publisher (every item from a feed shares it) and `url:` is per-article noise that never
+/// co-occurs across stories — both are excluded so threads form around what a life is *about*
+/// (people, orgs, places, CVEs, repos), not where it was published. Everything else is eligible.
+fn is_thread_spine_entity(entity: &CanonicalId) -> bool {
+    !entity.starts_with("domain:") && !entity.starts_with("url:")
 }
 
 /// Same-namespace lexical equivalence edges: for every pair of tokens sharing a `kind:` namespace
