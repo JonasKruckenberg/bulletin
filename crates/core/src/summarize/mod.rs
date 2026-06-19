@@ -1332,13 +1332,16 @@ pub fn clean_lead(raw: &str, grounding: &str) -> Option<String> {
 }
 
 /// The digest-lead system prompt (§3.6) — engineered for a 3–4B model exactly like the others: write
-/// the one "big picture" opening over the selected headlines, name a thread or two, don't list every
-/// item. A constant ⇒ prefix-cached. (The grounding it rephrases — the headlines/thread labels — is in
-/// the user prompt; those inputs are themselves already gate-passed summaries, §4.)
+/// the one "big picture" opening over the *tiered* headlines (the `dominant` items that led, then a
+/// short `also` set of what else moved), name a thread or two, don't list every item. A constant ⇒
+/// prefix-cached. (The grounding it rephrases — the headlines/thread labels — is in the user prompt;
+/// those inputs are themselves already gate-passed summaries, §4.)
 pub const LEAD_SYSTEM_PROMPT: &str = r#"You write the one-line "big picture" that opens a work digest.
 It sits under a greeting, so do NOT greet. One or two short sentences.
 
-1. Say what dominated, then what else moved. Name one or two threads by name.
+The input is tiered: "dominant" are the items that led the day; "also" is what else moved.
+
+1. Lead with the dominant items. Only briefly note what else moved (the "also" items) and the threads.
 2. Do not list every item. Do not number them. A reader sees the full list below.
 3. Use only the headlines and threads given. Every name, number, and date you write must be in them.
 4. Plain words. Active voice. Do not use: massive, huge, critical (unless given),
@@ -1348,28 +1351,33 @@ It sits under a greeting, so do NOT greet. One or two short sentences.
 
 EXAMPLES
 threads: Acme auth migration, Billing rewrite
-headlines:
+dominant:
 - Auth outage traced to the token-rotation deploy
 - SSRF advisory forces a billing PDF mitigation
+also:
 - Staging cutover completed for the payments service
-out: {"lead":"An auth outage from the token-rotation deploy led the day on the Acme auth migration, while a suspected SSRF pushed a billing PDF mitigation."}
+out: {"lead":"An auth outage from the token-rotation deploy led the day on the Acme auth migration, while a suspected SSRF pushed a billing PDF mitigation; the payments staging cutover also landed."}
 
 threads: On-call rotation
-headlines:
+dominant:
 - Pager handoff to the EU team completed
+also:
 out: {"lead":"A quiet stretch on the on-call rotation: the pager handed off to the EU team."}"#;
 
-/// The digest-lead user prompt: the selected items' headlines (newest/top-ranked first) + the thread
-/// names they advance, with the concrete ask. Short and concrete over the §4 pre-distilled inputs (the
-/// headlines are already-gated summaries, never raw events), like [`user_prompt`].
-pub fn lead_user_prompt(headlines: &[String], threads: &[String]) -> String {
+/// The digest-lead user prompt: the two tiers the lead is authored from — the `dominant` headlines that
+/// led the day and the short `also` set of what else moved (both newest/top-ranked first) — plus the
+/// thread names they advance, with the concrete ask. Short and concrete over the §4 pre-distilled
+/// inputs (the headlines are already-gated summaries, never raw events), like [`user_prompt`].
+pub fn lead_user_prompt(dominant: &[String], also: &[String], threads: &[String]) -> String {
     format!(
         "threads: {}\n\
-         headlines:\n{}\n\n\
-         Write the big-picture opening: 1-2 sentences, what dominated and what else moved. \
-         Name one or two threads. Do not greet, and do not list every item.",
+         dominant:\n{}\n\
+         also:\n{}\n\n\
+         Write the big-picture opening: 1-2 sentences. Lead with the dominant items; only briefly note \
+         what else moved. Name one or two threads. Do not greet, and do not list every item.",
         list_or_none(threads),
-        bullet_list(headlines),
+        bullet_list(dominant),
+        bullet_list(also),
     )
 }
 
@@ -2852,13 +2860,20 @@ mod tests {
                 "Auth outage traced to the deploy".to_string(),
                 "SSRF advisory forces a mitigation".to_string(),
             ],
+            &["Staging cutover completed".to_string()],
             &["Acme auth migration".to_string()],
         );
+        // The dominant tier is rendered under a "dominant:" label, the secondary set under "also:".
+        assert!(p.contains("dominant:"));
+        assert!(p.contains("also:"));
         assert!(p.contains("Acme auth migration"));
         assert!(p.contains("Auth outage traced to the deploy"));
+        assert!(p.contains("Staging cutover completed"));
         assert!(p.contains("do not list every item"));
-        // No headlines / no threads degrades to the explicit "(none)" rather than a blank.
-        let empty = lead_user_prompt(&[], &[]);
+        // No also / no threads degrades to the explicit "(none)" rather than a blank, and an empty
+        // also/threads slice doesn't panic.
+        let empty = lead_user_prompt(&["A lone update".to_string()], &[], &[]);
         assert!(empty.contains("(none)"));
+        assert!(empty.contains("A lone update"));
     }
 }

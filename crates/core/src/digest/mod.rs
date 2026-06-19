@@ -396,6 +396,69 @@ async fn digest_lead(
     Some(lead)
 }
 
+/// Tier the selected items into the two slices the big-picture lead is authored from (§3.6): the
+/// `dominant` set ("what dominated") and the `also` set ("what else moved"). The long tail is dropped,
+/// so the model gets a salience signal instead of a flat list it tries to recite in full.
+///
+/// `dominant` is the top items (in the existing global priority order — `items` arrives ranked) whose
+/// render `format` is [`Format::Story`], capped at 3. If fewer than 2 such Story items exist, it falls
+/// back to filling from the top items regardless of format until it holds up to 2–3 — a quiet day still
+/// gets a lead. `also` is the next up-to-3 headlines after the dominant set, skipping anything already
+/// in `dominant`, in priority order. Empty/whitespace headlines are skipped throughout (mirroring the
+/// prior empty-headline filtering), so a blank degraded headline never reaches the prompt.
+///
+/// Pure over the ranked slice (no IO), so it is unit-tested without a model or DB.
+fn lead_tiers(items: &[RenderItem]) -> (Vec<String>, Vec<String>) {
+    use crate::digest::select::Format;
+
+    const DOMINANT_CAP: usize = 3;
+    const ALSO_CAP: usize = 3;
+
+    // The non-empty headlines, paired with their format, in the incoming priority order.
+    let ranked: Vec<(&str, Format)> = items
+        .iter()
+        .map(|i| (i.headline.trim(), i.reason.format))
+        .filter(|(h, _)| !h.is_empty())
+        .collect();
+
+    // The indices (into `ranked`) chosen for the dominant tier: the top Stories first, then — only if
+    // that left us with fewer than 2 — the top items of any format, to reach up to the cap.
+    let mut dominant_idx: Vec<usize> = ranked
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, fmt))| *fmt == Format::Story)
+        .take(DOMINANT_CAP)
+        .map(|(i, _)| i)
+        .collect();
+    if dominant_idx.len() < 2 {
+        for (i, _) in ranked.iter().enumerate() {
+            if dominant_idx.len() >= DOMINANT_CAP {
+                break;
+            }
+            if !dominant_idx.contains(&i) {
+                dominant_idx.push(i);
+            }
+        }
+        dominant_idx.sort_unstable();
+    }
+
+    let dominant: Vec<String> = dominant_idx
+        .iter()
+        .map(|&i| ranked[i].0.to_string())
+        .collect();
+
+    // The next up-to-3 headlines after the dominant set, skipping anything already promoted to it.
+    let also: Vec<String> = ranked
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !dominant_idx.contains(i))
+        .map(|(_, (h, _))| h.to_string())
+        .take(ALSO_CAP)
+        .collect();
+
+    (dominant, also)
+}
+
 /// The deadline-bounded **authored big-picture lead** (Phase D, §3.1). `Some(lead)` on success; `None`
 /// when it couldn't be composed within this run's budget — the caller defers the digest (§3.7). There is
 /// no deterministic fallback: a digest with items either carries an authored lead or waits for one.
@@ -407,12 +470,14 @@ async fn digest_lead(
 async fn authored_lead(items: &[RenderItem], job_attempt: u32) -> Option<String> {
     use crate::summarize::{self, LeadOutcome, SummarizationConfig};
 
-    let headlines: Vec<String> = items
-        .iter()
-        .map(|i| i.headline.trim().to_string())
-        .filter(|h| !h.is_empty())
-        .collect();
-    if headlines.is_empty() {
+    // The full selected count — the count the lead's grounding is checked against (a "…and N others"
+    // lead must still pass the numeric gate), regardless of how few headlines the tiers feed the model.
+    let total_items = items.len();
+    // Feed the lead a *tiered* slice of the selection, not the flat list of everything: the top few
+    // stories as "what dominated", a short secondary set as "what else moved", long tail dropped — so
+    // the model has a salience signal and stops yoking major news to trivia (§3.6).
+    let (dominant, also) = lead_tiers(items);
+    if dominant.is_empty() {
         return None; // nothing to author from (the empty digest never reaches here anyway)
     }
     // The threads the selected items advance, deduped in first-seen (rank) order — the §3.6 "name 1–2
@@ -448,7 +513,7 @@ async fn authored_lead(items: &[RenderItem], job_attempt: u32) -> Option<String>
         let cfg = base.for_attempt(seed_base + i);
         match tokio::time::timeout(
             cfg.lead_deadline,
-            summarize::client::authored_lead(&cfg, &http, &headlines, &threads),
+            summarize::client::authored_lead(&cfg, &http, &dominant, &also, &threads, total_items),
         )
         .await
         {
@@ -926,4 +991,110 @@ pub async fn set_config(pool: &PgPool, cfg: ScoringConfig) -> Result<()> {
     store::update_config(pool, &cfg)
         .await
         .context("update scoring config")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::kind::SourceKind;
+    use crate::digest::select::Format;
+    use crate::summarize::Band;
+    use chrono::TimeZone;
+
+    /// A bare `RenderItem` carrying just the fields `lead_tiers` reads (headline + render format) — the
+    /// rest degrade to empty/default exactly as a not-yet-summarized item would.
+    fn item(headline: &str, format: Format) -> RenderItem {
+        RenderItem {
+            title: headline.to_string(),
+            link: None,
+            source: SourceKind::Rss,
+            last_event_time: Utc.with_ymd_and_hms(2026, 6, 13, 8, 30, 0).unwrap(),
+            connections: Vec::new(),
+            thread: None,
+            reason: ItemReason {
+                format,
+                ..ItemReason::default()
+            },
+            headline: headline.to_string(),
+            summary: String::new(),
+            summary_runs: Vec::new(),
+            summary_band: Band::Uncertain,
+            synthesized: false,
+        }
+    }
+
+    #[test]
+    fn lead_tiers_picks_top_stories_then_fills_also() {
+        // Priority order (the slice arrives ranked): two Stories lead, a Note follows, then more Stories.
+        let items = vec![
+            item("Auth outage traced to the deploy", Format::Story),
+            item("SSRF advisory forces a mitigation", Format::Story),
+            item("A passing blog post", Format::Note),
+            item("Payments staging cutover landed", Format::Story),
+            item("A fourth story", Format::Story),
+            item("Tail item dropped", Format::Note),
+        ];
+        let (dominant, also) = lead_tiers(&items);
+        // The dominant tier is the top-3 Stories in priority order (the Note is skipped for dominance).
+        assert_eq!(
+            dominant,
+            vec![
+                "Auth outage traced to the deploy".to_string(),
+                "SSRF advisory forces a mitigation".to_string(),
+                "Payments staging cutover landed".to_string(),
+            ]
+        );
+        // `also` is the next up-to-3 non-dominant headlines, in priority order — including the Note that
+        // the dominant tier skipped, since `also` is format-agnostic.
+        assert_eq!(
+            also,
+            vec![
+                "A passing blog post".to_string(),
+                "A fourth story".to_string(),
+                "Tail item dropped".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn lead_tiers_falls_back_when_fewer_than_two_stories() {
+        // Only one Story exists; the fallback fills the dominant tier from the top items of any format
+        // until it holds up to 2–3, preserving priority order.
+        let items = vec![
+            item("A lone story", Format::Story),
+            item("First note", Format::Note),
+            item("Second note", Format::Note),
+            item("Third note", Format::Note),
+        ];
+        let (dominant, also) = lead_tiers(&items);
+        assert_eq!(
+            dominant,
+            vec![
+                "A lone story".to_string(),
+                "First note".to_string(),
+                "Second note".to_string(),
+            ]
+        );
+        assert_eq!(also, vec!["Third note".to_string()]);
+    }
+
+    #[test]
+    fn lead_tiers_skips_empty_headlines() {
+        // Blank/whitespace headlines (a degraded item) never reach a tier: after filtering, only one
+        // Story and one Note survive, so the fewer-than-2-stories fallback pulls the Note into the
+        // dominant tier and `also` is left empty — and crucially neither blank ever appears.
+        let items = vec![
+            item("   ", Format::Story),
+            item("Real story", Format::Story),
+            item("", Format::Note),
+            item("Real note", Format::Note),
+        ];
+        let (dominant, also) = lead_tiers(&items);
+        assert_eq!(
+            dominant,
+            vec!["Real story".to_string(), "Real note".to_string()]
+        );
+        assert!(also.is_empty());
+        assert!(!dominant.iter().any(|h| h.trim().is_empty()));
+    }
 }
