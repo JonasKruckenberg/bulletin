@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use apalis::prelude::*;
 use apalis_cron::{CronStream, Tick};
 use apalis_postgres::PostgresStorage;
+use apalis_sql::ext::TaskBuilderExt; // .max_attempts() on the enqueued task
 use chrono::Utc;
 use cron::Schedule;
 use serde::{Deserialize, Serialize};
@@ -51,6 +52,17 @@ pub struct PublicBuildJob;
 pub struct GenerateDigestJob {
     pub subscriber_id: Uuid,
 }
+
+/// The per-job retry budget for `GenerateDigest` (§3.7). A digest with items defers (errors) rather than
+/// ship without an LLM lead; apalis re-runs a `Failed` job up to this many attempts before killing it, so
+/// this is how long a window waits out a transient sidecar blip before being given up on. Larger than the
+/// apalis default (5) so a brief sidecar restart doesn't drop the window. NB: apalis-postgres applies no
+/// inter-retry backoff, so the wall-clock window is roughly `DIGEST_MAX_ATTEMPTS x poll-interval`.
+const DIGEST_MAX_ATTEMPTS: u32 = 12;
+
+/// The attempt at/after which a still-deferred lead is escalated to an operator alert — set below
+/// [`DIGEST_MAX_ATTEMPTS`] so the alert precedes the give-up (the job keeps retrying until killed).
+const DIGEST_LEAD_ALERT_ATTEMPT: u32 = 8;
 
 /// thread_maintenance for one subscriber (design `docs/thread-layer.md` §5.1): the write-side,
 /// best-effort job that rebuilds the subscriber's identity graph + threads and projects the
@@ -184,9 +196,9 @@ async fn public_build(
         match bulletin_core::cluster::build(&pool).await {
             Ok(Some(stats)) => {
                 tracing::info!(dirty_groups = stats.dirty_groups, "public build complete");
-                // Best-effort, off the punctual path: summarize the public clusters whose content
-                // changed (no-op without the feature/flag). A failure degrades to baseline summaries,
-                // never the build.
+                // Off the punctual path: summarize the public clusters whose content changed. Per-cluster
+                // failures are tracked/retried/quarantined inside `core` (§3.7) and never fail the build;
+                // an un-summarized cluster is just withheld from digests until it lands.
                 summarize_public(&pool).await;
             }
             Ok(None) => tracing::debug!("public build skipped (lock held by a concurrent build)"),
@@ -277,16 +289,19 @@ async fn generate_digest(
                     DigestOutcome::AlreadyDelivered => metric::digest_outcome("already_delivered"),
                     DigestOutcome::NotYetDue => metric::digest_outcome("not_yet_due"),
                     // The §3.7 contract: a digest with items never ships without an LLM lead. Nothing was
-                    // delivered and the watermark didn't advance — error so apalis retries this same
-                    // window later (the box may recover, or a re-seeded lead may pass). Once the quiet
-                    // retry budget is spent, alert loudly rather than retry silently.
-                    DigestOutcome::LeadDeferred { exhausted } => {
+                    // delivered and the watermark didn't advance — error so apalis re-runs this same job
+                    // (the `Failed`-and-retry path, bounded by the job's max_attempts = DIGEST_MAX_ATTEMPTS;
+                    // the box may recover, or a re-seeded lead may pass). Once the quiet-recovery budget is
+                    // spent (but before the job is killed), alert loudly rather than retry silently. The
+                    // retry budget and alert threshold are the trigger layer's policy, kept out of core.
+                    DigestOutcome::LeadDeferred => {
                         metric::digest_outcome("lead_deferred");
-                        if exhausted {
+                        if job_attempt >= DIGEST_LEAD_ALERT_ATTEMPT {
                             metric::digest_lead_unavailable();
                             tracing::error!(
                                 subscriber_id = %job.subscriber_id,
                                 job_attempt,
+                                max_attempts = DIGEST_MAX_ATTEMPTS,
                                 "digest still undelivered — its LLM lead has been unavailable across the retry budget; operator attention needed (sidecar?)"
                             );
                         }
@@ -474,6 +489,9 @@ async fn run_tick(pool: Data<PgPool>) -> Result<(), BoxDynError> {
                 subscriber_id: s.id,
             })
             .with_idempotency_key(key)
+            // Widen the retry budget so a deferred digest (lead unavailable, §3.7) rides out a transient
+            // sidecar blip across several re-runs before apalis kills the job, instead of the default 5.
+            .max_attempts(DIGEST_MAX_ATTEMPTS)
             .build();
             match storage.push_task(task).await {
                 Ok(()) => {}

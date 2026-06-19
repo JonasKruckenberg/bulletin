@@ -176,7 +176,7 @@ pub fn digest_outcome(o: DigestOutcome) -> proto::DigestOutcome {
         DigestOutcome::Empty => ("empty", 0),
         DigestOutcome::AlreadyDelivered => ("already_delivered", 0),
         DigestOutcome::NotYetDue => ("not_yet_due", 0),
-        DigestOutcome::LeadDeferred { .. } => ("lead_deferred", 0),
+        DigestOutcome::LeadDeferred => ("lead_deferred", 0),
     };
     proto::DigestOutcome {
         kind: kind.to_string(),

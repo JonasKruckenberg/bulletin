@@ -1,5 +1,13 @@
 # LLM Summarization — Phase A Foundation: Implementation Handoff
 
+> **Partially superseded by `llm-summarization.md` §3.7 (the summarization-pipeline redesign).** This
+> handoff describes the original *best-effort, behind a `llm-summarization` cargo feature, degrades to a
+> deterministic baseline* model. That contract has been inverted: summarization is **mandatory** (the
+> feature is removed, there is no baseline), failures are tracked errors with bounded escalating retries
+> and quarantine, and a digest never ships without faithful summaries + an authored lead. Where this doc
+> says "kill switch", "off by default", "degrades to baseline", or `--features llm-summarization`, read
+> §3.7 instead. The schema/client/prompt/gate descriptions below remain accurate.
+
 **Status:** Implemented 2026-06-15. The **foundation** of `llm-summarization.md` Phase A — the schema,
 the write-side summarization pipeline, the local-sidecar client, and the llama.cpp deployment — is
 built, behind the `llm-summarization` cargo feature as the **sole, compile-time** kill switch (no
@@ -279,10 +287,8 @@ now exists to answer.
 # Pure logic (no sidecar, no DB): the gate, hash, facts, schema, baseline, serde, the eval accumulator.
 cargo test -p bulletin-core --lib summarize
 
-# Both feature configs compile clean (CI parity):
-cargo clippy -p bulletin-core -- -D warnings
-cargo clippy -p bulletin-core --features llm-summarization -- -D warnings
-cargo clippy -p bulletin --features llm-summarization -- -D warnings
+# Summarization is mandatory now (§3.7) — no cargo feature, one build config:
+cargo clippy --workspace --all-targets -- -D warnings
 
 # Read-only faithfulness eval against a live sidecar (the §3.4/§7 `digest-explain` hook) — needs a
 # DATABASE_URL with clusters and a reachable BULLETIN_LLM_BASE_URL; stores nothing.

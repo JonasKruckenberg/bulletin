@@ -57,10 +57,10 @@ pub fn summary_failed(unit: &'static str, kind: &'static str) {
         .increment(1);
 }
 
-/// A unit (`unit`: `cluster`) whose retry budget was exhausted and is now **quarantined** for operator
-/// review (§3.7) — withheld from the sweep and from digests until a content change or a manual clear. A
-/// rising count is the signal that the sidecar or the gate is systematically failing a slice of the
-/// corpus, not just flapping.
+/// A unit (`unit`: `cluster` | `story`) whose retry budget was exhausted and is now **quarantined** for
+/// operator review (§3.7) — withheld from the sweep and from digests until a content change or a manual
+/// clear. A rising count is the signal that the sidecar or the gate is systematically failing a slice of
+/// the corpus, not just flapping.
 pub fn quarantined(unit: &'static str) {
     metrics::counter!("bulletin_llm_quarantined_total", "unit" => unit).increment(1);
 }

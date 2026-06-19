@@ -128,35 +128,61 @@ pub(crate) async fn record_summary_failure(
     error: &str,
     quarantine: bool,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "UPDATE cluster
+    record_failure(conn, "cluster", cluster_id, attempts, error, quarantine).await
+}
+
+/// The shared §3.7 failure-record UPDATE for the cluster and story tiers — identical but for the table.
+/// `table` is a hardcoded caller-supplied identifier (never user input), so interpolating it is safe;
+/// the row id and the rest bind normally. Sets the consecutive-attempt counter to `attempts` (absolute),
+/// stores the coarse `error`, stamps `summary_failed_at`, and does **not** touch `summarized_at` so the
+/// unit stays in its work queue. `summary_quarantined_at` is `now()` on quarantine, NULL otherwise (so a
+/// unit retrying past a quarantine sheds the stale flag).
+async fn record_failure(
+    conn: &mut PgConnection,
+    table: &str,
+    id: Uuid,
+    attempts: i32,
+    error: &str,
+    quarantine: bool,
+) -> Result<(), sqlx::Error> {
+    let sql = format!(
+        "UPDATE {table}
          SET summary_attempts = $2,
              summary_last_error = $3,
              summary_failed_at = now(),
              summary_quarantined_at = CASE WHEN $4 THEN now() ELSE NULL END
-         WHERE id = $1",
-    )
-    .bind(cluster_id)
-    .bind(attempts)
-    .bind(error)
-    .bind(quarantine)
-    .execute(conn)
-    .await?;
+         WHERE id = $1"
+    );
+    sqlx::query(&sql)
+        .bind(id)
+        .bind(attempts)
+        .bind(error)
+        .bind(quarantine)
+        .execute(conn)
+        .await?;
     Ok(())
 }
 
 /// Advance only the `summarized_at` watermark for a cluster whose content was unchanged (the cache
 /// hit) — so the cheap `updated_at > summarized_at` gate stops re-flagging it every sweep, without a
-/// pointless model call. Leaves the existing summary/hash/model untouched.
+/// pointless model call. Leaves the existing summary/hash/model untouched, but **clears the §3.7 health
+/// record**: a cache hit means a valid faithful summary is present at this content, so any stale
+/// failure/quarantine state (e.g. from a since-reverted content change that was briefly un-summarizable)
+/// must not linger and keep the cluster in the operator-review queue.
 pub(crate) async fn touch_summarized(
     conn: &mut PgConnection,
     cluster_id: Uuid,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE cluster SET summarized_at = $2 WHERE id = $1")
-        .bind(cluster_id)
-        .bind(Utc::now())
-        .execute(conn)
-        .await?;
+    sqlx::query(
+        "UPDATE cluster
+         SET summarized_at = $2, summary_attempts = 0, summary_last_error = NULL,
+             summary_failed_at = NULL, summary_quarantined_at = NULL
+         WHERE id = $1",
+    )
+    .bind(cluster_id)
+    .bind(Utc::now())
+    .execute(conn)
+    .await?;
     Ok(())
 }
 
@@ -343,21 +369,7 @@ pub(crate) async fn record_story_summary_failure(
     error: &str,
     quarantine: bool,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "UPDATE story
-         SET summary_attempts = $2,
-             summary_last_error = $3,
-             summary_failed_at = now(),
-             summary_quarantined_at = CASE WHEN $4 THEN now() ELSE NULL END
-         WHERE id = $1",
-    )
-    .bind(story_id)
-    .bind(attempts)
-    .bind(error)
-    .bind(quarantine)
-    .execute(conn)
-    .await?;
-    Ok(())
+    record_failure(conn, "story", story_id, attempts, error, quarantine).await
 }
 
 /// Advance only the `summarized_at` watermark for a story whose member signature was unchanged (the
@@ -369,12 +381,19 @@ pub(crate) async fn touch_story_summarized(
     model: &str,
 ) -> Result<(), sqlx::Error> {
     // Stamp the model too, so a story we deliberately skip under the *current* model isn't re-flagged
-    // by the `summary_model IS DISTINCT FROM` clause every pass.
-    sqlx::query("UPDATE story SET summarized_at = now(), summary_model = $2 WHERE id = $1")
-        .bind(story_id)
-        .bind(model)
-        .execute(conn)
-        .await?;
+    // by the `summary_model IS DISTINCT FROM` clause every pass. Clear the §3.7 health record for the
+    // same reason `touch_summarized` does: a touch means a valid synthesis (cache hit) or nothing to
+    // synthesize (single member), so no stale failure/quarantine state should linger.
+    sqlx::query(
+        "UPDATE story
+         SET summarized_at = now(), summary_model = $2, summary_attempts = 0,
+             summary_last_error = NULL, summary_failed_at = NULL, summary_quarantined_at = NULL
+         WHERE id = $1",
+    )
+    .bind(story_id)
+    .bind(model)
+    .execute(conn)
+    .await?;
     Ok(())
 }
 

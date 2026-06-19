@@ -103,21 +103,18 @@
               }
             );
 
-          # Default build: no LLM summarization compiled in (the feature is the compile-time kill
-          # switch, off by default — the deterministic digest baseline).
+          # Summarization is a mandatory part of the pipeline now (no `llm-summarization` cargo feature,
+          # no compile-time kill switch) — there is a single binary. The worker requires a reachable
+          # summarization sidecar at boot (configure it via `BULLETIN_LLM_*` / the NixOS module's `llm.*`).
           bulletin = mkBin {
             pname = "bulletin";
             crate = "bulletin";
           };
 
-          # The summarization-enabled build (no new deps; rides the existing reqwest). Selected by the
-          # NixOS module's `services.bulletin.llm.enable`. Turning summarization on or off is a build
-          # choice — there is no runtime flag — so the off build genuinely has no summarization code.
-          bulletin-llm = mkBin {
-            pname = "bulletin";
-            crate = "bulletin";
-            features = [ "llm-summarization" ];
-          };
+          # `bulletin-llm` is retained as an alias of `bulletin` for backward compatibility (the NixOS
+          # module and any pinned references still name it); summarization is no longer a build choice, so
+          # the two are identical.
+          bulletin-llm = bulletin;
         in
         {
           inherit bulletin bulletin-llm;

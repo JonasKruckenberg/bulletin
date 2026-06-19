@@ -1546,6 +1546,40 @@ pub enum SummaryOutcome {
     Failed(SummaryFailure),
 }
 
+/// Shared §3.7 failure bookkeeping for a summarization unit (`unit`: "cluster" | "story", `id` names the
+/// row): emit the failure metric, decide quarantine, log at WARN (quarantine) or DEBUG, and return
+/// `(next_attempts, quarantine)` for the caller to persist via the unit's `record_*_failure`. Keeps the
+/// attempt/quarantine math + metrics + log in one place so the cluster and story sweeps can't drift.
+fn note_summary_failure(
+    unit: &'static str,
+    id: uuid::Uuid,
+    attempt: i32,
+    failure: &SummaryFailure,
+) -> (i32, bool) {
+    let next_attempts = attempt + 1;
+    let quarantine = next_attempts >= MAX_SUMMARY_ATTEMPTS;
+    metric::summary_failed(unit, failure.kind());
+    if quarantine {
+        metric::quarantined(unit);
+        tracing::warn!(
+            unit,
+            %id,
+            attempts = next_attempts,
+            error = %failure.describe(),
+            "summarization quarantined after exhausting retries — flagged for operator review"
+        );
+    } else {
+        tracing::debug!(
+            unit,
+            %id,
+            attempts = next_attempts,
+            error = %failure.describe(),
+            "summarization failed; will retry with an escalated seed"
+        );
+    }
+    (next_attempts, quarantine)
+}
+
 /// The result of one Phase-D **authored lead** attempt (§3.1, §3.7) — the one on-path model call. The
 /// caller (the digest flow) distinguishes the two failure modes because they want different handling: a
 /// gate `Rejected` is deterministic, so it retries *in process* with an escalated seed; an `Unavailable`
@@ -1742,29 +1776,14 @@ async fn sweep(
                 stats.summarized += 1;
             }
             SummaryOutcome::Failed(failure) => {
-                // This attempt's failure tips the consecutive count to `attempt + 1`; quarantine the
-                // cluster the moment that reaches the budget. A quarantined cluster is withheld from the
-                // sweep (and from digests) and surfaced for operator review; until then it stays
-                // un-summarized so the next sweep retries it with a hotter seed.
-                let next_attempts = attempt + 1;
-                let quarantine = next_attempts >= MAX_SUMMARY_ATTEMPTS;
-                metric::summary_failed("cluster", failure.kind());
+                // Track the failure (metric + log), decide quarantine, and persist — the cluster stays
+                // un-summarized (withheld from digests) so the next sweep retries it with a hotter seed,
+                // or, once the budget is spent, sits quarantined for operator review.
+                let (next_attempts, quarantine) =
+                    note_summary_failure("cluster", c.id, attempt, &failure);
                 if quarantine {
-                    metric::quarantined("cluster");
-                    tracing::warn!(
-                        cluster_id = %c.id,
-                        attempts = next_attempts,
-                        error = %failure.describe(),
-                        "cluster summarization quarantined after exhausting retries — flagged for operator review"
-                    );
                     stats.quarantined += 1;
                 } else {
-                    tracing::debug!(
-                        cluster_id = %c.id,
-                        attempts = next_attempts,
-                        error = %failure.describe(),
-                        "cluster summarization failed; will retry with an escalated seed"
-                    );
                     stats.failed += 1;
                 }
                 let cid = c.id;
@@ -1788,7 +1807,7 @@ async fn sweep(
 /// the *exact* generation path [`sweep`] uses — extract → (comprehend) → model → gate — but **stores
 /// nothing** and records the gate's verdict, so the Vectara-style entity/number accuracy rate
 /// (`local-ml-options.md` §7) can be measured *before* any summary touches a delivered digest. Newest
-/// clusters first, bounded by `limit`. Only exists in a `llm-summarization` build.
+/// clusters first, bounded by `limit`.
 ///
 /// Unlike [`sweep`], the eval ignores `summarized_at`/`summary_model` and re-generates a candidate for
 /// every sampled cluster regardless of cache state — it is measuring the model, not advancing the
@@ -1874,9 +1893,11 @@ pub async fn eval_public(
 /// their RLS context. Walks the stories whose membership/content changed, recomputes each one's member
 /// signature from the member clusters' `summary_hash`es, and — only if it moved (or a model upgrade) —
 /// synthesizes a fused summary from the **member cluster summaries** (never their raw events, §4),
-/// cached by the signature so a stable story is reused for free across fires. Best-effort by contract:
-/// a per-story failure leaves it un-synthesized (fire-time falls back to the representative cluster,
-/// §2.2 cold-start) and the pass continues. Only exists in a `llm-summarization` build.
+/// cached by the signature so a stable story is reused for free across fires. Under the strict §3.7
+/// contract a multi-member synthesis failure is tracked, retried with an escalating seed, and quarantined
+/// once the budget is spent — the story is withheld from digests until it lands, never collapsed to one
+/// member's single-source blurb (a single-member story has nothing to fuse and renders its one cluster
+/// summary directly). The pass continues past a failed story.
 ///
 /// (Deviation from §2.2: the member signature is keyed on member content alone — `thread_id` is not
 /// folded in, so a story moving threads doesn't itself force a re-synthesis. The synthesis quality
@@ -1923,11 +1944,10 @@ pub async fn sweep_stories(
             }
         })
         .await?;
-        // A cross-source synthesis needs ≥2 members *and* at least one with a real cluster summary to
-        // fuse; otherwise fire-time already renders the representative cluster identically — skip the
-        // model call, just advance the watermark so it isn't re-flagged.
         let has_content = members.iter().any(|m| !m.summary.is_empty());
-        if members.len() < 2 || !has_content {
+        if members.len() < 2 {
+            // A single-member story has nothing to fuse — advance the watermark so it isn't re-flagged;
+            // fire-time renders its one (already-gated) cluster summary directly (§3.7).
             let sid = s.id;
             let model = model.clone();
             let _ = with_scope(pool, ctx, move |conn| {
@@ -1938,6 +1958,14 @@ pub async fn sweep_stories(
                 })
             })
             .await;
+            stats.skipped += 1;
+            continue;
+        }
+        if !has_content {
+            // Multi-member, but no member carries a faithful summary *yet* (e.g. its clusters are still
+            // being summarized). Do **not** advance the watermark — leaving the story due means a later
+            // sweep re-checks it once its members land, rather than withholding it from digests until its
+            // membership/content next happens to move (§3.7). A cheap re-check, self-resolving.
             stats.skipped += 1;
             continue;
         }
@@ -1989,25 +2017,11 @@ pub async fn sweep_stories(
             // the seed next pass, and quarantine once the budget is spent (flagged for operator review;
             // the story then slips out of digests until its membership/content moves).
             SummaryOutcome::Failed(failure) => {
-                let next_attempts = attempt + 1;
-                let quarantine = next_attempts >= MAX_SUMMARY_ATTEMPTS;
-                metric::summary_failed("story", failure.kind());
+                let (next_attempts, quarantine) =
+                    note_summary_failure("story", s.id, attempt, &failure);
                 if quarantine {
-                    metric::quarantined("story");
-                    tracing::warn!(
-                        story_id = %s.id,
-                        attempts = next_attempts,
-                        error = %failure.describe(),
-                        "story synthesis quarantined after exhausting retries — flagged for operator review"
-                    );
                     stats.quarantined += 1;
                 } else {
-                    tracing::debug!(
-                        story_id = %s.id,
-                        attempts = next_attempts,
-                        error = %failure.describe(),
-                        "story synthesis failed; will retry with an escalated seed"
-                    );
                     stats.failed += 1;
                 }
                 let sid = s.id;

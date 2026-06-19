@@ -503,6 +503,7 @@ fn format_outcome(o: &proto::DigestOutcome) -> String {
         "empty" => "Empty".to_string(),
         "already_delivered" => "AlreadyDelivered".to_string(),
         "not_yet_due" => "NotYetDue".to_string(),
+        "lead_deferred" => "LeadDeferred (no LLM lead; delivery deferred)".to_string(),
         other => other.to_string(),
     }
 }

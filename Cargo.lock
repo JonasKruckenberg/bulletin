@@ -504,6 +504,7 @@ dependencies = [
  "apalis",
  "apalis-cron",
  "apalis-postgres",
+ "apalis-sql",
  "axum 0.7.9",
  "bulletin-core",
  "chrono",

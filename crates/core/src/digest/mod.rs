@@ -49,12 +49,12 @@ pub enum DigestOutcome {
     /// The boundary moved into the future between enqueue and run — a preference change deferred
     /// this send. Nothing delivered; the next tick fires it at the corrected boundary.
     NotYetDue,
-    /// The digest had selected items but its **authored lead couldn't be composed** within the retry
-    /// budget (the sidecar was down, or every re-seeded draw failed the gate). Per the §3.7 contract a
-    /// digest with items never ships without an LLM lead, so nothing was delivered and the watermark did
-    /// **not** advance: the job errors so apalis retries it later. `exhausted` is set once the per-job
-    /// retry budget is spent, so the worker can alert rather than retry silently forever.
-    LeadDeferred { exhausted: bool },
+    /// The digest had selected items but its **authored lead couldn't be composed** this run (the sidecar
+    /// was down, or every re-seeded draw failed the gate). Per the §3.7 contract a digest with items never
+    /// ships without an LLM lead, so nothing was delivered and the watermark did **not** advance: the
+    /// worker errors so apalis retries this window. Whether a still-deferred lead warrants an operator
+    /// alert is the worker's call (it owns the apalis attempt count and the retry budget).
+    LeadDeferred,
 }
 
 /// Loads a subscriber or errors if it's gone — the shared first step of every flow below.
@@ -144,17 +144,28 @@ async fn link_and_select(
     // synthesis is gate-passed (`band` confirmed/probable) — otherwise it's withheld and slips to a later
     // window rather than collapsing to one member's single-source blurb. Single-member stories have
     // nothing to fuse and render their one (already-gated) cluster summary, so they're always eligible.
-    let story_ids: Vec<Uuid> = assignment.stories.iter().map(|s| s.id).collect();
-    let faithful_stories: HashSet<Uuid> = with_scope(pool, ScopeCtx::Subscriber(sub_id), move |conn| {
-        Box::pin(async move {
-            link::store::faithful_story_ids(&mut *conn, &story_ids)
-                .await
-                .context("load faithful story summaries")
+    // Only multi-member stories consult the synthesis gate, so skip the DB round-trip entirely when there
+    // are none (the common case for a low-volume subscriber).
+    let multi_member_ids: Vec<Uuid> = assignment
+        .stories
+        .iter()
+        .filter(|s| s.clusters.len() > 1)
+        .map(|s| s.id)
+        .collect();
+    let faithful_stories: HashSet<Uuid> = if multi_member_ids.is_empty() {
+        HashSet::new()
+    } else {
+        with_scope(pool, ScopeCtx::Subscriber(sub_id), move |conn| {
+            Box::pin(async move {
+                link::store::faithful_story_ids(&mut *conn, &multi_member_ids)
+                    .await
+                    .context("load faithful story summaries")
+            })
         })
-    })
-    .await?
-    .into_iter()
-    .collect();
+        .await?
+        .into_iter()
+        .collect()
+    };
     let mut candidates: Vec<Candidate> = assignment
         .stories
         .iter()
@@ -360,12 +371,6 @@ async fn record_candidate_snapshot(
 /// immediately and the whole job retries later, where the box may be back.
 const LEAD_SEED_RETRIES: i32 = 3;
 
-/// The apalis job attempt at/after which a still-deferred lead is flagged `exhausted` — the signal the
-/// worker turns into an operator alert (§3.7: "delay the digest until the lead is ready, alert on the
-/// retry limit") rather than another silent retry. The job keeps retrying past this; the flag just marks
-/// that the budget for a *quiet* recovery is spent.
-const LEAD_DEFER_ALERT_ATTEMPTS: u32 = 5;
-
 /// Compose the digest's big-picture lead (`llm-summarization.md` §2.4/§3.1, Phase D) and persist it onto
 /// the `digest` row. This is the *one* summarization model call on the punctual path, and — per the §3.7
 /// contract — the digest never ships without it: returns `Some(lead)` when one was authored, or `None`
@@ -437,8 +442,11 @@ async fn authored_lead(items: &[RenderItem], job_attempt: u32) -> Option<String>
             return None;
         }
     };
-    // Offset the seed base so each in-process retry *and* each job retry draws a distinct lead.
-    let seed_base = job_attempt.saturating_mul(LEAD_SEED_RETRIES as u32) as i32;
+    // Offset the seed base so each in-process retry *and* each job retry draws a distinct lead. The
+    // apalis attempt index is 1-based, so subtract 1: the very first attempt starts at offset 0, i.e.
+    // `for_attempt(0)` (the deterministic base seed) is exercised on a healthy first try before any
+    // escalation, matching the rest of the pipeline.
+    let seed_base = job_attempt.saturating_sub(1).saturating_mul(LEAD_SEED_RETRIES as u32) as i32;
     for i in 0..LEAD_SEED_RETRIES {
         let cfg = base.for_attempt(seed_base + i);
         match tokio::time::timeout(
@@ -607,15 +615,16 @@ pub async fn generate(
     // window later (the digest row stays frozen and idempotent). A subscriber waits for a good lead
     // rather than receiving a partial digest.
     let Some(lead) = digest_lead(pool, digest.id, sub.id, &items, job_attempt).await else {
-        let exhausted = job_attempt >= LEAD_DEFER_ALERT_ATTEMPTS;
         tracing::warn!(
             subscriber_id = %sub.id,
             %window_end,
             job_attempt,
-            exhausted,
             "digest lead unavailable; deferring delivery (no digest ships without an LLM lead)"
         );
-        return Ok(DigestOutcome::LeadDeferred { exhausted });
+        // Nothing delivered, watermark unmoved — the worker errors so apalis retries this window, and
+        // decides (from the apalis attempt count + its own budget) when a still-deferred lead warrants
+        // an operator alert. Keeping that threshold at the trigger layer keeps core free of retry policy.
+        return Ok(DigestOutcome::LeadDeferred);
     };
     let message = render::render(
         mailer.from(),

@@ -347,9 +347,9 @@ fn build_upsert(
         id,
         origin,
         pinned,
-        // The deterministic auto-label baseline (top entities), recomputed from the spine every pass —
-        // the readable context eyebrow even with `llm-summarization` off; the Phase-B sweep upgrades it
-        // onto `thread.summary` (`llm-summarization.md` §2.3).
+        // The deterministic auto-label (top entities), recomputed from the spine every pass — the
+        // readable context eyebrow until the best-effort Phase-B sweep upgrades it onto `thread.summary`
+        // (`llm-summarization.md` §2.3); the thread label stays best-effort (cosmetic, not a delivery gate).
         label: crate::summarize::auto_label(entities),
         entities: entities.to_vec(),
         affinity,

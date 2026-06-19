@@ -154,13 +154,11 @@ in
 
     package = lib.mkOption {
       type = lib.types.package;
-      # The compile-time kill switch in action: `llm.enable` selects the summarization-enabled build
-      # (`bulletin-llm`) over the plain `bulletin`. There is no runtime flag — off genuinely ships a
-      # binary with no summarization code. Override this to pin a specific build.
-      default =
-        self.packages.${pkgs.stdenv.hostPlatform.system}.${if cfg.llm.enable then "bulletin-llm" else "bulletin"};
-      defaultText = lib.literalExpression "bulletin.packages.\${system}.\${if cfg.llm.enable then \"bulletin-llm\" else \"bulletin\"}";
-      description = "The `bulletin` package to run. Defaults to the LLM-enabled build when `llm.enable`.";
+      # Summarization is mandatory now (no compile-time switch), so there is a single binary. Override
+      # this to pin a specific build.
+      default = self.packages.${pkgs.stdenv.hostPlatform.system}.bulletin;
+      defaultText = lib.literalExpression "bulletin.packages.\${system}.bulletin";
+      description = "The `bulletin` package to run.";
     };
 
     database = {
@@ -310,15 +308,14 @@ in
     llm = {
       enable = lib.mkOption {
         type = lib.types.bool;
-        default = false;
+        default = true;
         description = ''
-          Turn on LLM cluster summarization (docs/llm-summarization.md, Phase A). This is a
-          **compile-time** switch: it selects the `bulletin-llm` build (the `llm-summarization` cargo
-          feature) over the plain `bulletin`, whose worker runs a best-effort, off-the-punctual-path
-          summarization sweep after each public build against the sidecar at `llm.baseUrl`. Off ⇒ a
-          binary with **no** summarization code at all (the deterministic digest baseline) — there is
-          no runtime flag. Pair with `llm.serveLocally` to also run the sidecar on this host. No data
-          egress: the sidecar is 100% local (design §12).
+          Retained for compatibility. Summarization is now a **mandatory** part of the pipeline
+          (docs/llm-summarization.md §3.7) — there is no `llm-summarization` cargo feature and no
+          baseline-only build, so this no longer changes the binary. The worker always requires a
+          reachable summarization sidecar at `llm.baseUrl` (it gates startup on it). The operative
+          choice is `llm.serveLocally` (run a 100%-local `llama-server` on this host, no egress —
+          design §12) versus pointing `llm.baseUrl` at an external sidecar.
         '';
       };
       baseUrl = lib.mkOption {
@@ -677,10 +674,8 @@ in
         BULLETIN_EMAIL_TRANSPORT = cfg.email.transport;
         BULLETIN_EMAIL_FROM = cfg.email.from;
         BULLETIN_EMAIL_FILE_DIR = "%S/bulletin/outbox";
-      }
-      // lib.optionalAttrs cfg.llm.enable {
-        # Configure (not enable — the feature build is the switch) the worker's summarization sidecar:
-        # where it lives, which model, which prompt version.
+        # Summarization is mandatory (§3.7), so the worker always needs to know where its sidecar lives,
+        # which model, and which prompt version — set unconditionally (no longer gated on a build switch).
         BULLETIN_LLM_BASE_URL = cfg.llm.baseUrl;
         BULLETIN_LLM_MODEL = cfg.llm.model;
         BULLETIN_LLM_PROMPT_VERSION = toString cfg.llm.promptVersion;
@@ -693,12 +688,12 @@ in
           RestartSec = 5;
           StateDirectory = "bulletin";
           StateDirectoryMode = "0700";
-          # Mark the unit failed if /health doesn't come up → deploy-rs (or any rollback) reverts. With
-          # `llm.enable` the binary now gates startup on the summarization sidecar being reachable (it
-          # won't bind /health until then, and the sidecar may still be loading its GGUF), so widen the
-          # retry window to cover that — an unreachable sidecar still fails the probe and rolls back,
-          # but a slow-loading one isn't mistaken for a dead deploy. Stays tight on the baseline build.
-          ExecStartPost = "${pkgs.curl}/bin/curl --fail --silent --max-time 5 --retry ${toString (if cfg.llm.enable then 90 else 15)} --retry-delay 1 --retry-connrefused http://${cfg.http.addr}/health";
+          # Mark the unit failed if /health doesn't come up → deploy-rs (or any rollback) reverts. The
+          # binary gates startup on the summarization sidecar being reachable (it won't bind /health until
+          # then, and the sidecar may still be loading its GGUF), so the retry window is wide — an
+          # unreachable sidecar still fails the probe and rolls back, but a slow-loading one isn't mistaken
+          # for a dead deploy.
+          ExecStartPost = "${pkgs.curl}/bin/curl --fail --silent --max-time 5 --retry 90 --retry-delay 1 --retry-connrefused http://${cfg.http.addr}/health";
         }
         // lib.optionalAttrs (envSecretFiles != [ ]) {
           # Both secret env files (SMTP creds + the sealed GitHub App credentials) are read as root
