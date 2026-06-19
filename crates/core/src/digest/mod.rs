@@ -11,7 +11,7 @@ pub mod subscriber;
 
 pub use render::{DigestContent, Mailer};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
@@ -49,6 +49,12 @@ pub enum DigestOutcome {
     /// The boundary moved into the future between enqueue and run — a preference change deferred
     /// this send. Nothing delivered; the next tick fires it at the corrected boundary.
     NotYetDue,
+    /// The digest had selected items but its **authored lead couldn't be composed** within the retry
+    /// budget (the sidecar was down, or every re-seeded draw failed the gate). Per the §3.7 contract a
+    /// digest with items never ships without an LLM lead, so nothing was delivered and the watermark did
+    /// **not** advance: the job errors so apalis retries it later. `exhausted` is set once the per-job
+    /// retry budget is spent, so the worker can alert rather than retry silently forever.
+    LeadDeferred { exhausted: bool },
 }
 
 /// Loads a subscriber or errors if it's gone — the shared first step of every flow below.
@@ -89,16 +95,16 @@ async fn link_and_select(
     // so, and now the DB enforces it (design §12).
     let (clusters, prior, shown) = with_scope(pool, ScopeCtx::Subscriber(sub_id), move |conn| {
         Box::pin(async move {
-            // With `llm-summarization` compiled in, withhold clusters that don't yet carry a
-            // gate-passed model summary — they slip to a later digest rather than shipping without one
-            // (docs/llm-summarization.md; the strict, no-valve policy). The deterministic build passes
-            // `false` and is unchanged.
+            // Strict summary gate (§3.7): withhold any cluster that doesn't yet carry a gate-passed
+            // model summary (`band` confirmed/probable) — it slips to a later digest rather than shipping
+            // without one. A cluster still being (re)summarized or quarantined for operator review simply
+            // doesn't appear here; it never blocks the digest, it just isn't in it yet.
             let clusters = link::store::candidate_clusters(
                 &mut *conn,
                 sub_id,
                 last_run,
                 horizon_days,
-                cfg!(feature = "llm-summarization"),
+                true,
             )
             .await
             .context("collect candidate clusters")?;
@@ -134,9 +140,25 @@ async fn link_and_select(
         .map(|s| (s.id, story_spine(s, &cluster_entities)))
         .collect();
 
+    // The §3.7 story gate: a **multi-member** story may only be a candidate once its cross-source
+    // synthesis is gate-passed (`band` confirmed/probable) — otherwise it's withheld and slips to a later
+    // window rather than collapsing to one member's single-source blurb. Single-member stories have
+    // nothing to fuse and render their one (already-gated) cluster summary, so they're always eligible.
+    let story_ids: Vec<Uuid> = assignment.stories.iter().map(|s| s.id).collect();
+    let faithful_stories: HashSet<Uuid> = with_scope(pool, ScopeCtx::Subscriber(sub_id), move |conn| {
+        Box::pin(async move {
+            link::store::faithful_story_ids(&mut *conn, &story_ids)
+                .await
+                .context("load faithful story summaries")
+        })
+    })
+    .await?
+    .into_iter()
+    .collect();
     let mut candidates: Vec<Candidate> = assignment
         .stories
         .iter()
+        .filter(|s| s.clusters.len() == 1 || faithful_stories.contains(&s.id))
         .map(|s| Candidate::from_story(s, story_entities[&s.id].clone(), shown.get(&s.id).copied()))
         .collect();
     // Add the Thread relevance term before ranking (compiled out when the feature is off; a no-op
@@ -332,22 +354,33 @@ async fn record_candidate_snapshot(
     }
 }
 
-/// Compose the digest's big-picture lead (`llm-summarization.md` §2.4, Phase D) and persist it onto the
-/// `digest` row for the debug trace. With `llm-summarization` this attempts the deadline-bounded
-/// **authored** editor's note, falling back to the deterministic Phase-A lead the instant it misses;
-/// the chosen lead is returned (rendered by the caller) and recorded best-effort. Without the feature
-/// it is a no-op returning `None` — render then composes the deterministic lead at fire time, exactly
-/// as before, and the `digest.lead` column stays NULL (feature-off behavior is unchanged).
-#[cfg(feature = "llm-summarization")]
+/// How many times, within a single `generate` run, the authored lead is re-attempted with an escalated
+/// seed past a deterministic gate rejection (§3.7) before the digest defers to a later job attempt. A
+/// down sidecar is *not* re-tried in-process (re-seeding can't reach a dead box) — that returns `None`
+/// immediately and the whole job retries later, where the box may be back.
+const LEAD_SEED_RETRIES: i32 = 3;
+
+/// The apalis job attempt at/after which a still-deferred lead is flagged `exhausted` — the signal the
+/// worker turns into an operator alert (§3.7: "delay the digest until the lead is ready, alert on the
+/// retry limit") rather than another silent retry. The job keeps retrying past this; the flag just marks
+/// that the budget for a *quiet* recovery is spent.
+const LEAD_DEFER_ALERT_ATTEMPTS: u32 = 5;
+
+/// Compose the digest's big-picture lead (`llm-summarization.md` §2.4/§3.1, Phase D) and persist it onto
+/// the `digest` row. This is the *one* summarization model call on the punctual path, and — per the §3.7
+/// contract — the digest never ships without it: returns `Some(lead)` when one was authored, or `None`
+/// when it couldn't be (the caller then defers the whole digest, watermark unmoved, for a later retry).
+/// `job_attempt` is the apalis attempt index, folded into the seed so successive job retries also draw
+/// fresh leads, not the same rejected one.
 async fn digest_lead(
     pool: &PgPool,
     digest_id: Uuid,
     subscriber_id: Uuid,
     items: &[RenderItem],
+    job_attempt: u32,
 ) -> Option<String> {
-    let lead = authored_lead(items).await;
-    // Persist whichever lead will render (authored or the deterministic fallback) — best-effort, never
-    // blocks the send, parity with the decision log.
+    let lead = authored_lead(items, job_attempt).await?;
+    // Persist the authored lead (for the debug trace) — best-effort, never blocks the send.
     let to_store = lead.clone();
     let result = with_scope(pool, ScopeCtx::Subscriber(subscriber_id), move |conn| {
         Box::pin(async move {
@@ -363,23 +396,16 @@ async fn digest_lead(
     Some(lead)
 }
 
-#[cfg(not(feature = "llm-summarization"))]
-async fn digest_lead(_: &PgPool, _: Uuid, _: Uuid, _: &[RenderItem]) -> Option<String> {
-    None
-}
-
-/// The deadline-bounded **authored big-picture lead** (Phase D, §3.1) over the selected items, with the
-/// deterministic Phase-A lead as the fallback. This is the *one* summarization model call on the
-/// punctual path, so it is wrapped in `SummarizationConfig::lead_deadline`: a slow box delays the send
-/// by at most that long, then ships the deterministic lead and goes out on time. Any failure — no usable
-/// headlines, a down sidecar, a gate rejection, or the deadline — degrades to the deterministic lead.
-#[cfg(feature = "llm-summarization")]
-async fn authored_lead(items: &[RenderItem]) -> String {
-    use crate::summarize::{self, SummarizationConfig};
-
-    // The deterministic Phase-A lead, composed from the selected headlines — both the deadline fallback
-    // and the grounding the authored lead's numbers are checked against.
-    let deterministic = render::compose_lead(items);
+/// The deadline-bounded **authored big-picture lead** (Phase D, §3.1). `Some(lead)` on success; `None`
+/// when it couldn't be composed within this run's budget — the caller defers the digest (§3.7). There is
+/// no deterministic fallback: a digest with items either carries an authored lead or waits for one.
+///
+/// A gate rejection is deterministic, so it is retried *in process* up to [`LEAD_SEED_RETRIES`] times,
+/// each with a hotter seed (the `job_attempt` offsets the seed base so a later job retry doesn't repeat
+/// this run's draws). A down sidecar or a blown deadline is not re-tried here — re-seeding can't revive
+/// a dead box — so it returns `None` at once and lets the whole job retry later.
+async fn authored_lead(items: &[RenderItem], job_attempt: u32) -> Option<String> {
+    use crate::summarize::{self, LeadOutcome, SummarizationConfig};
 
     let headlines: Vec<String> = items
         .iter()
@@ -387,7 +413,7 @@ async fn authored_lead(items: &[RenderItem]) -> String {
         .filter(|h| !h.is_empty())
         .collect();
     if headlines.is_empty() {
-        return deterministic; // nothing to author from (the empty digest never reaches here anyway)
+        return None; // nothing to author from (the empty digest never reaches here anyway)
     }
     // The threads the selected items advance, deduped in first-seen (rank) order — the §3.6 "name 1–2
     // threads" inputs.
@@ -403,31 +429,43 @@ async fn authored_lead(items: &[RenderItem]) -> String {
         }
     }
 
-    let cfg = SummarizationConfig::from_env();
-    let http = match summarize::build_summarize_http(&cfg, "digest-lead") {
+    let base = SummarizationConfig::from_env();
+    let http = match summarize::build_summarize_http(&base, "digest-lead") {
         Ok(h) => h,
         Err(e) => {
-            tracing::warn!(error = %e, "failed to build lead http client; using deterministic lead");
-            return deterministic;
+            tracing::warn!(error = %e, "failed to build lead http client; deferring digest");
+            return None;
         }
     };
-    match tokio::time::timeout(
-        cfg.lead_deadline,
-        summarize::client::authored_lead(&cfg, &http, &headlines, &threads),
-    )
-    .await
-    {
-        Ok(Some(lead)) => lead,
-        // Transport failure or a gate rejection — `authored_lead` already logged it.
-        Ok(None) => deterministic,
-        Err(_) => {
-            tracing::debug!(
-                deadline_s = cfg.lead_deadline.as_secs(),
-                "digest lead exceeded its deadline; using deterministic lead"
-            );
-            deterministic
+    // Offset the seed base so each in-process retry *and* each job retry draws a distinct lead.
+    let seed_base = job_attempt.saturating_mul(LEAD_SEED_RETRIES as u32) as i32;
+    for i in 0..LEAD_SEED_RETRIES {
+        let cfg = base.for_attempt(seed_base + i);
+        match tokio::time::timeout(
+            cfg.lead_deadline,
+            summarize::client::authored_lead(&cfg, &http, &headlines, &threads),
+        )
+        .await
+        {
+            Ok(LeadOutcome::Ready(lead)) => return Some(lead),
+            // Deterministic voice/grounding miss — re-seed and try again within this run.
+            Ok(LeadOutcome::Rejected) => continue,
+            // A dead box won't be revived by re-seeding; defer the whole digest to a later job attempt.
+            Ok(LeadOutcome::Unavailable) => return None,
+            Err(_) => {
+                tracing::debug!(
+                    deadline_s = cfg.lead_deadline.as_secs(),
+                    "digest lead exceeded its deadline; deferring digest"
+                );
+                return None;
+            }
         }
     }
+    tracing::debug!(
+        retries = LEAD_SEED_RETRIES,
+        "digest lead still rejected after re-seeding; deferring digest"
+    );
+    None
 }
 
 /// The story ids that made the cut, in render order.
@@ -464,6 +502,7 @@ pub async fn generate(
     mailer: &impl Mailer,
     subscriber_id: Uuid,
     content: &DigestContent<'_>,
+    job_attempt: u32,
 ) -> Result<DigestOutcome> {
     // The lookback reads the cluster cache as of ~now; on delivery this instant becomes the new
     // last_run_at (the next digest's consideration floor). Captured before the read so the floor
@@ -561,12 +600,23 @@ pub async fn generate(
         greeting::seed_for(sub.id, window_end),
         sub.name.as_deref(),
     );
-    // The big-picture lead (`llm-summarization.md` §2.4). With `llm-summarization` this is the
-    // deadline-bounded **authored** editor's note (Phase D), persisted onto the digest for the debug
-    // trace; otherwise `None`, and render composes the deterministic Phase-A lead at fire time — exactly
-    // today's behavior. The one model call on the punctual path, and the only one that can't be skipped:
-    // it is deadline-bounded so a slow box delays the send by at most `lead_deadline`, never more.
-    let lead = digest_lead(pool, digest.id, sub.id, &items).await;
+    // The big-picture lead (Phase D, `llm-summarization.md` §2.4/§3.1) — the one model call on the
+    // punctual path, and the one summary the digest can't ship without (§3.7). `None` means it couldn't
+    // be authored within this run's budget (sidecar down, or every re-seeded draw failed the gate): we
+    // do **not** send and do **not** advance the watermark — the job errors so apalis retries this same
+    // window later (the digest row stays frozen and idempotent). A subscriber waits for a good lead
+    // rather than receiving a partial digest.
+    let Some(lead) = digest_lead(pool, digest.id, sub.id, &items, job_attempt).await else {
+        let exhausted = job_attempt >= LEAD_DEFER_ALERT_ATTEMPTS;
+        tracing::warn!(
+            subscriber_id = %sub.id,
+            %window_end,
+            job_attempt,
+            exhausted,
+            "digest lead unavailable; deferring delivery (no digest ships without an LLM lead)"
+        );
+        return Ok(DigestOutcome::LeadDeferred { exhausted });
+    };
     let message = render::render(
         mailer.from(),
         &sub.email,
@@ -574,7 +624,7 @@ pub async fn generate(
         &sub.timezone,
         &items,
         &greeting,
-        lead.as_deref(),
+        Some(lead.as_str()),
         content,
     )?;
     mailer.send(message).await?;

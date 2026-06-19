@@ -200,13 +200,12 @@ async fn public_build(
     .await
 }
 
-/// Best-effort public cluster-summarization sweep, hung off a completed PublicBuild (the natural
+/// Public cluster-summarization sweep, hung off a completed PublicBuild (the natural
 /// `summary_hash`-invalidation point, docs/llm-summarization.md §5). Runs in the no-subscriber RLS
 /// context inside `core`; shared public summaries are generated once for everybody (the §5 multiplier
-/// saving). The `llm-summarization` cargo feature is the **sole** kill switch — without it this is the
-/// empty no-op below and no summarization code is compiled. The `BULLETIN_LLM_*` env only *configures*
-/// the sidecar (URL/model). Never propagates an error — summarization is not the deliverable.
-#[cfg(feature = "llm-summarization")]
+/// saving). The `BULLETIN_LLM_*` env configures the sidecar (URL/model). The sweep never propagates an
+/// error — per-cluster failures are tracked, retried with an escalating seed, and quarantined inside
+/// `core` (§3.7); the only externally-visible effect is the cluster's (temporary) absence from digests.
 async fn summarize_public(pool: &PgPool) {
     let cfg = bulletin_core::summarize::SummarizationConfig::from_env();
     report_sweep(
@@ -215,39 +214,38 @@ async fn summarize_public(pool: &PgPool) {
     );
 }
 
-#[cfg(not(feature = "llm-summarization"))]
-async fn summarize_public(_: &PgPool) {}
-
-/// Shared logging for a best-effort summarization sweep (public or private) — the one piece the two
-/// entry points actually share (their core calls differ in scope/arguments). `subscriber_id` is
-/// `Some` for a private sweep, `None` for the shared public one.
-#[cfg(feature = "llm-summarization")]
+/// Shared logging for a summarization sweep (public or private) — the one piece the two entry points
+/// actually share (their core calls differ in scope/arguments). `subscriber_id` is `Some` for a private
+/// sweep, `None` for the shared public one.
 fn report_sweep(
     subscriber_id: Option<Uuid>,
     result: anyhow::Result<bulletin_core::summarize::SummarizeStats>,
 ) {
     match result {
-        // A non-zero `unavailable` count means the sidecar was unreachable/erroring for at least one
-        // cluster this pass — surface it at WARN so a degraded model edge is visible at the default log
-        // level (those clusters retry next sweep), while a clean pass stays at INFO.
-        Ok(stats) if stats.unavailable > 0 => tracing::warn!(
+        // Any cluster that came out of the pass without a faithful summary (a tracked failure or a
+        // quarantine, §3.7) is a degraded model edge — surface it at WARN so it's visible at the default
+        // log level. A non-zero `quarantined` is the louder signal: that corpus slice exhausted its
+        // retries and now needs operator review. A clean pass stays at INFO.
+        Ok(stats) if stats.unhealthy() > 0 => tracing::warn!(
             ?subscriber_id,
             summarized = stats.summarized,
             skipped = stats.skipped,
-            unavailable = stats.unavailable,
-            "cluster summarization sweep complete with unavailable clusters (sidecar degraded?)"
+            failed = stats.failed,
+            quarantined = stats.quarantined,
+            "summarization sweep complete with failed/quarantined clusters (sidecar degraded?)"
         ),
         Ok(stats) => tracing::info!(
             ?subscriber_id,
             summarized = stats.summarized,
             skipped = stats.skipped,
-            unavailable = stats.unavailable,
-            "cluster summarization sweep complete"
+            failed = stats.failed,
+            quarantined = stats.quarantined,
+            "summarization sweep complete"
         ),
         Err(e) => tracing::warn!(
             ?subscriber_id,
             error = %format!("{e:#}"),
-            "cluster summarization sweep failed (non-fatal)"
+            "summarization sweep failed (non-fatal)"
         ),
     }
 }
@@ -259,10 +257,14 @@ async fn generate_digest(
     pool: Data<PgPool>,
     email: Data<EmailConfig>,
 ) -> Result<(), BoxDynError> {
+    // The apalis attempt index is folded into the lead's seed (so successive retries draw fresh leads,
+    // not the same rejected one) and decides when a still-deferred lead is "exhausted". Read before
+    // `attempt` is moved into `traced`.
+    let job_attempt = attempt.current() as u32;
     traced("generate_digest", task_id, attempt, async move {
         let sender = email.build_sender().map_err(boxed)?;
         let content = email.content();
-        match bulletin_core::digest::generate(&pool, &sender, job.subscriber_id, &content).await {
+        match bulletin_core::digest::generate(&pool, &sender, job.subscriber_id, &content, job_attempt).await {
             Ok(outcome) => {
                 // `delivered` and `empty` both sent an email; `already_delivered`/`not_yet_due`
                 // sent nothing. Record every variant so the counter doesn't undercount real sends.
@@ -274,6 +276,24 @@ async fn generate_digest(
                     DigestOutcome::Empty => metric::digest_outcome("empty"),
                     DigestOutcome::AlreadyDelivered => metric::digest_outcome("already_delivered"),
                     DigestOutcome::NotYetDue => metric::digest_outcome("not_yet_due"),
+                    // The §3.7 contract: a digest with items never ships without an LLM lead. Nothing was
+                    // delivered and the watermark didn't advance — error so apalis retries this same
+                    // window later (the box may recover, or a re-seeded lead may pass). Once the quiet
+                    // retry budget is spent, alert loudly rather than retry silently.
+                    DigestOutcome::LeadDeferred { exhausted } => {
+                        metric::digest_outcome("lead_deferred");
+                        if exhausted {
+                            metric::digest_lead_unavailable();
+                            tracing::error!(
+                                subscriber_id = %job.subscriber_id,
+                                job_attempt,
+                                "digest still undelivered — its LLM lead has been unavailable across the retry budget; operator attention needed (sidecar?)"
+                            );
+                        }
+                        return Err(boxed(anyhow::anyhow!(
+                            "digest lead unavailable (attempt {job_attempt}); deferring delivery until it can be composed"
+                        )));
+                    }
                 }
                 tracing::info!(subscriber_id = %job.subscriber_id, ?outcome, "digest generated");
             }
@@ -334,10 +354,8 @@ async fn thread_maintenance(
 /// private mirror of [`summarize_public`], run in the dependency order the hierarchy needs (§4): the
 /// **private cluster** summaries first (Phase A), then **story cross-source synthesis** over the
 /// member cluster summaries (Phase C), then the **thread label + delta** over the recent story
-/// headlines (Phase B). The `llm-summarization` cargo feature is the **sole** kill switch — without it
-/// this is the empty no-op below. Each sweep is independently best-effort and never propagates an
-/// error — summarization is not the deliverable.
-#[cfg(feature = "llm-summarization")]
+/// headlines (Phase B). Each sweep tracks/retries/quarantines its own failures inside `core` (§3.7) and
+/// never propagates an error — an un-summarized cluster is simply withheld from the subscriber's digest.
 async fn summarize_private(pool: &PgPool, subscriber_id: Uuid) {
     let cfg = bulletin_core::summarize::SummarizationConfig::from_env();
     // Phase A (private clusters) → Phase C (story synthesis) → Phase B (thread label/delta): each tier
@@ -356,9 +374,6 @@ async fn summarize_private(pool: &PgPool, subscriber_id: Uuid) {
         bulletin_core::summarize::sweep_thread_labels(pool, subscriber_id, &cfg).await,
     );
 }
-
-#[cfg(not(feature = "llm-summarization"))]
-async fn summarize_private(_: &PgPool, _: Uuid) {}
 
 /// How often a subscriber's thread-maintenance pass runs (a relaxed, off-path cadence).
 #[cfg(feature = "thread-weighting")]

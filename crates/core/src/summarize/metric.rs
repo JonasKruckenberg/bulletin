@@ -1,10 +1,8 @@
 //! The `bulletin_llm_*` metrics for the local-sidecar summarization path. Thin recorders so the
 //! metric-name strings live in one place rather than scattered across the client and the sweep —
-//! mirroring `bulletin`'s `metric.rs`. Gated on `llm-summarization` (the only build that makes model
-//! calls), and `metrics` is an optional dependency pulled in by that same feature, keeping the
-//! deterministic build's dependency surface flat. The Prometheus recorder is installed by the
-//! `bulletin` binary; until then (e.g. in unit tests, or any non-`worker` role) these macros are
-//! no-ops, so recording is always safe to call unconditionally.
+//! mirroring `bulletin`'s `metric.rs`. The Prometheus recorder is installed by the `bulletin` binary;
+//! until then (e.g. in unit tests, or any non-`worker` role) these macros are no-ops, so recording is
+//! always safe to call unconditionally.
 
 use std::time::Duration;
 
@@ -33,9 +31,11 @@ pub fn llm_tokens(phase: &'static str, prompt: u64, completion: u64) {
         .increment(completion);
 }
 
-/// A model candidate the faithfulness gate rejected back to the deterministic baseline (`phase`:
-/// `summarize` | `synthesize`). `reason` is the *variant* of the violation only — never its dynamic
-/// payload (the offending entity/number) — so the label set stays bounded.
+/// A model candidate the faithfulness gate rejected (`phase`: `summarize` | `synthesize`). `reason` is
+/// the *variant* of the violation only — never its dynamic payload (the offending entity/number) — so
+/// the label set stays bounded. For a cluster this is also a tracked [`summary_failed`] of kind
+/// `rejected` that drives the §3.7 escalating-seed retry; this counter additionally breaks it down by
+/// gate reason.
 pub fn gate_rejection(phase: &'static str, violation: &GateViolation) {
     let reason = match violation {
         GateViolation::UngroundedEntity(_) => "ungrounded_entity",
@@ -46,6 +46,23 @@ pub fn gate_rejection(phase: &'static str, violation: &GateViolation) {
     };
     metrics::counter!("bulletin_llm_gate_rejections_total", "phase" => phase, "reason" => reason)
         .increment(1);
+}
+
+/// A tracked summarization failure (§3.7): a unit (`unit`: `cluster` | `story`) that came out of an
+/// attempt without a faithful summary. `kind` is the coarse reason — `unavailable` (sidecar/transport)
+/// or `rejected` (the §3.4 gate said no) — so the down-sidecar rate and the hallucination-rejection rate
+/// read apart. The escalating-seed retry (§3.7) draws against this counter.
+pub fn summary_failed(unit: &'static str, kind: &'static str) {
+    metrics::counter!("bulletin_llm_summary_failed_total", "unit" => unit, "kind" => kind)
+        .increment(1);
+}
+
+/// A unit (`unit`: `cluster`) whose retry budget was exhausted and is now **quarantined** for operator
+/// review (§3.7) — withheld from the sweep and from digests until a content change or a manual clear. A
+/// rising count is the signal that the sidecar or the gate is systematically failing a slice of the
+/// corpus, not just flapping.
+pub fn quarantined(unit: &'static str) {
+    metrics::counter!("bulletin_llm_quarantined_total", "unit" => unit).increment(1);
 }
 
 /// One content-hash cache decision in a sweep (`kind`: `cluster` | `story`): a `hit` reused the cached

@@ -13,10 +13,6 @@ default = ["thread-weighting"]
 # Forwards to `bulletin-core/thread-weighting` and additionally gates the maintenance enqueue in the
 # worker tick. Build the binary with `--no-default-features` to disable the Thread layer entirely.
 thread-weighting = ["bulletin-core/thread-weighting"]
-# Forwards to `bulletin-core/llm-summarization` and gates the post-build cluster-summarization sweep
-# in the worker. Off by default — build with `--features llm-summarization` and set the runtime
-# `BULLETIN_LLM_*` env (a reachable local sidecar) to actually summarize. See docs/llm-summarization.md.
-llm-summarization = ["bulletin-core/llm-summarization"]
 
 [dependencies]
 # default-features = false so the binary's own `thread-weighting` feature is the single switch that

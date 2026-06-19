@@ -232,7 +232,9 @@ impl UnstableDebugService for AdminApi {
     ) -> Result<Response<proto::DigestOutcome>, Status> {
         let subscriber = parse_uuid(&req.into_inner().subscriber, "subscriber")?;
         let sender = self.build_sender()?;
-        let outcome = digest::generate(&self.pool, &sender, subscriber, &self.email.content())
+        // A manual operator run is a single shot (attempt 0): if the lead defers, the outcome says so and
+        // the operator can re-run; there's no apalis retry behind this RPC.
+        let outcome = digest::generate(&self.pool, &sender, subscriber, &self.email.content(), 0)
             .await
             .map_err(error::internal("generate digest"))?;
         Ok(Response::new(convert::digest_outcome(outcome)))
