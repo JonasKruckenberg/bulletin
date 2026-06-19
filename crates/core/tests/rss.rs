@@ -86,7 +86,10 @@ fn parse_rss_caps_body_on_word_boundary() {
 </channel></rss>"#
     );
     let items = parse_feed(xml.as_bytes()).unwrap();
-    let body = items[0].body.as_deref().expect("item has a description body");
+    let body = items[0]
+        .body
+        .as_deref()
+        .expect("item has a description body");
 
     assert!(
         body.chars().count() <= 2000,
@@ -94,7 +97,10 @@ fn parse_rss_caps_body_on_word_boundary() {
         body.chars().count()
     );
     // Cut on a whitespace boundary: the final token is a complete "alpha", with no trailing space.
-    assert!(body.ends_with("alpha"), "body must end on a whole word: {body:?}");
+    assert!(
+        body.ends_with("alpha"),
+        "body must end on a whole word: {body:?}"
+    );
     assert!(!body.ends_with(' '), "no dangling trailing space: {body:?}");
 }
 
