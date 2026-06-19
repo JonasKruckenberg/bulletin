@@ -12,12 +12,16 @@ use uuid::Uuid;
 
 use crate::link::{Assignment, LinkCluster, PriorMember};
 
-/// The subscriber's candidate clusters for linking: their scope (`public ∪ own-private`), carrying
-/// the blocking substrate (`entities`) and recency span. Two arms, unioned (`scope_kind = 'public' OR
-/// scope_subscriber_id = $1` is the isolation boundary — never another subscriber's private cluster):
+/// The subscriber's candidate clusters for linking: their scope (`subscribed-public ∪ own-private`),
+/// carrying the blocking substrate (`entities`) and recency span. Two arms, unioned
+/// (`scope_subscriber_id = $1` is the isolation boundary — never another subscriber's private
+/// cluster):
 ///
-///  1. **In-floor** — public ∪ own-private clusters updated since the freshness floor `min(last_run,
-///     now − horizon)`. The bulk of the candidate set, served by the `cluster_*_recency` indexes.
+///  1. **In-floor** — clusters updated since the freshness floor `min(last_run, now − horizon)`: a
+///     public cluster only when the subscriber subscribes to the `connection` that produced it (the
+///     sources they chose for their digest; an unattributed public row — no origin on record — stays
+///     global), plus all own-private. The bulk of the candidate set, served by the `cluster_*_recency`
+///     indexes + the `subscription` join.
 ///  2. **Cross-boundary seed** — public clusters that share a **strong key** (a `cve:`/`url:`, mirrors
 ///     `entity::link_strength`) with the subscriber's *active* (in-floor) private clusters, **regardless
 ///     of the freshness floor on the public side**. This is the design's blocking seed (§8.2):
@@ -55,7 +59,24 @@ pub async fn candidate_clusters(
                   SELECT id, scope_kind, source, entities, first_event_time, last_event_time,
                          event_count, content_depth, max_severity
                   FROM cluster
-                  WHERE (scope_kind = 'public' OR scope_subscriber_id = $1)
+                  -- The candidate scope, now an explicit per-source filter: a public cluster enters
+                  -- only if the subscriber subscribes to the connection that produced it (the source
+                  -- they chose for their digest); own-private always. `scope_subscriber_id = $1` stays
+                  -- the isolation boundary — never another subscriber's private cluster.
+                  --
+                  -- `connection_id IS NULL` (an unattributed public cluster — no originating feed on
+                  -- record) is treated as global. Real ingest (poll/webhook) always stamps the
+                  -- connection, so this only covers off-path/fixture rows; an attributed public source
+                  -- is always subscription-gated. Source selection is a product filter, not a privacy
+                  -- boundary (that's RLS), so failing open for the degenerate no-origin case is safe.
+                  WHERE (
+                          (scope_kind = 'public'
+                              AND (connection_id IS NULL
+                                   OR connection_id IN (
+                                       SELECT connection_id FROM subscription
+                                       WHERE subscriber_id = $1)))
+                          OR scope_subscriber_id = $1
+                        )
                     AND updated_at >= (SELECT lo FROM floor)
                     AND (NOT $4 OR summary ->> 'band' IN ('confirmed', 'probable'))
               ),
@@ -74,6 +95,11 @@ pub async fn candidate_clusters(
               ),
               -- Public clusters sharing a strong key with those — *regardless of the floor*, so an
               -- aged-out advisory still links (a strong CVE/URL edge ignores temporal distance).
+              -- Intentionally NOT subscription-gated: this seed is not browsing an unsubscribed
+              -- source, it enriches a story the subscriber already gets (via their own private
+              -- incident) with the public advisory that incident strong-keys to — the product cross-
+              -- source link. It only fires on a cve:/url: match to the subscriber own active private
+              -- clusters, so it cannot pull in arbitrary public content.
               cross_boundary AS (
                   SELECT id, scope_kind, source, entities, first_event_time, last_event_time,
                          event_count, content_depth, max_severity

@@ -27,6 +27,7 @@ pub mod feedback;
 pub mod identity;
 pub mod ingest;
 pub mod link;
+pub mod subscription;
 pub mod summarize;
 pub mod thread;
 

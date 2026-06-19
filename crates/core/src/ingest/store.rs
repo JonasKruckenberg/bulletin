@@ -10,14 +10,15 @@ use uuid::Uuid;
 
 /// The `connection` column list, in `ConnectionRow` / `row_to_connection` order — shared by every
 /// read so the projection can't drift from the mapper.
-const CONNECTION_COLUMNS: &str = "id, source, status, config, cursor, poll_interval_secs, \
+pub(crate) const CONNECTION_COLUMNS: &str =
+    "id, source, status, config, cursor, poll_interval_secs, \
      next_poll_at, last_polled_at, consecutive_failures, subscriber_id";
 
 /// The full `event` column list (DB-filled `id`/`ingest_time` included), in `from_row` order —
 /// shared by the append `RETURNING` and the debug list `SELECT`.
 const EVENT_COLUMNS: &str = "id, fingerprint, source, scope_kind, scope_subscriber_id, \
      event_time, title, body, links, group_key, entities, \
-     content_kind, severity_hint, ingest_time, raw";
+     content_kind, severity_hint, ingest_time, raw, connection_id";
 
 // ── Connections ────────────────────────────────────────────────────────
 //
@@ -41,7 +42,7 @@ pub struct ConnectionRow {
     pub subscriber_id: Option<Uuid>,
 }
 
-fn row_to_connection(row: PgRow) -> Result<ConnectionRow, sqlx::Error> {
+pub(crate) fn row_to_connection(row: PgRow) -> Result<ConnectionRow, sqlx::Error> {
     Ok(ConnectionRow {
         id: row.get("id"),
         source: row.try_get("source")?,
@@ -100,8 +101,22 @@ pub async fn insert_connection(
     .bind(provider_account_id)
     .fetch_one(&mut *tx)
     .await?;
+    let id: Uuid = row.get("id");
+    // Owning a connection implies subscribing to it: the owner sees its (public-from-owned) clusters
+    // in their digest without a second step, while ownerless public sources (RSS) require an explicit
+    // subscription. Private content rides scope, independent of this row.
+    if let Some(owner) = owner {
+        sqlx::query(
+            "INSERT INTO subscription (subscriber_id, connection_id) VALUES ($1, $2)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(owner)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    }
     tx.commit().await?;
-    Ok(row.get("id"))
+    Ok(id)
 }
 
 /// Returns all connections regardless of status.
@@ -249,8 +264,8 @@ pub async fn insert_event(
         "INSERT INTO event (
             fingerprint, source, scope_kind, scope_subscriber_id,
             event_time, title, body, links, group_key, entities,
-            content_kind, severity_hint, raw
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            content_kind, severity_hint, raw, connection_id
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
         ON CONFLICT ON CONSTRAINT event_fingerprint_unique DO NOTHING
         RETURNING {EVENT_COLUMNS}"
     ))
@@ -267,6 +282,7 @@ pub async fn insert_event(
     .bind(ev.content_kind)
     .bind(ev.severity_hint)
     .bind(ev.raw.as_deref())
+    .bind(ev.connection_id)
     .try_map(from_row)
     .fetch_optional(executor)
     .await

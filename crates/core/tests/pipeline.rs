@@ -11,7 +11,7 @@ use bulletin_core::digest::store::{
     create_with_items, last_shown, mark_delivered, render_items, FrozenItem,
 };
 use bulletin_core::digest::subscriber::{
-    advance_after_delivery, due_subscribers, insert_subscriber, load_subscriber,
+    advance_after_delivery, delete_subscriber, due_subscribers, insert_subscriber, load_subscriber,
     update_preferences, Recurrence,
 };
 use bulletin_core::ingest::store::{insert_connection, insert_event};
@@ -19,6 +19,7 @@ use bulletin_core::link::{
     link,
     store::{candidate_clusters, load_prior_members, persist_assignment},
 };
+use bulletin_core::subscription::{list_subscriptions, subscribe, unsubscribe};
 use bulletin_core::{
     begin_scope,
     cluster::{build_private, rollup},
@@ -131,6 +132,30 @@ async fn insert_private(
     .links(vec![format!("https://example.com/{stable_id}")])
     .private(true)
     .finalize(Some(subscriber));
+    insert_event(pool, &ev).await.unwrap();
+}
+
+/// Inserts a public event attributed to `connection` — the real-ingest shape (poll/webhook stamp the
+/// originating connection), so its cluster is subscription-filterable (unlike `insert_public`, which
+/// leaves the origin NULL → globally visible).
+async fn insert_public_from(
+    pool: &PgPool,
+    connection: Uuid,
+    stable_id: &str,
+    group_key: &str,
+    title: &str,
+    secs: i64,
+) {
+    let ev = EventBuilder::new(
+        SourceKind::Rss,
+        stable_id,
+        Utc.timestamp_opt(secs, 0).single().unwrap(),
+        title,
+        group_key,
+    )
+    .links(vec![format!("https://example.com/{stable_id}")])
+    .connection(Some(connection))
+    .finalize(None);
     insert_event(pool, &ev).await.unwrap();
 }
 
@@ -503,6 +528,144 @@ async fn private_clusters_are_isolated_to_their_owner() {
     // The total cluster count is 1 public + 2 private — a private event never lands in a public
     // cluster (scope is part of the cluster identity).
     assert_eq!(cluster_count(&pool).await, 3);
+}
+
+// Source subscriptions: a public source comprises a subscriber's digest only when they subscribe to
+// the connection that produced it. An attributed public cluster is gated; subscribing admits it,
+// unsubscribing removes it — own-private content is unaffected (it rides scope, not subscription).
+#[tokio::test]
+async fn subscription_gates_public_sources() {
+    let (pool, _pg) = setup().await;
+
+    // A public RSS feed (ownerless → no auto-subscription) with one built cluster.
+    let feed = insert_connection(
+        &pool,
+        SourceKind::Rss,
+        serde_json::json!({ "url": "https://example.com/feed.xml" }),
+        900,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    insert_public_from(&pool, feed, "a", "a", "Feed article", 100).await;
+    build_all(&pool).await;
+
+    let alice = insert_subscriber(&pool, "a@x.com", None, Recurrence::Daily, "UTC", nine_am())
+        .await
+        .unwrap();
+    let bob = insert_subscriber(&pool, "b@x.com", None, Recurrence::Daily, "UTC", nine_am())
+        .await
+        .unwrap();
+
+    let candidates = |sub| {
+        let pool = pool.clone();
+        async move {
+            candidate_clusters(&pool, sub, None, 30, false)
+                .await
+                .unwrap()
+                .len()
+        }
+    };
+
+    // Neither subscriber chose this source yet → it's in nobody's digest.
+    assert_eq!(candidates(alice).await, 0, "unsubscribed: not a candidate");
+    assert_eq!(candidates(bob).await, 0);
+
+    // Alice subscribes → the source now comprises her digest, but still not Bob's.
+    assert!(subscribe(&pool, alice, feed).await.unwrap());
+    assert!(!subscribe(&pool, alice, feed).await.unwrap(), "idempotent");
+    assert_eq!(candidates(alice).await, 1, "subscribed: now a candidate");
+    assert_eq!(candidates(bob).await, 0, "Bob didn't subscribe");
+
+    // list_subscriptions reflects the choice.
+    let subs = list_subscriptions(&pool, alice).await.unwrap();
+    assert_eq!(subs.len(), 1);
+    assert_eq!(subs[0].id, feed);
+
+    // Unsubscribing drops it back out of her candidate set.
+    assert!(unsubscribe(&pool, alice, feed).await.unwrap());
+    assert_eq!(candidates(alice).await, 0, "unsubscribed again: gone");
+}
+
+// Owning a connection (a private source) implies subscribing to it — no second step to see its
+// (public-from-owned) clusters. Deleting the subscriber then reclaims the whole footprint: their
+// subscription, their owned connection, and the private clusters/events that were orphaned before
+// (scope_subscriber_id carried no FK).
+#[tokio::test]
+async fn deleting_subscriber_reclaims_private_cache_and_subscriptions() {
+    let (pool, _pg) = setup().await;
+
+    let bob = insert_subscriber(&pool, "b@x.com", None, Recurrence::Daily, "UTC", nine_am())
+        .await
+        .unwrap();
+
+    // Bob owns a GitHub connection → an implicit subscription is seeded for him.
+    insert_connection(
+        &pool,
+        SourceKind::Github,
+        serde_json::json!({ "installation_id": 7, "repos": [] }),
+        900,
+        Some(bob),
+        Some("7"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        list_subscriptions(&pool, bob).await.unwrap().len(),
+        1,
+        "owning a connection implies a subscription to it"
+    );
+
+    // A private event of Bob's, built into a private cluster.
+    insert_private(&pool, bob, "secret", "secret", "Bob secret", 200).await;
+    assert_eq!(build_private(&pool, bob).await.unwrap(), 1);
+
+    let private_clusters = |sub| {
+        let pool = pool.clone();
+        async move {
+            let n: i64 =
+                sqlx::query("SELECT count(*) AS n FROM cluster WHERE scope_subscriber_id = $1")
+                    .bind(sub)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+                    .get("n");
+            n
+        }
+    };
+    let subscription_rows = || {
+        let pool = pool.clone();
+        async move {
+            let n: i64 =
+                sqlx::query("SELECT count(*) AS n FROM subscription WHERE subscriber_id = $1")
+                    .bind(bob)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+                    .get("n");
+            n
+        }
+    };
+
+    assert_eq!(private_clusters(bob).await, 1, "Bob has a private cluster");
+    assert_eq!(subscription_rows().await, 1);
+
+    // Delete Bob → the FK cascades reclaim everything that used to orphan.
+    assert!(delete_subscriber(&pool, bob).await.unwrap());
+    assert_eq!(
+        private_clusters(bob).await,
+        0,
+        "the private cluster is reclaimed, not orphaned"
+    );
+    assert_eq!(subscription_rows().await, 0, "subscriptions cascade away");
+    let conns: i64 = sqlx::query("SELECT count(*) AS n FROM connection WHERE subscriber_id = $1")
+        .bind(bob)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("n");
+    assert_eq!(conns, 0, "the owned connection cascades away too");
 }
 
 // The cross-boundary blocking seed (design §8.2): a public advisory that has aged out of the

@@ -81,8 +81,8 @@ pub async fn upsert_cluster(
         "INSERT INTO cluster
             (scope_kind, scope_subscriber_id, source, group_key, title, link,
              first_event_time, last_event_time, entities,
-             event_count, content_depth, max_severity, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
+             event_count, content_depth, max_severity, connection_id, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now())
          ON CONFLICT ON CONSTRAINT cluster_identity DO UPDATE SET
             title = EXCLUDED.title,
             link = EXCLUDED.link,
@@ -92,6 +92,7 @@ pub async fn upsert_cluster(
             event_count = EXCLUDED.event_count,
             content_depth = EXCLUDED.content_depth,
             max_severity = EXCLUDED.max_severity,
+            connection_id = EXCLUDED.connection_id,
             updated_at = now()
          RETURNING id",
     )
@@ -107,6 +108,7 @@ pub async fn upsert_cluster(
     .bind(r.event_count)
     .bind(r.content_depth)
     .bind(r.max_severity)
+    .bind(r.connection_id)
     .fetch_one(executor)
     .await?;
     Ok(row.get("id"))
@@ -156,7 +158,7 @@ pub async fn list_group_events(
     sqlx::query(
         "SELECT id, fingerprint, source, scope_kind, scope_subscriber_id,
                 event_time, title, body, links, group_key, entities,
-                content_kind, severity_hint, ingest_time, raw
+                content_kind, severity_hint, ingest_time, raw, connection_id
          FROM event
          WHERE scope_kind = $1 AND scope_subscriber_id IS NOT DISTINCT FROM $2
            AND source = $3 AND group_key = $4

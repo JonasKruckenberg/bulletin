@@ -309,7 +309,10 @@ pub async fn poll(pool: &PgPool, connection_id: Uuid, ctx: &ConnectorCtx) -> Res
             // `append_scoped` then writes each event in the RLS context its scope requires.
             let events: Vec<NewEvent> = builders
                 .into_iter()
-                .map(|b| b.finalize(conn_row.subscriber_id))
+                .map(|b| {
+                    b.connection(Some(conn_row.id))
+                        .finalize(conn_row.subscriber_id)
+                })
                 .collect();
             let (inserted, deduplicated) = append_scoped(pool, events).await?;
             tracing::info!(
@@ -406,7 +409,7 @@ pub async fn process_webhook(
             // writes each event in the RLS context its scope requires.
             let events: Vec<NewEvent> = builders
                 .into_iter()
-                .map(|b| b.finalize(conn.subscriber_id))
+                .map(|b| b.connection(Some(conn.id)).finalize(conn.subscriber_id))
                 .collect();
             let (inserted, deduplicated) = append_scoped(pool, events).await?;
             tracing::info!(

@@ -66,8 +66,14 @@ pub enum DebugCommand {
     },
     /// List subscribers
     SubscriberList,
-    /// Delete a subscriber row by id (cascades to their digests)
+    /// Delete a subscriber row by id (cascades to their digests, subscriptions, and private cache)
     SubscriberRm { id: Uuid },
+    /// Subscribe a subscriber to a source (connection) — adds it to their digest
+    SubscriptionAdd { subscriber: Uuid, connection: Uuid },
+    /// Unsubscribe a subscriber from a source (connection)
+    SubscriptionRm { subscriber: Uuid, connection: Uuid },
+    /// List the sources (connections) a subscriber is subscribed to
+    SubscriptionList { subscriber: Uuid },
     /// Run PublicBuild once, inline (cluster new public events now)
     BuildRun,
     /// Run GenerateDigest once for a subscriber, inline (select → render → deliver)
@@ -286,6 +292,60 @@ pub async fn run(
                 println!("deleted {id}");
             } else {
                 println!("not found: {id}");
+            }
+        }
+        DebugCommand::SubscriptionAdd {
+            subscriber,
+            connection,
+        } => {
+            let created = admin
+                .subscribe(proto::SubscribeRequest {
+                    subscriber: subscriber.to_string(),
+                    connection: connection.to_string(),
+                })
+                .await?
+                .into_inner()
+                .created;
+            if created {
+                println!("subscribed {subscriber} -> {connection}");
+            } else {
+                println!("already subscribed: {subscriber} -> {connection}");
+            }
+        }
+        DebugCommand::SubscriptionRm {
+            subscriber,
+            connection,
+        } => {
+            let removed = admin
+                .unsubscribe(proto::UnsubscribeRequest {
+                    subscriber: subscriber.to_string(),
+                    connection: connection.to_string(),
+                })
+                .await?
+                .into_inner()
+                .removed;
+            if removed {
+                println!("unsubscribed {subscriber} -> {connection}");
+            } else {
+                println!("not subscribed: {subscriber} -> {connection}");
+            }
+        }
+        DebugCommand::SubscriptionList { subscriber } => {
+            let rows = admin
+                .list_subscriptions(proto::ListSubscriptionsRequest {
+                    subscriber: subscriber.to_string(),
+                })
+                .await?
+                .into_inner()
+                .connections;
+            if rows.is_empty() {
+                println!("no subscriptions");
+            }
+            for r in rows {
+                println!(
+                    "{}\t{}\t{}\tpoll={}s\tconfig={}",
+                    r.id, r.source, r.status, r.poll_interval_secs, r.config_json,
+                );
             }
         }
         DebugCommand::BuildRun => {

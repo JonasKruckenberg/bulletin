@@ -1,0 +1,78 @@
+//! The subscriber ↔ source (`connection`) relation: the sources a subscriber chose to comprise their
+//! digest. This is the explicit join the digest candidate scope filters on
+//! ([`link::store::candidate_clusters`](crate::link::store::candidate_clusters)) — a public cluster
+//! enters a subscriber's digest only when they subscribe to the connection that produced it.
+//!
+//! Owning a connection implies a subscription (`ingest::store::insert_connection` seeds one for the
+//! owner); ownerless public sources (RSS) require an explicit subscribe. Deleting either side drops
+//! the row (both FKs `ON DELETE CASCADE`), so a deleted subscriber's subscriptions — and, via the
+//! private-scope cascade added alongside, their private clusters/events — are reclaimed.
+//!
+//! Operator/control-plane operations, run in the `Admin` scope like the rest of the connection
+//! management surface; the `subscription` RLS policy admits admin (and a subscriber to its own rows).
+
+use sqlx::PgPool;
+use uuid::Uuid;
+
+use crate::common::db::{begin_scope, ScopeCtx};
+use crate::ingest::store::{row_to_connection, ConnectionRow, CONNECTION_COLUMNS};
+
+/// Subscribes `subscriber_id` to `connection_id`. Idempotent — re-subscribing is a no-op (the
+/// composite PK collapses the duplicate). Returns `true` if a new row was created.
+pub async fn subscribe(
+    pool: &PgPool,
+    subscriber_id: Uuid,
+    connection_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = begin_scope(pool, ScopeCtx::Admin).await?;
+    let result = sqlx::query(
+        "INSERT INTO subscription (subscriber_id, connection_id) VALUES ($1, $2)
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(subscriber_id)
+    .bind(connection_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Unsubscribes `subscriber_id` from `connection_id`. Returns `true` if a row was removed. The
+/// connection's clusters simply stop entering this subscriber's candidate set on the next digest.
+pub async fn unsubscribe(
+    pool: &PgPool,
+    subscriber_id: Uuid,
+    connection_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = begin_scope(pool, ScopeCtx::Admin).await?;
+    let result =
+        sqlx::query("DELETE FROM subscription WHERE subscriber_id = $1 AND connection_id = $2")
+            .bind(subscriber_id)
+            .bind(connection_id)
+            .execute(&mut *tx)
+            .await?;
+    tx.commit().await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// The connections a subscriber is subscribed to — the sources comprising their digest — ordered for
+/// a stable listing.
+pub async fn list_subscriptions(
+    pool: &PgPool,
+    subscriber_id: Uuid,
+) -> Result<Vec<ConnectionRow>, sqlx::Error> {
+    let mut tx = begin_scope(pool, ScopeCtx::Admin).await?;
+    let rows = sqlx::query(&format!(
+        "SELECT {CONNECTION_COLUMNS}
+         FROM connection c
+         JOIN subscription s ON s.connection_id = c.id
+         WHERE s.subscriber_id = $1
+         ORDER BY c.next_poll_at"
+    ))
+    .bind(subscriber_id)
+    .try_map(row_to_connection)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(rows)
+}

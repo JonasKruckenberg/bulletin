@@ -23,6 +23,10 @@ pub struct EventBuilder {
     /// only this bool — it can name no subscriber and construct no `Scope` (design §12 risk #1).
     /// `finalize` combines it with the connection's owner to decide the actual `Scope`.
     is_private: bool,
+    /// The `connection` this event was ingested from — the source origin the per-source subscription
+    /// filter keys on. Set by infra (`ingest::poll`/`process_webhook`) from OUR connection row, never
+    /// a connector/payload; `None` only for events built off the ingest path (tests, fixtures).
+    connection_id: Option<Uuid>,
 }
 
 impl EventBuilder {
@@ -48,6 +52,7 @@ impl EventBuilder {
             severity_hint: None,
             raw: None,
             is_private: false,
+            connection_id: None,
         }
     }
 
@@ -61,6 +66,13 @@ impl EventBuilder {
     /// to `false` (public). The adapter sets only this bool; the subscriber binding is `finalize`'s.
     pub fn private(mut self, is_private: bool) -> Self {
         self.is_private = is_private;
+        self
+    }
+
+    /// Stamps the originating `connection` (the source-subscription key). Infra sets this from the
+    /// resolved connection row before `finalize`; off-path builders (tests) leave it `None`.
+    pub fn connection(mut self, connection_id: Option<Uuid>) -> Self {
+        self.connection_id = connection_id;
         self
     }
 
@@ -134,6 +146,7 @@ impl EventBuilder {
             entities,
             severity_hint: self.severity_hint,
             raw: self.raw,
+            connection_id: self.connection_id,
         }
     }
 }
@@ -152,6 +165,8 @@ pub struct NewEvent {
     pub entities: Vec<String>,
     pub severity_hint: Option<i16>,
     pub raw: Option<Vec<u8>>,
+    /// The originating `connection` (source-subscription key); `None` for off-path builders.
+    pub connection_id: Option<Uuid>,
 }
 
 /// Full event from the DB — `id` (UUIDv7) and `ingest_time` filled by the DB.
@@ -170,6 +185,8 @@ pub struct Event {
     pub severity_hint: Option<i16>,
     pub ingest_time: DateTime<Utc>,
     pub raw: Option<Vec<u8>>,
+    /// The originating `connection` (source-subscription key); `None` for pre-attribution rows.
+    pub connection_id: Option<Uuid>,
 }
 
 fn decode_err(msg: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> sqlx::Error {
@@ -202,6 +219,7 @@ pub fn from_row(row: PgRow) -> Result<Event, sqlx::Error> {
         severity_hint: row.get("severity_hint"),
         ingest_time: row.get("ingest_time"),
         raw: row.get("raw"),
+        connection_id: row.get("connection_id"),
     })
 }
 

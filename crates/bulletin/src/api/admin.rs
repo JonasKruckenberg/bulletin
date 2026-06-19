@@ -4,7 +4,7 @@
 //! own `ScopeCtx::Admin` transaction, so there's no scope ceremony here either.
 
 use bulletin_core::digest::select::ScoringConfig;
-use bulletin_core::{cluster, digest, ingest, status};
+use bulletin_core::{cluster, digest, ingest, status, subscription};
 use sqlx::PgPool;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
@@ -157,6 +157,45 @@ impl AdminService for AdminApi {
             .await
             .map_err(error::db("delete subscriber"))?;
         Ok(Response::new(proto::DeleteSubscriberResponse { deleted }))
+    }
+
+    async fn subscribe(
+        &self,
+        req: Request<proto::SubscribeRequest>,
+    ) -> Result<Response<proto::SubscribeResponse>, Status> {
+        let r = req.into_inner();
+        let subscriber = parse_uuid(&r.subscriber, "subscriber")?;
+        let connection = parse_uuid(&r.connection, "connection")?;
+        let created = subscription::subscribe(&self.pool, subscriber, connection)
+            .await
+            .map_err(error::db("subscribe"))?;
+        Ok(Response::new(proto::SubscribeResponse { created }))
+    }
+
+    async fn unsubscribe(
+        &self,
+        req: Request<proto::UnsubscribeRequest>,
+    ) -> Result<Response<proto::UnsubscribeResponse>, Status> {
+        let r = req.into_inner();
+        let subscriber = parse_uuid(&r.subscriber, "subscriber")?;
+        let connection = parse_uuid(&r.connection, "connection")?;
+        let removed = subscription::unsubscribe(&self.pool, subscriber, connection)
+            .await
+            .map_err(error::db("unsubscribe"))?;
+        Ok(Response::new(proto::UnsubscribeResponse { removed }))
+    }
+
+    async fn list_subscriptions(
+        &self,
+        req: Request<proto::ListSubscriptionsRequest>,
+    ) -> Result<Response<proto::ListSubscriptionsResponse>, Status> {
+        let subscriber = parse_uuid(&req.into_inner().subscriber, "subscriber")?;
+        let rows = subscription::list_subscriptions(&self.pool, subscriber)
+            .await
+            .map_err(error::db("list subscriptions"))?;
+        Ok(Response::new(proto::ListSubscriptionsResponse {
+            connections: rows.into_iter().map(convert::connection).collect(),
+        }))
     }
 
     async fn get_status(
