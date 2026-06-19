@@ -1,4 +1,4 @@
-//! The local-sidecar summarization client (gated). Drives a `llama-server` (llama.cpp) over its
+//! The local-sidecar summarization client. Drives a `llama-server` (llama.cpp) over its
 //! OpenAI-compatible `/chat/completions` with grammar-constrained JSON (`docs/local-ml-options.md`
 //! §4–§5). 100% local ⇒ the §12 no-egress invariant holds: no content leaves the box.
 //!
@@ -15,59 +15,56 @@ use serde::Deserialize;
 use super::metric;
 use crate::common::event::Event;
 use crate::summarize::{
-    apply_comprehension, baseline, clean_delta, clean_label, clean_lead, comprehend_user_prompt,
+    apply_comprehension, clean_delta, clean_label, clean_lead, comprehend_user_prompt,
     comprehension_schema, delta_schema, delta_user_prompt, extract_facts, faithful, label_schema,
     label_user_prompt, lead_schema, lead_user_prompt, response_schema, source_corpus,
     story_member_corpus, story_user_prompt, synthesize_facts, user_prompt, Band, ClusterSummary,
-    Comprehension, Facts, SummarizationConfig, TldrRun, COMPREHEND_SYSTEM_PROMPT,
-    DELTA_SYSTEM_PROMPT, LABEL_SYSTEM_PROMPT, LEAD_SYSTEM_PROMPT, STORY_SYSTEM_PROMPT,
-    SYSTEM_PROMPT,
+    Comprehension, Facts, LeadOutcome, SummarizationConfig, SummaryFailure, SummaryOutcome,
+    TldrRun, COMPREHEND_SYSTEM_PROMPT, DELTA_SYSTEM_PROMPT, LABEL_SYSTEM_PROMPT,
+    LEAD_SYSTEM_PROMPT, STORY_SYSTEM_PROMPT, SYSTEM_PROMPT,
 };
 
 /// Summarize one cluster: extract-then-summarize (§3.2) — hand the model the pre-extracted facts +
 /// budgeted source text and ask it to *rewrite* them, then run the §3.4 faithfulness gate.
 ///
-/// Returns:
-/// - `Some(summary)` on success **and** on a gate rejection (a deterministic, content-derived
-///   [`baseline`] banded `uncertain`) — both are stable results worth caching;
-/// - `None` when the model itself was unavailable (transport/HTTP error) — so the caller leaves the
-///   cluster unsummarized and a later sweep retries once the sidecar recovers, rather than freezing it
-///   at a baseline. Never panics — the digest's punctuality does not depend on the model.
+/// Returns (§3.7, no baseline fallback):
+/// - [`SummaryOutcome::Faithful`] when the model answered and the gate passed it — the only result that
+///   ships in a digest;
+/// - [`SummaryOutcome::Failed`] otherwise: [`SummaryFailure::Unavailable`] when the sidecar was
+///   unreachable/erroring (a later sweep retries once it recovers), or [`SummaryFailure::Rejected`] when
+///   the gate caught an ungrounded claim (a later sweep retries with an escalated seed). Either way the
+///   cluster is left un-summarized and withheld from digests, never degraded to a baseline. Never panics.
 ///
-/// `http` is the sweep's shared client (one connection pool for the whole pass).
+/// `cfg` carries this attempt's seed/temperature (the caller passes a [`SummarizationConfig::for_attempt`]
+/// clone); `http` is the sweep's shared client (one connection pool for the whole pass).
 pub async fn summarize_cluster(
     cfg: &SummarizationConfig,
     http: &reqwest::Client,
-    title: &str,
     events: &[Event],
-) -> Option<ClusterSummary> {
+) -> SummaryOutcome {
     let (summary, facts, source) = match generate_candidate(cfg, http, events).await {
         Ok(generated) => generated,
         Err(e) => {
+            let kind = failure_kind(&e);
             tracing::warn!(
                 error = %format!("{e:#}"),
-                kind = failure_kind(&e),
+                kind,
                 base_url = %cfg.base_url,
                 model = %cfg.model,
                 "summarization model call failed; leaving cluster unsummarized for retry"
             );
-            return None;
+            return SummaryOutcome::Failed(SummaryFailure::Unavailable(kind));
         }
     };
 
     if cfg.faithfulness_gate {
         if let Err(v) = faithful(&summary, &facts, &source) {
-            tracing::debug!(violation = ?v, "faithfulness gate rejected summary; using baseline");
+            tracing::debug!(violation = ?v, "faithfulness gate rejected summary; will retry with an escalated seed");
             metric::gate_rejection("summarize", &v);
-            return Some(baseline(
-                title,
-                events.len() as i32,
-                &source_labels(events),
-                facts,
-            ));
+            return SummaryOutcome::Failed(SummaryFailure::Rejected(v));
         }
     }
-    Some(summary)
+    SummaryOutcome::Faithful(summary)
 }
 
 /// The shared generation half of the cluster summarizer (§3.2), factored out so the production path
@@ -150,26 +147,24 @@ pub async fn eval_cluster(
 /// over the fused facts. `members` are the story's member-cluster summaries, **newest-first** (so
 /// `members[0]` is the representative and the freshest lifecycle wins in [`synthesize_facts`]).
 ///
-/// Returns, mirroring [`summarize_cluster`]:
-/// - `Some(synthesis)` on success, or — on a gate rejection — the **representative member's own
-///   summary** (already grounded and gate-passed when it was generated), banded down to its band;
-///   both are stable, content-derived results worth caching.
-/// - `None` when the model itself was unavailable, so the caller leaves the story un-synthesized and a
-///   later pass retries once the sidecar recovers (rather than caching a degraded synthesis).
+/// Treated exactly like a cluster (§3.7) — and for the same reason: a multi-source story collapsed to one
+/// member's single-source blurb reads as low quality, so a synthesis that can't be made faithful is a
+/// tracked error the story tier *withholds and retries*, never a silent downgrade. One attempt per call
+/// (the sweep escalates the seed across passes via the story's DB attempt counter, mirroring the cluster
+/// sweep): returns [`SummaryOutcome::Faithful`] on a gate-passed cross-source rewrite, or
+/// [`SummaryOutcome::Failed`] (`Unavailable` / `Rejected`) otherwise — there is no representative
+/// fallback. (A single-member story is never synthesized; the sweep renders its one faithful cluster
+/// summary directly, so it never reaches here.)
+///
+/// `members` are the story's member-cluster summaries, **newest-first** (so `members[0]` is the
+/// representative and the freshest lifecycle wins in [`synthesize_facts`]). `cfg` carries this attempt's
+/// seed/temperature (a [`SummarizationConfig::for_attempt`] clone).
 pub async fn synthesize_story(
     cfg: &SummarizationConfig,
     http: &reqwest::Client,
     members: &[ClusterSummary],
     thread_label: Option<&str>,
-) -> Option<ClusterSummary> {
-    // Nothing to fuse — let the caller fall back to the representative cluster (cold-start, §2.2).
-    let representative = members.first()?;
-    // A lone member is not a cross-source synthesis: the representative summary already *is* the
-    // answer, so reuse it verbatim rather than spending a model call to paraphrase one input.
-    if members.len() == 1 {
-        return Some(representative.clone());
-    }
-
+) -> SummaryOutcome {
     let facts = synthesize_facts(members);
     let corpus = story_member_corpus(members);
 
@@ -186,8 +181,9 @@ pub async fn synthesize_story(
     {
         Ok(c) => c,
         Err(e) => {
-            tracing::warn!(error = %e, "story synthesis call failed; leaving story un-synthesized for retry");
-            return None;
+            let kind = failure_kind(&e);
+            tracing::warn!(error = %e, kind, "story synthesis call failed; leaving story un-synthesized for retry");
+            return SummaryOutcome::Failed(SummaryFailure::Unavailable(kind));
         }
     };
 
@@ -202,12 +198,12 @@ pub async fn synthesize_story(
 
     if cfg.faithfulness_gate {
         if let Err(v) = faithful(&summary, &facts, &corpus) {
-            tracing::debug!(violation = ?v, "story synthesis gate rejected; falling back to representative cluster summary");
+            tracing::debug!(violation = ?v, "story synthesis gate rejected; will retry with an escalated seed");
             metric::gate_rejection("synthesize", &v);
-            return Some(representative.clone());
+            return SummaryOutcome::Failed(SummaryFailure::Rejected(v));
         }
     }
-    Some(summary)
+    SummaryOutcome::Faithful(summary)
 }
 
 /// Generate a readable thread **label** (Phase B, §2.3): upgrade the deterministic auto-label to a
@@ -272,19 +268,20 @@ pub async fn delta_thread(
 /// Compose the **authored big-picture lead** (Phase D, §2.4/§3.1): an "editor's note" over the
 /// selected items' `headlines` and the `threads` they advance, rephrasing them into one or two
 /// sentences. This is the *one* summarization call that runs on the punctual path — so the caller wraps
-/// it in [`SummarizationConfig::lead_deadline`](crate::summarize::SummarizationConfig::lead_deadline)
-/// and uses the deterministic Phase-A lead the moment it misses.
+/// it with [`SummarizationConfig::lead_deadline`](crate::summarize::SummarizationConfig::lead_deadline)
+/// and retries it (with an escalated seed) rather than ship a digest without it (§3.7).
 ///
-/// Best-effort, mirroring the Phase-B label/delta calls — `None` on any transport failure *or* a gate
-/// rejection ([`clean_lead`]: voice + length + URL + numeric grounding against the headlines/threads),
-/// so the caller keeps the deterministic lead. The headlines fed here are themselves already-gated
+/// Returns a [`LeadOutcome`]: `Ready` with the composed sentence; `Rejected` when the model answered but
+/// [`clean_lead`] (voice + length + URL + numeric grounding against the headlines/threads) caught it — a
+/// deterministic miss the caller re-seeds past; or `Unavailable` on any transport failure — the caller
+/// defers the digest so the job retries later. The headlines fed here are themselves already-gated
 /// summaries (§4), so the lead never touches raw events.
 pub async fn authored_lead(
     cfg: &SummarizationConfig,
     http: &reqwest::Client,
     headlines: &[String],
     threads: &[String],
-) -> Option<String> {
+) -> LeadOutcome {
     // The grounding the lead's numbers are checked against: the same headlines + thread labels it is
     // composed from. A big-picture lead naturally cites a count ("…and 6 other updates"), so the digest's
     // own item counts — the total and the "N others" (total − 1) — are grounded too; without them the
@@ -306,21 +303,29 @@ pub async fn authored_lead(
     )
     .await;
     match out {
-        Ok(o) => clean_lead(&o.lead, &grounding),
+        // `clean_lead` returns `None` when the model's sentence failed the voice/length/grounding lint —
+        // a deterministic rejection the caller retries with a fresh seed.
+        Ok(o) => match clean_lead(&o.lead, &grounding) {
+            Some(lead) => LeadOutcome::Ready(lead),
+            None => {
+                tracing::debug!("digest lead rejected by the voice/grounding gate; retrying with an escalated seed");
+                LeadOutcome::Rejected
+            }
+        },
         Err(e) => {
-            tracing::debug!(error = %e, "digest lead call failed; keeping deterministic lead");
-            None
+            tracing::debug!(error = %e, kind = failure_kind(&e), "digest lead call failed; deferring digest");
+            LeadOutcome::Unavailable
         }
     }
 }
 
-/// Startup reachability gate for the local summarization sidecar (the fail-loud counterpart to the
-/// per-call best-effort degradation). A `llm-summarization` build exists *to* summarize against the
-/// sidecar; if it can't be reached when the worker boots, that is a deployment/config error — a wrong
+/// Startup reachability gate for the local summarization sidecar. Summarization is a hard dependency of
+/// the pipeline now (§3.7), so an unreachable sidecar at boot is a deployment/config error — a wrong
 /// `BULLETIN_LLM_BASE_URL`, a sidecar that never came up, or a model that failed to load — and we want
-/// it surfaced **loudly** (a failed unit → deploy rollback) rather than silently shipping deterministic
-/// baselines forever. This is intentionally distinct from the *running* contract: once past this gate,
-/// a transient sidecar blip mid-sweep still degrades best-effort and retries (a digest is never blocked).
+/// it surfaced **loudly** (a failed unit → deploy rollback) rather than a worker that quietly quarantines
+/// the entire corpus and defers every digest. This is distinct from the *running* contract: once past
+/// this gate, a transient sidecar blip mid-sweep is a tracked per-cluster failure that retries (and a
+/// digest waits on its lead) — the boot gate just refuses to start against a sidecar that was never there.
 ///
 /// Probes the OpenAI-compatible `{base_url}/models` endpoint, retrying with capped exponential backoff
 /// until `deadline` elapses, so a sidecar still mapping its GGUF at boot (llama-cpp is ordered before us
@@ -419,12 +424,6 @@ async fn call_comprehension(
         comprehension_schema(),
     )
     .await
-}
-
-/// The source-kind labels a cluster's events came from, in event order (the baseline tldr sorts +
-/// dedups them, so no need to here).
-fn source_labels(events: &[Event]) -> Vec<&'static str> {
-    events.iter().map(|e| e.source.as_str()).collect()
 }
 
 /// The slice of the model's response we parse — the abstractive fields. The rest is reconstructed

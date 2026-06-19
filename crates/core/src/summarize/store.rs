@@ -1,6 +1,6 @@
-//! The summarization store contract (Phase A): the work-queue read and the summary write on the
-//! `cluster` cache. Durable state is the events; `cluster.summary` is a rebuildable cache this
-//! advances — exactly like the rollup columns beside it. Gated with the rest of the model edge.
+//! The summarization store contract (Phase A): the work-queue read, the summary write, and the
+//! failure/quarantine bookkeeping (§3.7) on the `cluster` cache. Durable state is the events;
+//! `cluster.summary` is a rebuildable cache this advances — exactly like the rollup columns beside it.
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -12,22 +12,35 @@ use crate::common::scope::Scope;
 use crate::summarize::{ClusterSummary, ThreadSummary};
 
 /// A cluster the sweep should consider (re)summarizing: its scope-aware identity (so the events can be
-/// re-read) plus the stored `summary_hash` for the exact staleness re-check.
+/// re-read), the stored `summary_hash` for the exact staleness re-check, and the §3.7 retry state —
+/// how many consecutive attempts have failed, and whether this row is here *despite* a prior quarantine
+/// because its content has since moved (so the sweep starts it on a fresh retry budget).
 pub(crate) struct DueCluster {
     pub id: Uuid,
     pub source: SourceKind,
     pub group_key: String,
-    pub title: String,
     pub summary_hash: Option<Vec<u8>>,
+    /// Consecutive failed attempts since the last success — the retry index the sweep escalates the seed
+    /// against (§3.7). Carried as the column's `int` (i32).
+    pub summary_attempts: i32,
+    /// True when this cluster was quarantined but its content changed afterwards (`updated_at >
+    /// summary_quarantined_at`): the prior failures are stale, so the sweep treats it as attempt 0.
+    pub retry_reset: bool,
 }
 
 /// Clusters whose content changed since (or were never) summarized, in the given `scope` — the
 /// summarizer work queue (§2.1). The cheap SQL gate is `summarized_at IS NULL` (the partial index)
 /// **or** `updated_at > summarized_at` (the build bumps `updated_at` on every recompute) **or** a
 /// model/prompt upgrade (`summary_model <> $current`). The exact `summary_hash` re-check in the sweep
-/// then drops the rare case where `updated_at` moved but the content didn't. Newest-first, bounded by
-/// `limit` so one pass drains a slice of a large backlog. Reads `cluster` (RLS-protected) → the caller
-/// runs it in the matching scope context.
+/// then drops the rare case where `updated_at` moved but the content didn't.
+///
+/// **Quarantined clusters (§3.7) are withheld** — a cluster whose retry budget was spent is not
+/// re-picked (it would just re-fail and re-burn the sidecar) *unless* its content has since changed
+/// (`updated_at > summary_quarantined_at`), which earns it a fresh budget. That post-quarantine content
+/// move is surfaced as `retry_reset` so the sweep zeroes the stale attempt count.
+///
+/// Newest-first, bounded by `limit` so one pass drains a slice of a large backlog. Reads `cluster`
+/// (RLS-protected) → the caller runs it in the matching scope context.
 pub(crate) async fn clusters_needing_summary(
     conn: &mut PgConnection,
     scope: &Scope,
@@ -36,12 +49,15 @@ pub(crate) async fn clusters_needing_summary(
 ) -> Result<Vec<DueCluster>, sqlx::Error> {
     let (scope_kind, scope_subscriber_id) = scope.to_columns();
     sqlx::query(
-        "SELECT id, source, group_key, title, summary_hash
+        "SELECT id, source, group_key, summary_hash, summary_attempts,
+                (summary_quarantined_at IS NOT NULL AND updated_at > summary_quarantined_at) AS retry_reset
          FROM cluster
          WHERE scope_kind = $1 AND scope_subscriber_id IS NOT DISTINCT FROM $2
            AND ( summarized_at IS NULL
                  OR updated_at > summarized_at
                  OR summary_model IS DISTINCT FROM $3 )
+           AND ( summary_quarantined_at IS NULL
+                 OR updated_at > summary_quarantined_at )
          ORDER BY last_event_time DESC
          LIMIT $4",
     )
@@ -54,17 +70,20 @@ pub(crate) async fn clusters_needing_summary(
             id: row.get("id"),
             source: row.try_get("source")?,
             group_key: row.get("group_key"),
-            title: row.get("title"),
             summary_hash: row.get("summary_hash"),
+            summary_attempts: row.get("summary_attempts"),
+            retry_reset: row.get("retry_reset"),
         })
     })
     .fetch_all(conn)
     .await
 }
 
-/// Write a freshly generated (or baseline) summary onto the cluster, stamping the content signature,
-/// model/prompt provenance, and timestamp. Idempotent — re-running with the same content overwrites
-/// in place. Runs in the cluster's scope context (public sweep: no-subscriber; private: the owner).
+/// Write a freshly generated, gate-passed summary onto the cluster, stamping the content signature,
+/// model/prompt provenance, and timestamp — and **clearing the §3.7 health record** (attempts, last
+/// error, quarantine), since a faithful summary is the success that resets the retry budget. Idempotent
+/// — re-running with the same content overwrites in place. Runs in the cluster's scope context (public
+/// sweep: no-subscriber; private: the owner).
 pub(crate) async fn store_summary(
     conn: &mut PgConnection,
     cluster_id: Uuid,
@@ -76,7 +95,9 @@ pub(crate) async fn store_summary(
         serde_json::to_value(summary).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
     sqlx::query(
         "UPDATE cluster
-         SET summary = $2, summary_hash = $3, summary_model = $4, summarized_at = now()
+         SET summary = $2, summary_hash = $3, summary_model = $4, summarized_at = now(),
+             summary_attempts = 0, summary_last_error = NULL,
+             summary_failed_at = NULL, summary_quarantined_at = NULL
          WHERE id = $1",
     )
     .bind(cluster_id)
@@ -88,18 +109,80 @@ pub(crate) async fn store_summary(
     Ok(())
 }
 
+/// Record a failed summarization attempt for a cluster (§3.7): set the consecutive-attempt counter to
+/// `attempts` (the sweep's computed new total — absolute, not an increment, so a cluster that earned a
+/// fresh budget on a post-quarantine content change counts from 1 rather than from a stale high-water
+/// mark), store the coarse `error` for operator review, and stamp `summary_failed_at`. Crucially it does
+/// **not** advance `summarized_at` — the cluster stays in the work queue so the next sweep retries it
+/// (with an escalated seed).
+///
+/// `summary_quarantined_at` is set to `now()` when `quarantine` is true (the retry budget is spent —
+/// withhold the cluster from the sweep and from digests until a content change or an operator clears it)
+/// and to NULL otherwise. NULL-ing on a non-quarantine failure is what lets a cluster retrying after a
+/// post-quarantine content move shed its old quarantine flag, so subsequent sweeps count it normally
+/// instead of perpetually resetting to attempt 0. Runs in the cluster's scope context.
+pub(crate) async fn record_summary_failure(
+    conn: &mut PgConnection,
+    cluster_id: Uuid,
+    attempts: i32,
+    error: &str,
+    quarantine: bool,
+) -> Result<(), sqlx::Error> {
+    record_failure(conn, "cluster", cluster_id, attempts, error, quarantine).await
+}
+
+/// The shared §3.7 failure-record UPDATE for the cluster and story tiers — identical but for the table.
+/// `table` is a hardcoded caller-supplied identifier (never user input), so interpolating it is safe;
+/// the row id and the rest bind normally. Sets the consecutive-attempt counter to `attempts` (absolute),
+/// stores the coarse `error`, stamps `summary_failed_at`, and does **not** touch `summarized_at` so the
+/// unit stays in its work queue. `summary_quarantined_at` is `now()` on quarantine, NULL otherwise (so a
+/// unit retrying past a quarantine sheds the stale flag).
+async fn record_failure(
+    conn: &mut PgConnection,
+    table: &str,
+    id: Uuid,
+    attempts: i32,
+    error: &str,
+    quarantine: bool,
+) -> Result<(), sqlx::Error> {
+    let sql = format!(
+        "UPDATE {table}
+         SET summary_attempts = $2,
+             summary_last_error = $3,
+             summary_failed_at = now(),
+             summary_quarantined_at = CASE WHEN $4 THEN now() ELSE NULL END
+         WHERE id = $1"
+    );
+    sqlx::query(&sql)
+        .bind(id)
+        .bind(attempts)
+        .bind(error)
+        .bind(quarantine)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
 /// Advance only the `summarized_at` watermark for a cluster whose content was unchanged (the cache
 /// hit) — so the cheap `updated_at > summarized_at` gate stops re-flagging it every sweep, without a
-/// pointless model call. Leaves the existing summary/hash/model untouched.
+/// pointless model call. Leaves the existing summary/hash/model untouched, but **clears the §3.7 health
+/// record**: a cache hit means a valid faithful summary is present at this content, so any stale
+/// failure/quarantine state (e.g. from a since-reverted content change that was briefly un-summarizable)
+/// must not linger and keep the cluster in the operator-review queue.
 pub(crate) async fn touch_summarized(
     conn: &mut PgConnection,
     cluster_id: Uuid,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE cluster SET summarized_at = $2 WHERE id = $1")
-        .bind(cluster_id)
-        .bind(Utc::now())
-        .execute(conn)
-        .await?;
+    sqlx::query(
+        "UPDATE cluster
+         SET summarized_at = $2, summary_attempts = 0, summary_last_error = NULL,
+             summary_failed_at = NULL, summary_quarantined_at = NULL
+         WHERE id = $1",
+    )
+    .bind(cluster_id)
+    .bind(Utc::now())
+    .execute(conn)
+    .await?;
     Ok(())
 }
 
@@ -149,20 +232,27 @@ pub(crate) async fn clusters_for_eval(
 // ── Phase C — story cross-source synthesis (§2.2) ────────────────────────────────────────────────
 
 /// A story the synthesis pass should consider (re)synthesizing: its id plus the member cluster ids
-/// (so their summaries can be re-read) and the stored `summary_sig` for the exact staleness re-check.
+/// (so their summaries can be re-read), the stored `summary_sig` for the exact staleness re-check, and
+/// the §3.7 retry state (mirroring [`DueCluster`]).
 pub(crate) struct DueStory {
     pub id: Uuid,
     pub cluster_ids: Vec<Uuid>,
     pub summary_sig: Option<Vec<u8>>,
     pub summary_model: Option<String>,
+    /// Consecutive failed synthesis attempts since the last success — the seed-escalation retry index.
+    pub summary_attempts: i32,
+    /// True when this story was quarantined but its content/membership changed afterwards (a fresh
+    /// budget); the sweep then treats it as attempt 0.
+    pub retry_reset: bool,
 }
 
 /// The subscriber's live stories whose membership/content changed since (or were never) synthesized —
 /// the Phase-C work queue (§2.2). The cheap SQL gate mirrors the cluster sweep: `summarized_at IS
 /// NULL` **or** `updated_at > summarized_at` (the per-fire recompute bumps `updated_at`) **or** a
 /// model/prompt upgrade; the exact `summary_sig` re-check in the sweep then drops the rare false
-/// positive. Newest-first, bounded by `limit`. Runs in the subscriber's RLS context (story/cluster
-/// fenced to owner ∪ public).
+/// positive. **Quarantined stories (§3.7) are withheld** unless their content moved past the quarantine
+/// (a fresh budget, surfaced as `retry_reset`). Newest-first, bounded by `limit`. Runs in the
+/// subscriber's RLS context (story/cluster fenced to owner ∪ public).
 pub(crate) async fn stories_needing_summary(
     conn: &mut PgConnection,
     subscriber_id: Uuid,
@@ -172,14 +262,18 @@ pub(crate) async fn stories_needing_summary(
     sqlx::query(
         "SELECT s.id,
                 array_agg((m.value ->> 'cluster_id')::uuid) AS cluster_ids,
-                s.summary_sig, s.summary_model
+                s.summary_sig, s.summary_model, s.summary_attempts,
+                (s.summary_quarantined_at IS NOT NULL AND s.updated_at > s.summary_quarantined_at) AS retry_reset
          FROM story s
          CROSS JOIN LATERAL jsonb_array_elements(s.clusters) AS m
          WHERE s.subscriber_id = $1 AND s.merged_into IS NULL
            AND ( s.summarized_at IS NULL
                  OR s.updated_at > s.summarized_at
                  OR s.summary_model IS DISTINCT FROM $2 )
-         GROUP BY s.id, s.last_event_time, s.summary_sig, s.summary_model
+           AND ( s.summary_quarantined_at IS NULL
+                 OR s.updated_at > s.summary_quarantined_at )
+         GROUP BY s.id, s.last_event_time, s.summary_sig, s.summary_model, s.summary_attempts,
+                  s.summary_quarantined_at, s.updated_at
          ORDER BY s.last_event_time DESC
          LIMIT $3",
     )
@@ -192,6 +286,8 @@ pub(crate) async fn stories_needing_summary(
             cluster_ids: row.get("cluster_ids"),
             summary_sig: row.get("summary_sig"),
             summary_model: row.get("summary_model"),
+            summary_attempts: row.get("summary_attempts"),
+            retry_reset: row.get("retry_reset"),
         })
     })
     .fetch_all(conn)
@@ -232,8 +328,9 @@ pub(crate) async fn load_member_summaries(
     .await
 }
 
-/// Write a freshly synthesized story summary, stamping the member signature + provenance + timestamp.
-/// Idempotent — re-running with the same membership overwrites in place.
+/// Write a freshly synthesized, gate-passed story summary, stamping the member signature + provenance +
+/// timestamp and **clearing the §3.7 health record** (attempts/last-error/quarantine), like
+/// [`store_summary`]. Idempotent — re-running with the same membership overwrites in place.
 pub(crate) async fn store_story_summary(
     conn: &mut PgConnection,
     story_id: Uuid,
@@ -245,7 +342,9 @@ pub(crate) async fn store_story_summary(
         serde_json::to_value(summary).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
     sqlx::query(
         "UPDATE story
-         SET summary = $2, summary_sig = $3, summary_model = $4, summarized_at = now()
+         SET summary = $2, summary_sig = $3, summary_model = $4, summarized_at = now(),
+             summary_attempts = 0, summary_last_error = NULL,
+             summary_failed_at = NULL, summary_quarantined_at = NULL
          WHERE id = $1",
     )
     .bind(story_id)
@@ -257,6 +356,22 @@ pub(crate) async fn store_story_summary(
     Ok(())
 }
 
+/// Record a failed story-synthesis attempt (§3.7), the story mirror of [`record_summary_failure`]: set
+/// the consecutive-attempt counter to `attempts` (absolute), store the coarse `error`, stamp
+/// `summary_failed_at`, and — crucially — do **not** advance `summarized_at`, so the next sweep retries
+/// it with an escalated seed. `summary_quarantined_at` is set when `quarantine` is true (the synthesis
+/// budget is spent — the multi-source story is withheld from digests until its content changes or an
+/// operator clears it) and NULL'd otherwise (so a story retrying past a quarantine sheds the stale flag).
+pub(crate) async fn record_story_summary_failure(
+    conn: &mut PgConnection,
+    story_id: Uuid,
+    attempts: i32,
+    error: &str,
+    quarantine: bool,
+) -> Result<(), sqlx::Error> {
+    record_failure(conn, "story", story_id, attempts, error, quarantine).await
+}
+
 /// Advance only the `summarized_at` watermark for a story whose member signature was unchanged (the
 /// cache hit) or that needs no synthesis (a singleton / all-unsummarized story) — so the cheap
 /// `updated_at > summarized_at` gate stops re-flagging it, without a pointless model call.
@@ -266,12 +381,19 @@ pub(crate) async fn touch_story_summarized(
     model: &str,
 ) -> Result<(), sqlx::Error> {
     // Stamp the model too, so a story we deliberately skip under the *current* model isn't re-flagged
-    // by the `summary_model IS DISTINCT FROM` clause every pass.
-    sqlx::query("UPDATE story SET summarized_at = now(), summary_model = $2 WHERE id = $1")
-        .bind(story_id)
-        .bind(model)
-        .execute(conn)
-        .await?;
+    // by the `summary_model IS DISTINCT FROM` clause every pass. Clear the §3.7 health record for the
+    // same reason `touch_summarized` does: a touch means a valid synthesis (cache hit) or nothing to
+    // synthesize (single member), so no stale failure/quarantine state should linger.
+    sqlx::query(
+        "UPDATE story
+         SET summarized_at = now(), summary_model = $2, summary_attempts = 0,
+             summary_last_error = NULL, summary_failed_at = NULL, summary_quarantined_at = NULL
+         WHERE id = $1",
+    )
+    .bind(story_id)
+    .bind(model)
+    .execute(conn)
+    .await?;
     Ok(())
 }
 

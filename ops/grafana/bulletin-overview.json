@@ -1571,7 +1571,7 @@
       "id": 31,
       "type": "stat",
       "title": "LLM call error ratio (5m)",
-      "description": "Non-ok outcomes over all sidecar calls (bulletin_llm_call_duration_seconds_count, the histogram's per-outcome count). Best-effort path — a failed call degrades that cluster to baseline, so a low steady rate is tolerable; a spike means the local sidecar is down (connect), slow (timeout), or erroring. Empty unless built with --features llm-summarization.",
+      "description": "Non-ok outcomes over all sidecar calls (bulletin_llm_call_duration_seconds_count, the histogram's per-outcome count). Summarization is mandatory (§3.7) — a failed call is a tracked error that retries and, if persistent, quarantines the cluster/story and (for the lead) defers the digest, so a low steady rate is tolerable but a spike means the local sidecar is down (connect), slow (timeout), or erroring and digests are being held back.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"

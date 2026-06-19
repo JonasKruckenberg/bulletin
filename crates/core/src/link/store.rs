@@ -31,14 +31,12 @@ use crate::link::{Assignment, LinkCluster, PriorMember};
 /// *affinity* — lands with relevance in M4; until then the in-floor arm carries the public set.)
 /// Ordered by id for a deterministic linking input.
 ///
-/// When `require_summary` is set (the `llm-summarization` build — the caller passes the compile-time
-/// feature), a cluster is a candidate **only once it carries a gate-passed model summary** (`summary`'s
-/// `band` is `confirmed`/`probable`). A cluster that was never summarized, or whose model output the
-/// faithfulness gate rejected to the deterministic `uncertain` baseline, is *withheld* and slips to a
-/// later digest once the off-path sweep summarizes it — so the LLM build never ships an item without a
-/// real grounded summary. With the feature off this is `false` and the deterministic digest is unchanged
-/// (gating on a summary that is never produced would empty every digest). Strict, with no age valve: a
-/// prolonged sidecar outage withholds those clusters until it recovers rather than degrading to baseline.
+/// When `require_summary` is set (always, in the strict §3.7 policy — the caller passes `true`), a
+/// cluster is a candidate **only once it carries a gate-passed model summary** (`summary`'s `band` is
+/// `confirmed`/`probable`). A cluster that was never summarized, or whose model output the faithfulness
+/// gate rejected, is *withheld* and slips to a later digest once the off-path sweep summarizes it — so a
+/// digest never ships an item without a real grounded summary. Strict, with no age valve: a prolonged
+/// sidecar outage withholds those clusters until it recovers rather than degrading to a baseline.
 pub async fn candidate_clusters(
     executor: impl PgExecutor<'_>,
     subscriber_id: Uuid,
@@ -135,6 +133,26 @@ pub async fn load_prior_members(
             delivered: row.get("delivered"),
         })
     })
+    .fetch_all(executor)
+    .await
+}
+
+/// The subset of `story_ids` that carry a **gate-passed cross-source synthesis** (`story.summary`'s
+/// `band` is `confirmed`/`probable`) — the §3.7 story gate the digest uses to decide which multi-member
+/// stories may ship. A multi-source story whose Phase-C synthesis isn't (yet) faithful is withheld so the
+/// digest never collapses it to one member's single-source blurb; it slips to a later window once the
+/// off-path synthesis sweep lands (or stays out while quarantined). Single-member stories are *not*
+/// gated by this (they have nothing to fuse and render their one faithful cluster summary), so the caller
+/// only consults this set for multi-member stories. Reads `story` (RLS-fenced to the owner).
+pub async fn faithful_story_ids(
+    executor: impl PgExecutor<'_>,
+    story_ids: &[Uuid],
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT id FROM story
+         WHERE id = ANY($1) AND summary ->> 'band' IN ('confirmed', 'probable')",
+    )
+    .bind(story_ids)
     .fetch_all(executor)
     .await
 }

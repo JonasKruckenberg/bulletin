@@ -183,13 +183,17 @@ is reproducible in the debug trace. **Composed at fire time, deterministically, 
 items' precomputed summaries/deltas (§3.1) — no model call on the punctual path.** Null ⇒ the lead
 falls back to the greeting alone (exactly today's lead).
 
-### 2.5 Config + kill switch (mirror `MaintenanceConfig` / `digest_config`)
+### 2.5 Config (mirror `MaintenanceConfig` / `digest_config`)
 
 A `SummarizationConfig` (model name, sidecar `base_url`, per-task `max_tokens`/temperature, the
 entity-badge budget, the faithfulness-gate toggle) held like `thread::maintain::MaintenanceConfig` — a struct
-now, a `summarization_config` row when per-deployment tuning bites. Guard the whole feature behind a
-**`llm-summarization` cargo feature** (compile-time kill switch, mirroring `thread-weighting`) **and** a
-runtime flag, so it compiles out entirely and the deterministic baseline ships by default.
+now, a `summarization_config` row when per-deployment tuning bites.
+
+> **Superseded by §3.7.** This section originally proposed a `llm-summarization` cargo feature as a
+> compile-time kill switch, with the deterministic baseline shipping by default. Summarization is now a
+> **mandatory** part of the pipeline: the feature and the baseline are gone, there is no kill switch
+> (compile-time or runtime), and the sidecar is a hard runtime dependency the worker gates on at boot.
+> `SummarizationConfig` is pure tuning config; see §3.7 for the failure/retry/quarantine contract.
 
 ---
 
@@ -362,6 +366,49 @@ Per-task **user** prompts stay equally short and concrete (all over the §4 pre-
 The **extraction** pass that produces `facts` (incl. the `certainty` flag) is a separate, *non-editorial*
 prompt run scratchpad-then-constrained (§3.2) — it does the epistemic judging once, so every summary
 call downstream is a mechanical rephrase.
+
+### 3.7 Summarization is the deliverable — errors are tracked, retried, and quarantined
+
+The original framing (§8, the early §3.4) made every model call *best-effort*: a sidecar outage or a
+gate rejection silently **degraded to a deterministic baseline**, and the digest shipped on schedule
+regardless. In practice that produced steady **partial digests** — items showing a raw cluster title
+instead of a grounded summary, and a templated "Leading this digest: …" line instead of an authored
+lead. The contract is now inverted:
+
+> **A digest never ships without LLM summaries.** A unit appears in a digest only with a faithful,
+> gate-passed summary; the digest never ships an authored lead it didn't compose. There is no
+> deterministic baseline to fall back to — it has been removed, along with the `llm-summarization`
+> cargo feature (summarization is mandatory; the sidecar is a hard runtime dependency the worker gates
+> on at boot).
+
+A summarization that fails — a down/slow sidecar (`unavailable`) **or** a faithfulness-gate rejection
+(`rejected`) — is therefore a real, **tracked error**, not a value to swallow:
+
+- **Bounded escalating retries.** Each unit (cluster, story) carries a `summary_attempts` counter. A
+  failed attempt records the coarse error (`summary_last_error`/`summary_failed_at`) and leaves the unit
+  un-summarized so the next sweep retries it — each retry at an **escalated seed/temperature**
+  (`SummarizationConfig::for_attempt`), because a gate rejection is deterministic under a fixed seed and
+  a bare retry would only reproduce it. A success resets the counter.
+- **Quarantine.** After `MAX_SUMMARY_ATTEMPTS` consecutive failures the unit is **quarantined**
+  (`summary_quarantined_at`): withheld from the sweep (it stops burning the sidecar) and surfaced for
+  operator review (`bulletin_llm_quarantined_total`, a `cluster_quarantined`/`story_quarantined` index).
+  A content change earns it a fresh budget.
+- **A stuck unit never blocks a digest — it slips.** Because the digest's candidate gate requires a
+  faithful summary, an un-summarized or quarantined cluster simply isn't a candidate this window; it
+  rides a later one once it lands. Clusters and **stories** are treated identically: a multi-source
+  story whose cross-source synthesis can't be made faithful is *withheld* (it slips, then quarantines),
+  never collapsed to one member's single-source blurb — that reads as low quality. A *single-member*
+  story has nothing to fuse and renders its one faithful cluster summary directly.
+- **The lead is the one hard gate.** The Phase-D authored lead is the only on-path call and the only
+  summary a populated digest can't skip. It retries with escalating seeds in-process (past deterministic
+  gate rejections) and, on a down sidecar, **defers the whole digest** — no send, watermark unmoved — so
+  apalis retries the same window later. Once the quiet retry budget is spent the deferral is flagged
+  `exhausted` and alerted (`bulletin_digest_lead_unavailable_total`): the subscriber waits for a good
+  lead rather than receiving a partial digest.
+
+Enrichments that *don't* gate delivery stay best-effort: the Phase-B thread **label/delta** is cosmetic
+context, and the **comprehension** pre-pass only tunes phrasing — both keep their deterministic
+auto-label / neutral-facts fallback and are not retried or quarantined.
 
 ---
 
@@ -561,6 +608,12 @@ layer uses.
 
 ## 8. Invariants preserved
 
+> **Amended by §3.7.** Two of these invariants below describe the original *best-effort* contract and no
+> longer hold verbatim: **Punctuality** is now traded for completeness on the lead (a populated digest
+> waits for its authored lead rather than shipping a deterministic one — "fall behind, never partial"),
+> and **Graceful degradation** to a deterministic baseline is gone (a failed summary is tracked, retried,
+> and quarantined; the unit slips to a later window). The rest stand. See §3.7 for the current contract.
+
 - **Punctuality (§3.1).** No model call on the fire path; the lead is deterministic; every summary is a
   precomputed read or a graceful omit. A slow box ⇒ staler summaries, never a late digest.
 - **No-egress / scope (§12 #1/#5/#6).** 100% local; public summaries shared from the no-subscriber
@@ -572,8 +625,10 @@ layer uses.
 - **Trust / explainability (§10.2/§10.4).** The faithfulness gate degrades to a true deterministic line
   on any unsupported entity/number; uncertainty renders as a band, not hidden; `digest.lead` joins
   `digest.decisions` in the debug trace.
-- **Graceful degradation.** Disable the cargo feature and the digest is exactly today's: greeting lead,
-  no eyebrow/summary, no delta, raw titles — the deterministic baseline, intact.
+- **Graceful degradation.** *(Removed by §3.7 — there is no longer a deterministic baseline or a cargo
+  feature to disable. A unit without a faithful summary is withheld from the digest, not degraded; a
+  lead that can't be composed defers the digest. Enrichments that don't gate delivery — thread
+  label/delta, comprehension — still degrade gracefully.)*
 
 ---
 

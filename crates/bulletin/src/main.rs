@@ -86,8 +86,7 @@ enum Command {
     /// Read-only faithfulness eval (the `digest-explain` hook, `docs/llm-summarization.md` §3.4/§7):
     /// generate candidate summaries for a sample of historical public clusters, run them through the
     /// faithfulness gate, and report the Vectara-style entity/number accuracy rate — **storing nothing
-    /// and touching no digest**. Requires an `llm-summarization` build with a reachable sidecar; the
-    /// deterministic build prints a clear notice and exits.
+    /// and touching no digest**. Requires a reachable summarization sidecar (it measures the model).
     SummaryEval {
         /// How many recent public clusters to sample.
         #[arg(long, default_value_t = 100)]
@@ -149,7 +148,7 @@ async fn main() -> Result<()> {
             metric::init(cli.metrics_addr)?;
             let pool = connect_pool(cli.database_url()?).await?;
             let connectors = cli.secrets.connector_ctx()?;
-            // Fail loud if this is an LLM build and the sidecar isn't reachable (no-op otherwise).
+            // Fail loud if the summarization sidecar isn't reachable — it's a required dependency (§3.7).
             ensure_sidecar_ready().await?;
             tracing::info!("starting worker");
             worker::start(pool, cli.email.clone(), connectors).await?;
@@ -170,10 +169,10 @@ async fn main() -> Result<()> {
             let pool = connect_pool(cli.database_url()?).await?;
             let webhook_secret = cli.secrets.webhook_secret()?;
             let connectors = cli.secrets.connector_ctx()?;
-            // Verify the summarization sidecar *before* binding `/health` (no-op without the
-            // `llm-summarization` feature). A feature build that can't reach its sidecar then never
-            // reports healthy, so the deploy's `ExecStartPost` health probe fails and the rollout rolls
-            // back — instead of silently serving deterministic baselines.
+            // Verify the summarization sidecar *before* binding `/health`. Summarization is required
+            // (§3.7), so a box that can't reach its sidecar never reports healthy — the deploy's
+            // `ExecStartPost` health probe fails and the rollout rolls back, instead of starting a worker
+            // that quarantines the corpus and defers every digest.
             ensure_sidecar_ready().await?;
             tracing::info!(addr = %cli.http_addr, "starting server + worker + api");
             tokio::try_join!(
@@ -213,14 +212,13 @@ async fn connect_pool(database_url: &str) -> Result<PgPool> {
         .context("failed to connect to database")
 }
 
-/// Startup gate: in an `llm-summarization` build, refuse to run the worker if the local summarization
-/// sidecar can't be reached. The feature *is* the summarization edge, so an unreachable sidecar at boot
-/// is a deployment/config error (wrong `BULLETIN_LLM_BASE_URL`, sidecar down, model didn't load) we want
-/// to fail loudly on — not paper over by silently shipping deterministic baselines. Gives the sidecar a
-/// bounded window to come up (it may still be loading its GGUF), tunable via
-/// `BULLETIN_LLM_STARTUP_TIMEOUT_SECS` (default 60). Once past this gate the *running* path stays
-/// best-effort: a transient blip mid-sweep degrades and retries, never blocking a digest.
-#[cfg(feature = "llm-summarization")]
+/// Startup gate: refuse to run the worker if the local summarization sidecar can't be reached.
+/// Summarization is a mandatory part of the pipeline now (§3.7), so an unreachable sidecar at boot is a
+/// deployment/config error (wrong `BULLETIN_LLM_BASE_URL`, sidecar down, model didn't load) we fail
+/// loudly on — rather than start a worker that quarantines the whole corpus and defers every digest.
+/// Gives the sidecar a bounded window to come up (it may still be loading its GGUF), tunable via
+/// `BULLETIN_LLM_STARTUP_TIMEOUT_SECS` (default 60). Once past this gate the *running* path tracks and
+/// retries a transient blip mid-sweep per cluster (§3.7); the boot gate just refuses an absent sidecar.
 async fn ensure_sidecar_ready() -> Result<()> {
     use std::time::Duration;
     let cfg = bulletin_core::summarize::SummarizationConfig::from_env();
@@ -237,18 +235,10 @@ async fn ensure_sidecar_ready() -> Result<()> {
     bulletin_core::summarize::client::ensure_reachable(&cfg, Duration::from_secs(timeout_secs))
         .await
         .context(
-            "summarization sidecar unreachable at startup (llm-summarization build). Bring up the \
-             llama-server sidecar and check BULLETIN_LLM_BASE_URL, or build without the \
-             llm-summarization feature to run the deterministic baseline",
+            "summarization sidecar unreachable at startup. Summarization is required (§3.7): bring up \
+             the llama-server sidecar and check BULLETIN_LLM_BASE_URL",
         )?;
     tracing::info!("summarization sidecar reachable");
-    Ok(())
-}
-
-/// Without the `llm-summarization` feature there is no sidecar to gate on — the deterministic build runs
-/// unconditionally.
-#[cfg(not(feature = "llm-summarization"))]
-async fn ensure_sidecar_ready() -> Result<()> {
     Ok(())
 }
 
@@ -257,7 +247,6 @@ async fn ensure_sidecar_ready() -> Result<()> {
 /// clusters, runs them through the faithfulness gate, and prints the Vectara-style accuracy rate —
 /// without storing anything. The sidecar must be reachable (the eval can't measure the model without
 /// it), so this gates on it up front like the worker does.
-#[cfg(feature = "llm-summarization")]
 async fn run_summary_eval(database_url: Option<&str>, limit: i64) -> Result<()> {
     let database_url = database_url.context(DATABASE_URL_REQUIRED)?;
     ensure_sidecar_ready().await?;
@@ -268,16 +257,6 @@ async fn run_summary_eval(database_url: Option<&str>, limit: i64) -> Result<()> 
         .context("faithfulness eval failed")?;
     println!("{report}");
     Ok(())
-}
-
-/// Without the `llm-summarization` feature there is no model to evaluate — say so plainly rather than
-/// silently succeeding with an empty report (and before any DB connect is attempted).
-#[cfg(not(feature = "llm-summarization"))]
-async fn run_summary_eval(_: Option<&str>, _: i64) -> Result<()> {
-    anyhow::bail!(
-        "summary-eval requires an llm-summarization build (the deterministic build has no model to \
-         evaluate). Rebuild with --features llm-summarization"
-    )
 }
 
 /// The HTTP server (`serve` / `all`): liveness `/health` + the webhook catcher (`/webhooks/github`),

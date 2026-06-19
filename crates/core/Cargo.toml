@@ -11,15 +11,6 @@ default = ["thread-weighting"]
 # `--no-default-features` to take that path off the build entirely; the deterministic recency digest
 # is unaffected. (The `thread_maintenance` write side is harmless either way.)
 thread-weighting = []
-# Phase A of LLM summarization (docs/llm-summarization.md §2.5): compiles in the write-side,
-# best-effort cluster summarization sweep and its local-sidecar HTTP client. **Off by default** — the
-# deterministic baseline ships and the whole feature (including the client) compiles out, mirroring
-# `thread-weighting`. The pure logic (content hash, faithfulness gate, prompt/schema, deterministic
-# fallback) is always compiled and unit-tested regardless of the feature; only the DB sweep and the
-# network call are gated. The client rides the existing `reqwest`; the one dependency the feature adds
-# is `metrics`, for the `bulletin_llm_*` instrumentation — optional, so the deterministic build that
-# compiles the model edge out never pulls it in.
-llm-summarization = ["dep:metrics"]
 
 [dependencies]
 anyhow      = { workspace = true }
@@ -39,7 +30,7 @@ base64            = { workspace = true }
 sqlx        = { workspace = true }
 tokio       = { workspace = true }
 tracing     = { workspace = true }
-metrics     = { workspace = true, optional = true }  # `bulletin_llm_*`, pulled in by `llm-summarization`
+metrics     = { workspace = true }  # `bulletin_llm_*` summarization instrumentation
 reqwest          = { workspace = true }
 rss              = { workspace = true }
 atom_syndication = { workspace = true }

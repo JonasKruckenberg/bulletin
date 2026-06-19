@@ -307,10 +307,10 @@ async fn no_build_gate_unbuilt_events_ride_next_fire() {
     );
 }
 
-// With the summary gate on (the `llm-summarization` build), a cluster is a candidate only once it
-// carries a gate-passed model summary (band confirmed/probable). A never-summarized cluster and a
-// rejected `uncertain` baseline both slip; with the gate off (the deterministic build) all are
-// candidates regardless. Drives the band directly via SQL (the gated store writer isn't reachable here).
+// With the summary gate on (the strict §3.7 policy — what the digest path always passes now), a cluster
+// is a candidate only once it carries a gate-passed model summary (band confirmed/probable). A
+// never-summarized cluster and a rejected `uncertain` cluster both slip; with the gate off all are
+// candidates regardless. Drives the band directly via SQL (the model store writer isn't reachable here).
 #[tokio::test]
 async fn summary_gate_withholds_unsummarized_and_baseline_clusters() {
     let (pool, _pg) = setup().await;
@@ -348,11 +348,11 @@ async fn summary_gate_withholds_unsummarized_and_baseline_clusters() {
         "with the gate off every built cluster is a candidate"
     );
 
-    // Gate on (llm-summarization build): only the gate-passed model summary survives.
+    // Gate on (the strict digest path): only the gate-passed model summary survives.
     let gated = candidate_clusters(&pool, Uuid::nil(), None, 30, true)
         .await
         .unwrap();
-    assert_eq!(gated.len(), 1, "baseline + never-summarized clusters slip");
+    assert_eq!(gated.len(), 1, "uncertain + never-summarized clusters slip");
     let title: String = sqlx::query("SELECT title FROM cluster WHERE id = $1")
         .bind(gated[0].id)
         .fetch_one(&pool)

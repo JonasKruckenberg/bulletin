@@ -25,8 +25,7 @@ const DIGEST_ITEMS_BUCKETS: &[f64] = &[0.0, 1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0,
 /// Per-call latency buckets for `bulletin_llm_call_duration_seconds`, in seconds. A local sidecar call
 /// runs from tens of milliseconds (cache-warm classify) up to the request timeout (default 120s) on a
 /// cold CPU generation, so the bucketing is denser in the 0.1–10s working range and reaches the
-/// timeout ceiling. Recorded from `bulletin-core` only in an `llm-summarization` build; harmless to
-/// register either way (the matcher simply never fires when nothing emits the metric).
+/// timeout ceiling.
 const LLM_CALL_DURATION_BUCKETS: &[f64] = &[
     0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0, 45.0, 60.0, 90.0, 120.0,
 ];
@@ -95,11 +94,18 @@ pub fn poll_failed(source: &'static str) {
 }
 
 /// The terminal outcome of one `generate_digest` run, keyed by variant. `delivered` and `empty`
-/// both put an email on the wire (the "all caught up" note is still a delivery); `already_delivered`
-/// and `not_yet_due` send nothing. Counting every variant — not just `delivered` — keeps the
-/// emails-actually-sent total honest: `delivered + empty`.
+/// both put an email on the wire (the "all caught up" note is still a delivery); `already_delivered`,
+/// `not_yet_due`, and `lead_deferred` send nothing. Counting every variant — not just `delivered` —
+/// keeps the emails-actually-sent total honest: `delivered + empty`.
 pub fn digest_outcome(outcome: &'static str) {
     metrics::counter!("bulletin_digests_total", "outcome" => outcome).increment(1);
+}
+
+/// A digest that has now exhausted its *quiet* retry budget with its LLM lead still unavailable (§3.7):
+/// the subscriber is overdue and waiting on the sidecar. A non-zero value is an operator alert — the
+/// digest won't ship without a lead, so this is a delivery being held, not a transient blip.
+pub fn digest_lead_unavailable() {
+    metrics::counter!("bulletin_digest_lead_unavailable_total").increment(1);
 }
 
 /// How many items a delivered digest carried — the substance of a send. Empty windows record `0`

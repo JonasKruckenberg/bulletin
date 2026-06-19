@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use apalis::prelude::*;
 use apalis_cron::{CronStream, Tick};
 use apalis_postgres::PostgresStorage;
+use apalis_sql::ext::TaskBuilderExt; // .max_attempts() on the enqueued task
 use chrono::Utc;
 use cron::Schedule;
 use serde::{Deserialize, Serialize};
@@ -51,6 +52,17 @@ pub struct PublicBuildJob;
 pub struct GenerateDigestJob {
     pub subscriber_id: Uuid,
 }
+
+/// The per-job retry budget for `GenerateDigest` (§3.7). A digest with items defers (errors) rather than
+/// ship without an LLM lead; apalis re-runs a `Failed` job up to this many attempts before killing it, so
+/// this is how long a window waits out a transient sidecar blip before being given up on. Larger than the
+/// apalis default (5) so a brief sidecar restart doesn't drop the window. NB: apalis-postgres applies no
+/// inter-retry backoff, so the wall-clock window is roughly `DIGEST_MAX_ATTEMPTS x poll-interval`.
+const DIGEST_MAX_ATTEMPTS: u32 = 12;
+
+/// The attempt at/after which a still-deferred lead is escalated to an operator alert — set below
+/// [`DIGEST_MAX_ATTEMPTS`] so the alert precedes the give-up (the job keeps retrying until killed).
+const DIGEST_LEAD_ALERT_ATTEMPT: u32 = 8;
 
 /// thread_maintenance for one subscriber (design `docs/thread-layer.md` §5.1): the write-side,
 /// best-effort job that rebuilds the subscriber's identity graph + threads and projects the
@@ -184,9 +196,9 @@ async fn public_build(
         match bulletin_core::cluster::build(&pool).await {
             Ok(Some(stats)) => {
                 tracing::info!(dirty_groups = stats.dirty_groups, "public build complete");
-                // Best-effort, off the punctual path: summarize the public clusters whose content
-                // changed (no-op without the feature/flag). A failure degrades to baseline summaries,
-                // never the build.
+                // Off the punctual path: summarize the public clusters whose content changed. Per-cluster
+                // failures are tracked/retried/quarantined inside `core` (§3.7) and never fail the build;
+                // an un-summarized cluster is just withheld from digests until it lands.
                 summarize_public(&pool).await;
             }
             Ok(None) => tracing::debug!("public build skipped (lock held by a concurrent build)"),
@@ -200,13 +212,12 @@ async fn public_build(
     .await
 }
 
-/// Best-effort public cluster-summarization sweep, hung off a completed PublicBuild (the natural
+/// Public cluster-summarization sweep, hung off a completed PublicBuild (the natural
 /// `summary_hash`-invalidation point, docs/llm-summarization.md §5). Runs in the no-subscriber RLS
 /// context inside `core`; shared public summaries are generated once for everybody (the §5 multiplier
-/// saving). The `llm-summarization` cargo feature is the **sole** kill switch — without it this is the
-/// empty no-op below and no summarization code is compiled. The `BULLETIN_LLM_*` env only *configures*
-/// the sidecar (URL/model). Never propagates an error — summarization is not the deliverable.
-#[cfg(feature = "llm-summarization")]
+/// saving). The `BULLETIN_LLM_*` env configures the sidecar (URL/model). The sweep never propagates an
+/// error — per-cluster failures are tracked, retried with an escalating seed, and quarantined inside
+/// `core` (§3.7); the only externally-visible effect is the cluster's (temporary) absence from digests.
 async fn summarize_public(pool: &PgPool) {
     let cfg = bulletin_core::summarize::SummarizationConfig::from_env();
     report_sweep(
@@ -215,39 +226,38 @@ async fn summarize_public(pool: &PgPool) {
     );
 }
 
-#[cfg(not(feature = "llm-summarization"))]
-async fn summarize_public(_: &PgPool) {}
-
-/// Shared logging for a best-effort summarization sweep (public or private) — the one piece the two
-/// entry points actually share (their core calls differ in scope/arguments). `subscriber_id` is
-/// `Some` for a private sweep, `None` for the shared public one.
-#[cfg(feature = "llm-summarization")]
+/// Shared logging for a summarization sweep (public or private) — the one piece the two entry points
+/// actually share (their core calls differ in scope/arguments). `subscriber_id` is `Some` for a private
+/// sweep, `None` for the shared public one.
 fn report_sweep(
     subscriber_id: Option<Uuid>,
     result: anyhow::Result<bulletin_core::summarize::SummarizeStats>,
 ) {
     match result {
-        // A non-zero `unavailable` count means the sidecar was unreachable/erroring for at least one
-        // cluster this pass — surface it at WARN so a degraded model edge is visible at the default log
-        // level (those clusters retry next sweep), while a clean pass stays at INFO.
-        Ok(stats) if stats.unavailable > 0 => tracing::warn!(
+        // Any cluster that came out of the pass without a faithful summary (a tracked failure or a
+        // quarantine, §3.7) is a degraded model edge — surface it at WARN so it's visible at the default
+        // log level. A non-zero `quarantined` is the louder signal: that corpus slice exhausted its
+        // retries and now needs operator review. A clean pass stays at INFO.
+        Ok(stats) if stats.unhealthy() > 0 => tracing::warn!(
             ?subscriber_id,
             summarized = stats.summarized,
             skipped = stats.skipped,
-            unavailable = stats.unavailable,
-            "cluster summarization sweep complete with unavailable clusters (sidecar degraded?)"
+            failed = stats.failed,
+            quarantined = stats.quarantined,
+            "summarization sweep complete with failed/quarantined clusters (sidecar degraded?)"
         ),
         Ok(stats) => tracing::info!(
             ?subscriber_id,
             summarized = stats.summarized,
             skipped = stats.skipped,
-            unavailable = stats.unavailable,
-            "cluster summarization sweep complete"
+            failed = stats.failed,
+            quarantined = stats.quarantined,
+            "summarization sweep complete"
         ),
         Err(e) => tracing::warn!(
             ?subscriber_id,
             error = %format!("{e:#}"),
-            "cluster summarization sweep failed (non-fatal)"
+            "summarization sweep failed (non-fatal)"
         ),
     }
 }
@@ -259,10 +269,14 @@ async fn generate_digest(
     pool: Data<PgPool>,
     email: Data<EmailConfig>,
 ) -> Result<(), BoxDynError> {
+    // The apalis attempt index is folded into the lead's seed (so successive retries draw fresh leads,
+    // not the same rejected one) and decides when a still-deferred lead is "exhausted". Read before
+    // `attempt` is moved into `traced`.
+    let job_attempt = attempt.current() as u32;
     traced("generate_digest", task_id, attempt, async move {
         let sender = email.build_sender().map_err(boxed)?;
         let content = email.content();
-        match bulletin_core::digest::generate(&pool, &sender, job.subscriber_id, &content).await {
+        match bulletin_core::digest::generate(&pool, &sender, job.subscriber_id, &content, job_attempt).await {
             Ok(outcome) => {
                 // `delivered` and `empty` both sent an email; `already_delivered`/`not_yet_due`
                 // sent nothing. Record every variant so the counter doesn't undercount real sends.
@@ -274,6 +288,27 @@ async fn generate_digest(
                     DigestOutcome::Empty => metric::digest_outcome("empty"),
                     DigestOutcome::AlreadyDelivered => metric::digest_outcome("already_delivered"),
                     DigestOutcome::NotYetDue => metric::digest_outcome("not_yet_due"),
+                    // The §3.7 contract: a digest with items never ships without an LLM lead. Nothing was
+                    // delivered and the watermark didn't advance — error so apalis re-runs this same job
+                    // (the `Failed`-and-retry path, bounded by the job's max_attempts = DIGEST_MAX_ATTEMPTS;
+                    // the box may recover, or a re-seeded lead may pass). Once the quiet-recovery budget is
+                    // spent (but before the job is killed), alert loudly rather than retry silently. The
+                    // retry budget and alert threshold are the trigger layer's policy, kept out of core.
+                    DigestOutcome::LeadDeferred => {
+                        metric::digest_outcome("lead_deferred");
+                        if job_attempt >= DIGEST_LEAD_ALERT_ATTEMPT {
+                            metric::digest_lead_unavailable();
+                            tracing::error!(
+                                subscriber_id = %job.subscriber_id,
+                                job_attempt,
+                                max_attempts = DIGEST_MAX_ATTEMPTS,
+                                "digest still undelivered — its LLM lead has been unavailable across the retry budget; operator attention needed (sidecar?)"
+                            );
+                        }
+                        return Err(boxed(anyhow::anyhow!(
+                            "digest lead unavailable (attempt {job_attempt}); deferring delivery until it can be composed"
+                        )));
+                    }
                 }
                 tracing::info!(subscriber_id = %job.subscriber_id, ?outcome, "digest generated");
             }
@@ -334,10 +369,8 @@ async fn thread_maintenance(
 /// private mirror of [`summarize_public`], run in the dependency order the hierarchy needs (§4): the
 /// **private cluster** summaries first (Phase A), then **story cross-source synthesis** over the
 /// member cluster summaries (Phase C), then the **thread label + delta** over the recent story
-/// headlines (Phase B). The `llm-summarization` cargo feature is the **sole** kill switch — without it
-/// this is the empty no-op below. Each sweep is independently best-effort and never propagates an
-/// error — summarization is not the deliverable.
-#[cfg(feature = "llm-summarization")]
+/// headlines (Phase B). Each sweep tracks/retries/quarantines its own failures inside `core` (§3.7) and
+/// never propagates an error — an un-summarized cluster is simply withheld from the subscriber's digest.
 async fn summarize_private(pool: &PgPool, subscriber_id: Uuid) {
     let cfg = bulletin_core::summarize::SummarizationConfig::from_env();
     // Phase A (private clusters) → Phase C (story synthesis) → Phase B (thread label/delta): each tier
@@ -356,9 +389,6 @@ async fn summarize_private(pool: &PgPool, subscriber_id: Uuid) {
         bulletin_core::summarize::sweep_thread_labels(pool, subscriber_id, &cfg).await,
     );
 }
-
-#[cfg(not(feature = "llm-summarization"))]
-async fn summarize_private(_: &PgPool, _: Uuid) {}
 
 /// How often a subscriber's thread-maintenance pass runs (a relaxed, off-path cadence).
 #[cfg(feature = "thread-weighting")]
@@ -459,6 +489,9 @@ async fn run_tick(pool: Data<PgPool>) -> Result<(), BoxDynError> {
                 subscriber_id: s.id,
             })
             .with_idempotency_key(key)
+            // Widen the retry budget so a deferred digest (lead unavailable, §3.7) rides out a transient
+            // sidecar blip across several re-runs before apalis kills the job, instead of the default 5.
+            .max_attempts(DIGEST_MAX_ATTEMPTS)
             .build();
             match storage.push_task(task).await {
                 Ok(()) => {}

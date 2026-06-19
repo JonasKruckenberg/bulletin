@@ -239,10 +239,11 @@ pub(crate) async fn cluster_cards(
 /// tombstoned/empty story).
 ///
 /// `story_summary` is the Phase-C cross-source synthesis (`story.summary`, §2.2) when one has been
-/// computed — preferred over the representative cluster's summary for the headline + tldr. A `None`
-/// (or inert empty) story summary degrades to the representative cluster summary (Phase A), which
-/// itself degrades to the raw title — so the item is correct at every phase (§6.1 "precomputed-or-omit
-/// fallback at each phase").
+/// computed — preferred over the representative cluster's summary for the headline + tldr. Under the
+/// strict §3.7 gate a **multi-member** story only reaches selection (and thus render) once it carries a
+/// faithful synthesis, so the `None`/empty path here is taken only by **single-member** stories — which
+/// legitimately render their one (already gate-passed) cluster summary, not a degradation. That summary
+/// still degrades to the raw `title` if even Phase A is somehow absent (§6.1 belt-and-braces).
 pub(crate) fn build_render_item(
     members: &[ClusterRef],
     cards: &HashMap<Uuid, ClusterCard>,

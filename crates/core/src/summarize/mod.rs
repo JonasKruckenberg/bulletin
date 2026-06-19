@@ -1,28 +1,38 @@
 //! LLM summarization (Phase A — the cluster foundation; `docs/llm-summarization.md`).
 //!
-//! Produces the **durable, content-hashed cluster summary** every higher surface composes from. The
-//! governing constraint (`local-ml-options.md` §0, `thread-layer.md` §3.1): every model call is
-//! write-side, best-effort, off the punctual path, behind a flag, and **degrades to a deterministic
-//! baseline** — a missing or rejected summary costs a plainer email, never a late or wrong one.
+//! Produces the **durable, content-hashed cluster summary** every higher surface composes from.
 //!
-//! This module splits cleanly into two halves:
+//! **The contract inverted (the §3.7 redesign).** Summarization used to be a best-effort enrichment
+//! that silently degraded to a deterministic baseline. It no longer is: it is the deliverable. A
+//! cluster ships in a digest *only* once it carries a faithful model summary (the §3.4 gate's
+//! `confirmed`/`probable` band), and the digest never ships an authored lead it didn't compose. A
+//! summarization that fails — a down sidecar, or a faithfulness-gate rejection — is therefore a real,
+//! tracked **error** with bounded retries (gate rejections re-attempt with an escalating seed, since
+//! a fixed seed reproduces the rejection), and a cluster whose retries are exhausted is **quarantined**
+//! for operator review and withheld from digests. A stuck cluster simply slips to a later window; it
+//! never blocks a subscriber's digest. The model edge is compiled unconditionally now (no kill-switch
+//! feature) — the sidecar address/model are runtime config, not a build flag.
 //!
-//! - **The pure core (always compiled, unit-tested):** the data model ([`ClusterSummary`]), the
+//! This module splits into two halves:
+//!
+//! - **The pure core (unit-tested without a sidecar):** the data model ([`ClusterSummary`]), the
 //!   content signature ([`summary_hash`]), the grounding-fact skeleton ([`extract_facts`]), the
-//!   grammar/JSON schema + prompts ([`response_schema`] / [`SYSTEM_PROMPT`] / [`user_prompt`]), the
-//!   deterministic [`faithfulness gate`](faithful), and the [`baseline`] fallback. None of it talks
-//!   to a model or the DB, so it is exercised without a sidecar.
-//! - **The gated edge (behind `feature = "llm-summarization"`):** [`client`] (the local-sidecar HTTP
-//!   call) and the DB [`sweep`](sweep_public)/[`store`](store) that walk the work queue. Compiled out
-//!   by default so the deterministic digest ships unchanged.
+//!   grammar/JSON schema + prompts ([`response_schema`] / [`SYSTEM_PROMPT`] / [`user_prompt`]), and the
+//!   deterministic [`faithfulness gate`](faithful). None of it talks to a model or the DB.
+//! - **The model edge:** [`client`] (the local-sidecar HTTP call) and the DB [`sweep`](sweep_public)/
+//!   [`store`](store) that walk the work queue, retry, and quarantine.
 
-#[cfg(feature = "llm-summarization")]
 pub mod client;
-/// The `bulletin_llm_*` recorders for the summarization path; gated with the rest of the model edge.
-#[cfg(feature = "llm-summarization")]
+/// The `bulletin_llm_*` recorders for the summarization path.
 mod metric;
-#[cfg(feature = "llm-summarization")]
 pub(crate) mod store;
+
+/// How many times a cluster's summarization may fail (a sidecar outage *or* a faithfulness-gate
+/// rejection, counted together) before it is **quarantined** for operator review and withheld from the
+/// sweep (§3.7). Each retry runs with an escalating seed/temperature ([`SummarizationConfig::for_attempt`])
+/// so a deterministic gate rejection gets genuinely fresh draws rather than reproducing itself. A content
+/// change gives a quarantined cluster a fresh budget.
+pub const MAX_SUMMARY_ATTEMPTS: i32 = 4;
 
 use std::time::Duration;
 
@@ -35,10 +45,10 @@ use crate::common::event::Event;
 
 /// Tuning surface for summarization, held as a struct like
 /// [`thread::MaintenanceConfig`](crate::thread::MaintenanceConfig) — a `summarization_config` row
-/// when per-deployment tuning bites. **There is no runtime kill switch here:** the *only* switch is
-/// the compile-time `llm-summarization` feature (mirroring `thread-weighting`), so a build without it
-/// has no summarization code at all. This struct is pure config — the sidecar address, the model, and
-/// the generation knobs — never a guard.
+/// when per-deployment tuning bites. Pure config — the sidecar address, the model, and the generation
+/// knobs — never a guard. Summarization is a mandatory part of the pipeline now (§3.7), so there is no
+/// kill switch, compile-time or runtime: the sidecar is a hard runtime dependency the worker gates on
+/// at boot ([`client::ensure_reachable`]).
 #[derive(Debug, Clone)]
 pub struct SummarizationConfig {
     /// The 100%-local sidecar's OpenAI-compatible base URL (no egress, §3.5), e.g.
@@ -132,14 +142,32 @@ impl SummarizationConfig {
         format!("{}@{}", self.model, self.prompt_version)
     }
 
+    /// A copy of this config with the generation seed (and, mildly, the temperature) perturbed for a
+    /// given retry `attempt` (§3.7). Attempt `0` is this config unchanged — the first try stays at the
+    /// deterministic base seed/temperature, so the content-hash cache (§3.3) keeps its meaning for a
+    /// cluster that summarizes cleanly first time. A later attempt offsets the seed by a fixed odd
+    /// stride (so each draw is genuinely different, not adjacent) and nudges the temperature up a notch
+    /// (capped well under 1.0): a faithfulness-gate rejection is deterministic under a fixed seed, so a
+    /// bare retry would only reproduce it — re-seeding is what gives the model a real second chance.
+    pub fn for_attempt(&self, attempt: i32) -> Self {
+        if attempt <= 0 {
+            return self.clone();
+        }
+        let mut c = self.clone();
+        c.seed = self
+            .seed
+            .wrapping_add((attempt as u32).wrapping_mul(0x9E37_79B9));
+        c.temperature = (self.temperature + 0.15 * attempt as f32).min(0.9);
+        c
+    }
+
     /// Build a config from the `BULLETIN_LLM_*` environment (the binary's runtime config seam): the
     /// sidecar `BASE_URL`, `MODEL`, and `PROMPT_VERSION`, plus the operational knobs an operator needs
     /// to recover a degraded edge without a recompile — `REQUEST_TIMEOUT_SECS` (slow hardware),
     /// `COMPREHEND` (drop the extra per-cluster call to halve the load), and `DISABLE_THINKING` (the
-    /// reasoning-model toggle). Everything else stays at the conservative defaults. These are *config,
-    /// not a kill switch* — whether summarization runs at all is the compile-time feature's call (this
-    /// code only exists in a feature build). Reached only from the gated worker step, so it never
-    /// executes in a default build.
+    /// reasoning-model toggle). Everything else stays at the conservative defaults. These are *config*,
+    /// not a kill switch — summarization is mandatory (§3.7); these knobs only let an operator recover a
+    /// degraded sidecar edge (slow hardware, a reasoning model) without a recompile.
     pub fn from_env() -> Self {
         let mut cfg = SummarizationConfig::default();
         if let Ok(v) = std::env::var("BULLETIN_LLM_BASE_URL") {
@@ -215,8 +243,10 @@ pub enum Certainty {
 }
 
 /// The faithfulness verdict the gate (§3.4) stamps on a summary, carried to render as the §10.4
-/// confidence surface. `Confirmed`/`Probable` are model output that passed the gate; `Uncertain` is
-/// what a rejected (or never-generated) summary degrades to — the deterministic baseline.
+/// confidence surface. `Confirmed`/`Probable` are model output that passed the gate and the only bands
+/// that ship (the digest's strict §3.7 gate withholds anything else). `Uncertain` is just the inert
+/// default of a never-summarized unit — under §3.7 a rejected candidate is *not* stored as `Uncertain`,
+/// it's a tracked failure that retries and quarantines, so a stored summary is always `Confirmed`/`Probable`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Band {
@@ -780,41 +810,6 @@ fn contains_word(haystack: &str, needle: &str) -> bool {
         start = after;
     }
     false
-}
-
-// ── The deterministic baseline (§3.4 fallback) ───────────────────────────────────────────────────
-
-/// The deterministic baseline a rejected or never-generated summary degrades to: the extractive
-/// cluster `title` as the headline, a templated one-liner as the tldr, banded `uncertain`. Always
-/// true, never a hallucination — the §3.4/§8 graceful-degradation guarantee. `facts` is carried
-/// through so the grounding survives even when generation is skipped.
-pub fn baseline(title: &str, event_count: i32, sources: &[&str], facts: Facts) -> ClusterSummary {
-    let headline = title.trim().chars().take(90).collect::<String>();
-    let tldr_text = baseline_tldr(event_count, sources);
-    ClusterSummary {
-        headline,
-        tldr: vec![TldrRun::Text {
-            text: tldr_text.clone(),
-        }],
-        tldr_text,
-        facts,
-        band: Band::Uncertain,
-    }
-}
-
-/// The templated baseline tldr (§3.4): a true, plain count-and-sources line — e.g. "3 updates across
-/// GitHub, Slack." A single update with one source reads "1 update from GitHub."
-fn baseline_tldr(event_count: i32, sources: &[&str]) -> String {
-    let n = event_count.max(1);
-    let unit = if n == 1 { "update" } else { "updates" };
-    let mut srcs: Vec<&str> = sources.to_vec();
-    srcs.sort_unstable();
-    srcs.dedup();
-    match srcs.len() {
-        0 => format!("{n} {unit}."),
-        1 => format!("{n} {unit} from {}.", srcs[0]),
-        _ => format!("{n} {unit} across {}.", srcs.join(", ")),
-    }
 }
 
 // ── Schema + prompts (§3.3, §3.6) ────────────────────────────────────────────────────────────────
@@ -1507,7 +1502,95 @@ impl std::fmt::Display for EvalReport {
     }
 }
 
-// ── The sweep (gated) — walk the work queue, summarize best-effort ───────────────────────────────
+// ── The sweep — walk the work queue, summarize, retry, quarantine ────────────────────────────────
+
+/// Why a cluster's summarization attempt failed (§3.7) — the two outcomes that are now tracked errors
+/// rather than swallowed: the sidecar was unreachable/erroring, or the model answered but the §3.4
+/// faithfulness gate rejected the answer. Both increment the cluster's attempt counter and, on
+/// exhaustion, quarantine it; they differ only in the coarse `kind` recorded for the operator and the
+/// metric label.
+#[derive(Debug, Clone)]
+pub enum SummaryFailure {
+    /// Transport/HTTP/timeout — retrying (once the sidecar recovers) can fix it.
+    Unavailable(&'static str),
+    /// The §3.4 gate rejected the candidate. Deterministic under a fixed seed, so a retry only helps
+    /// with an escalated seed ([`SummarizationConfig::for_attempt`]).
+    Rejected(GateViolation),
+}
+
+impl SummaryFailure {
+    /// The coarse kind for the metric label and the stored `summary_last_error` prefix.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            SummaryFailure::Unavailable(_) => "unavailable",
+            SummaryFailure::Rejected(_) => "rejected",
+        }
+    }
+
+    /// A one-line description for `cluster.summary_last_error` (operator review): the kind plus the
+    /// specific transport bucket or gate violation.
+    pub fn describe(&self) -> String {
+        match self {
+            SummaryFailure::Unavailable(bucket) => format!("unavailable: {bucket}"),
+            SummaryFailure::Rejected(v) => format!("rejected: {v:?}"),
+        }
+    }
+}
+
+/// The result of one cluster summarization attempt (§3.7): a gate-passed faithful summary, or a tracked
+/// failure. Replaces the old `Option<ClusterSummary>` where `Some(baseline)` quietly stood in for a
+/// rejection — there is no baseline to fall back to anymore.
+#[derive(Debug, Clone)]
+pub enum SummaryOutcome {
+    Faithful(ClusterSummary),
+    Failed(SummaryFailure),
+}
+
+/// Shared §3.7 failure bookkeeping for a summarization unit (`unit`: "cluster" | "story", `id` names the
+/// row): emit the failure metric, decide quarantine, log at WARN (quarantine) or DEBUG, and return
+/// `(next_attempts, quarantine)` for the caller to persist via the unit's `record_*_failure`. Keeps the
+/// attempt/quarantine math + metrics + log in one place so the cluster and story sweeps can't drift.
+fn note_summary_failure(
+    unit: &'static str,
+    id: uuid::Uuid,
+    attempt: i32,
+    failure: &SummaryFailure,
+) -> (i32, bool) {
+    let next_attempts = attempt + 1;
+    let quarantine = next_attempts >= MAX_SUMMARY_ATTEMPTS;
+    metric::summary_failed(unit, failure.kind());
+    if quarantine {
+        metric::quarantined(unit);
+        tracing::warn!(
+            unit,
+            %id,
+            attempts = next_attempts,
+            error = %failure.describe(),
+            "summarization quarantined after exhausting retries — flagged for operator review"
+        );
+    } else {
+        tracing::debug!(
+            unit,
+            %id,
+            attempts = next_attempts,
+            error = %failure.describe(),
+            "summarization failed; will retry with an escalated seed"
+        );
+    }
+    (next_attempts, quarantine)
+}
+
+/// The result of one Phase-D **authored lead** attempt (§3.1, §3.7) — the one on-path model call. The
+/// caller (the digest flow) distinguishes the two failure modes because they want different handling: a
+/// gate `Rejected` is deterministic, so it retries *in process* with an escalated seed; an `Unavailable`
+/// sidecar won't be fixed by re-seeding, so the digest defers and the whole job retries later. There is
+/// no deterministic lead to fall back to — a digest with items ships an authored lead or it waits.
+#[derive(Debug, Clone)]
+pub enum LeadOutcome {
+    Ready(String),
+    Rejected,
+    Unavailable,
+}
 
 /// What a summarization sweep did, for logs / metrics.
 #[derive(Debug, Default, Clone, Copy)]
@@ -1516,19 +1599,29 @@ pub struct SummarizeStats {
     pub summarized: usize,
     /// Clusters skipped because their content hash was unchanged (the cache hit).
     pub skipped: usize,
-    /// Clusters left unsummarized because the model was unavailable — *not* persisted, so a later
-    /// sweep retries once the sidecar recovers (rather than sticking at a baseline).
-    pub unavailable: usize,
+    /// Clusters that failed this pass (sidecar unavailable *or* a gate rejection) and still have retry
+    /// budget — left un-summarized so the next sweep retries them with an escalated seed (§3.7).
+    pub failed: usize,
+    /// Clusters whose retry budget was exhausted this pass: quarantined and flagged for operator review.
+    pub quarantined: usize,
 }
 
-/// Run a best-effort cluster-summarization sweep over **public** clusters, in the no-subscriber RLS
-/// context (so it can only touch shared rows, §3.5). Public summaries are generated once and shared by
-/// every subscriber (the §5 multiplier saving). Only exists in a `llm-summarization` build — the
-/// feature is the kill switch.
+impl SummarizeStats {
+    /// Any cluster that did not come out of this pass with a faithful summary — a degraded edge worth
+    /// surfacing at WARN even though the sweep itself never errors (the per-cluster retry/quarantine is
+    /// the recovery path, not a failed job).
+    pub fn unhealthy(&self) -> usize {
+        self.failed + self.quarantined
+    }
+}
+
+/// Run a cluster-summarization sweep over **public** clusters, in the no-subscriber RLS context (so it
+/// can only touch shared rows, §3.5). Public summaries are generated once and shared by every subscriber
+/// (the §5 multiplier saving).
 ///
-/// Best-effort by contract (`thread-layer.md` §3.1): a per-cluster failure degrades that cluster to
-/// its deterministic baseline and the sweep continues; nothing here ever blocks or fails a digest.
-#[cfg(feature = "llm-summarization")]
+/// A per-cluster failure (sidecar down or a gate rejection) is tracked, retried with an escalating seed
+/// on later sweeps, and quarantined when the retry budget is spent (§3.7) — the sweep continues past it
+/// and never errors as a whole. An unsummarized cluster is simply withheld from digests until it lands.
 pub async fn sweep_public(
     pool: &sqlx::PgPool,
     cfg: &SummarizationConfig,
@@ -1536,10 +1629,9 @@ pub async fn sweep_public(
     sweep(pool, &Scope::Public, cfg).await
 }
 
-/// Run a best-effort cluster-summarization sweep over one subscriber's **private** clusters, in their
-/// RLS context (per-unit, stateless — no cross-tenant content in one call, §3.5). Only exists in a
-/// `llm-summarization` build — the feature is the kill switch.
-#[cfg(feature = "llm-summarization")]
+/// Run a cluster-summarization sweep over one subscriber's **private** clusters, in their RLS context
+/// (per-unit, stateless — no cross-tenant content in one call, §3.5). Same retry/quarantine contract as
+/// [`sweep_public`].
 pub async fn sweep_private(
     pool: &sqlx::PgPool,
     subscriber_id: uuid::Uuid,
@@ -1548,13 +1640,11 @@ pub async fn sweep_private(
     sweep(pool, &Scope::Private(subscriber_id), cfg).await
 }
 
-#[cfg(feature = "llm-summarization")]
 use crate::common::{db::ScopeCtx, scope::Scope};
 
 /// One HTTP client (connection pool / TLS cache / resolver) per sweep, reused across every model call
 /// in the pass rather than rebuilt per item — shared by all three sweeps (cluster / story / thread) so
 /// client construction lives in one place. `what` names the sweep for the error context.
-#[cfg(feature = "llm-summarization")]
 pub(crate) fn build_summarize_http(
     cfg: &SummarizationConfig,
     what: &str,
@@ -1579,7 +1669,6 @@ pub(crate) fn build_summarize_http(
 /// writer to `cluster` then queue behind. That is exactly what surfaces as a multi-minute "slow
 /// statement" on the trivial `store_summary` `UPDATE`. The model calls touch no DB, so they sit
 /// comfortably outside any transaction.
-#[cfg(feature = "llm-summarization")]
 async fn sweep(
     pool: &sqlx::PgPool,
     scope: &Scope,
@@ -1654,23 +1743,26 @@ async fn sweep(
             continue;
         }
         metric::cache("cluster", false);
-        // `None` ⇒ the model was unavailable: leave the cluster unsummarized (don't advance
-        // `summarized_at`) so a later sweep retries once the sidecar recovers, rather than freezing it
-        // at a baseline until its content next changes. A gate rejection still returns `Some(baseline)`
-        // — that is a stable, content-derived result worth caching. A span so the best-effort warnings
-        // inside `summarize_cluster` (model/comprehension call failed) carry *which* cluster they were
-        // for — the failure is logged at the call site where the error type is known, but the identity
-        // lives out here. The call holds no transaction.
+        // The retry attempt index for this cluster (§3.7): the count of consecutive prior failures since
+        // its last success. A cluster that slipped past quarantine on a content change (`retry_reset`)
+        // starts a fresh budget — its stale attempts/quarantine no longer apply. Attempt 0 runs at the
+        // deterministic base seed; each later attempt re-seeds so a deterministic gate rejection gets a
+        // genuinely new draw rather than reproducing itself.
+        let attempt = if c.retry_reset { 0 } else { c.summary_attempts };
+        let attempt_cfg = cfg.for_attempt(attempt);
+        // A span so the warnings inside `summarize_cluster` (model/comprehension call failed) carry
+        // *which* cluster they were for. The model call holds no transaction.
         let span = tracing::debug_span!(
             "summarize_cluster",
             cluster_id = %c.id,
             source = c.source.as_str(),
+            attempt,
         );
-        match client::summarize_cluster(cfg, &http, &c.title, &events)
+        match client::summarize_cluster(&attempt_cfg, &http, &events)
             .instrument(span)
             .await
         {
-            Some(summary) => {
+            SummaryOutcome::Faithful(summary) => {
                 let cid = c.id;
                 let model = model.clone();
                 with_scope(pool, ctx, move |conn| {
@@ -1683,7 +1775,28 @@ async fn sweep(
                 .await?;
                 stats.summarized += 1;
             }
-            None => stats.unavailable += 1,
+            SummaryOutcome::Failed(failure) => {
+                // Track the failure (metric + log), decide quarantine, and persist — the cluster stays
+                // un-summarized (withheld from digests) so the next sweep retries it with a hotter seed,
+                // or, once the budget is spent, sits quarantined for operator review.
+                let (next_attempts, quarantine) =
+                    note_summary_failure("cluster", c.id, attempt, &failure);
+                if quarantine {
+                    stats.quarantined += 1;
+                } else {
+                    stats.failed += 1;
+                }
+                let cid = c.id;
+                let error = failure.describe();
+                with_scope(pool, ctx, move |conn| {
+                    Box::pin(async move {
+                        store::record_summary_failure(conn, cid, next_attempts, &error, quarantine)
+                            .await
+                            .context("record cluster summary failure")
+                    })
+                })
+                .await?;
+            }
         }
     }
     Ok(stats)
@@ -1694,13 +1807,12 @@ async fn sweep(
 /// the *exact* generation path [`sweep`] uses — extract → (comprehend) → model → gate — but **stores
 /// nothing** and records the gate's verdict, so the Vectara-style entity/number accuracy rate
 /// (`local-ml-options.md` §7) can be measured *before* any summary touches a delivered digest. Newest
-/// clusters first, bounded by `limit`. Only exists in a `llm-summarization` build.
+/// clusters first, bounded by `limit`.
 ///
 /// Unlike [`sweep`], the eval ignores `summarized_at`/`summary_model` and re-generates a candidate for
 /// every sampled cluster regardless of cache state — it is measuring the model, not advancing the
 /// cache. It is also scoped to public clusters only (the no-subscriber context, like [`sweep_public`])
 /// to stay trivially scope-clean; a per-subscriber eval is a later refinement.
-#[cfg(feature = "llm-summarization")]
 pub async fn eval_public(
     pool: &sqlx::PgPool,
     cfg: &SummarizationConfig,
@@ -1781,15 +1893,16 @@ pub async fn eval_public(
 /// their RLS context. Walks the stories whose membership/content changed, recomputes each one's member
 /// signature from the member clusters' `summary_hash`es, and — only if it moved (or a model upgrade) —
 /// synthesizes a fused summary from the **member cluster summaries** (never their raw events, §4),
-/// cached by the signature so a stable story is reused for free across fires. Best-effort by contract:
-/// a per-story failure leaves it un-synthesized (fire-time falls back to the representative cluster,
-/// §2.2 cold-start) and the pass continues. Only exists in a `llm-summarization` build.
+/// cached by the signature so a stable story is reused for free across fires. Under the strict §3.7
+/// contract a multi-member synthesis failure is tracked, retried with an escalating seed, and quarantined
+/// once the budget is spent — the story is withheld from digests until it lands, never collapsed to one
+/// member's single-source blurb (a single-member story has nothing to fuse and renders its one cluster
+/// summary directly). The pass continues past a failed story.
 ///
 /// (Deviation from §2.2: the member signature is keyed on member content alone — `thread_id` is not
 /// folded in, so a story moving threads doesn't itself force a re-synthesis. The synthesis quality
 /// barely depends on the thread context, and this keeps Phase C decoupled from fire-time
 /// thread-assignment. Revisit if cross-thread restatement proves valuable.)
-#[cfg(feature = "llm-summarization")]
 pub async fn sweep_stories(
     pool: &sqlx::PgPool,
     subscriber_id: uuid::Uuid,
@@ -1831,11 +1944,10 @@ pub async fn sweep_stories(
             }
         })
         .await?;
-        // A cross-source synthesis needs ≥2 members *and* at least one with a real cluster summary to
-        // fuse; otherwise fire-time already renders the representative cluster identically — skip the
-        // model call, just advance the watermark so it isn't re-flagged.
         let has_content = members.iter().any(|m| !m.summary.is_empty());
-        if members.len() < 2 || !has_content {
+        if members.len() < 2 {
+            // A single-member story has nothing to fuse — advance the watermark so it isn't re-flagged;
+            // fire-time renders its one (already-gated) cluster summary directly (§3.7).
             let sid = s.id;
             let model = model.clone();
             let _ = with_scope(pool, ctx, move |conn| {
@@ -1846,6 +1958,14 @@ pub async fn sweep_stories(
                 })
             })
             .await;
+            stats.skipped += 1;
+            continue;
+        }
+        if !has_content {
+            // Multi-member, but no member carries a faithful summary *yet* (e.g. its clusters are still
+            // being summarized). Do **not** advance the watermark — leaving the story due means a later
+            // sweep re-checks it once its members land, rather than withholding it from digests until its
+            // membership/content next happens to move (§3.7). A cheap re-check, self-resolving.
             stats.skipped += 1;
             continue;
         }
@@ -1873,9 +1993,13 @@ pub async fn sweep_stories(
         }
         metric::cache("story", false);
 
+        // Same escalating-seed retry as the cluster sweep (§3.7): attempt 0 at the base seed, each later
+        // attempt re-seeded; a post-quarantine content change (`retry_reset`) starts a fresh budget.
+        let attempt = if s.retry_reset { 0 } else { s.summary_attempts };
+        let attempt_cfg = cfg.for_attempt(attempt);
         let summaries: Vec<ClusterSummary> = members.into_iter().map(|m| m.summary).collect();
-        match client::synthesize_story(cfg, &http, &summaries, None).await {
-            Some(summary) => {
+        match client::synthesize_story(&attempt_cfg, &http, &summaries, None).await {
+            SummaryOutcome::Faithful(summary) => {
                 let sid = s.id;
                 let model = model.clone();
                 with_scope(pool, ctx, move |conn| {
@@ -1888,7 +2012,35 @@ pub async fn sweep_stories(
                 .await?;
                 stats.summarized += 1;
             }
-            None => stats.unavailable += 1,
+            // A multi-source story that can't be synthesized faithfully is withheld and retried, never
+            // collapsed to one member's blurb (§3.7) — exactly like a cluster. Track the failure, escalate
+            // the seed next pass, and quarantine once the budget is spent (flagged for operator review;
+            // the story then slips out of digests until its membership/content moves).
+            SummaryOutcome::Failed(failure) => {
+                let (next_attempts, quarantine) =
+                    note_summary_failure("story", s.id, attempt, &failure);
+                if quarantine {
+                    stats.quarantined += 1;
+                } else {
+                    stats.failed += 1;
+                }
+                let sid = s.id;
+                let error = failure.describe();
+                with_scope(pool, ctx, move |conn| {
+                    Box::pin(async move {
+                        store::record_story_summary_failure(
+                            conn,
+                            sid,
+                            next_attempts,
+                            &error,
+                            quarantine,
+                        )
+                        .await
+                        .context("record story summary failure")
+                    })
+                })
+                .await?;
+            }
         }
     }
     Ok(stats)
@@ -1899,9 +2051,8 @@ pub async fn sweep_stories(
 /// to a readable one (stored on `thread.summary`, leaving `thread.label` as the baseline beneath) and
 /// composes the §5.2 delta flag from the stories that newly landed since `delta_through` — both from
 /// the precomputed story/cluster headlines, never raw events (§4). Best-effort: a per-thread failure
-/// keeps the deterministic label/count-delta and the pass continues. Only exists in a
-/// `llm-summarization` build.
-#[cfg(feature = "llm-summarization")]
+/// keeps the deterministic label/count-delta and the pass continues — a thread label is cosmetic
+/// context (§2.3), not a delivery gate.
 pub async fn sweep_thread_labels(
     pool: &sqlx::PgPool,
     subscriber_id: uuid::Uuid,
@@ -2282,15 +2433,19 @@ mod tests {
     }
 
     #[test]
-    fn baseline_is_true_and_uncertain() {
-        let b = baseline("Title here", 3, &["github", "slack"], Facts::default());
-        assert_eq!(b.headline, "Title here");
-        assert_eq!(b.tldr_text, "3 updates across github, slack.");
-        assert_eq!(b.band, Band::Uncertain);
-        assert!(!b.is_empty());
-
-        let single = baseline("T", 1, &["github"], Facts::default());
-        assert_eq!(single.tldr_text, "1 update from github.");
+    fn for_attempt_zero_is_unchanged_and_later_attempts_reseed() {
+        let base = SummarizationConfig::default();
+        // Attempt 0 keeps the deterministic base seed/temperature, so a first-try summary still hits
+        // the content-hash cache.
+        let a0 = base.for_attempt(0);
+        assert_eq!(a0.seed, base.seed);
+        assert_eq!(a0.temperature, base.temperature);
+        // A retry re-seeds (a deterministic gate rejection would otherwise reproduce itself) and nudges
+        // the temperature up, but stays well under 1.0.
+        let a1 = base.for_attempt(1);
+        assert_ne!(a1.seed, base.seed);
+        assert!(a1.temperature > base.temperature && a1.temperature <= 0.9);
+        assert_ne!(base.for_attempt(2).seed, a1.seed);
     }
 
     #[test]

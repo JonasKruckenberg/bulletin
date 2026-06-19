@@ -20,9 +20,9 @@ datasource (the dashboard exposes a `datasource` variable, so it isn't pinned to
 - **Digests / delivery** — outcomes, items per digest, pending, time-since-last-delivery,
   cadence mix.
 - **LLM summarization** — per-call latency (p50/p95/p99 by phase), call outcomes, token
-  throughput, faithfulness-gate rejections, and content-hash cache hit ratio. Empty unless the
-  binary is built with `--features llm-summarization`; the model edge (and these metrics) compile
-  out by default.
+  throughput, faithfulness-gate rejections, content-hash cache hit ratio, and (§3.7) tracked
+  summary failures + cluster/story quarantines. Always present: summarization is a mandatory part of
+  the pipeline (no cargo feature).
 
 ## Notes on the metrics
 
@@ -34,8 +34,8 @@ datasource (the dashboard exposes a `datasource` variable, so it isn't pinned to
   ride the next tick. Page on delivery/queue/freshness, not on build lag.
 - **Gauges refresh once per minute** (the cron tick calls `status::gather`). Range/rate windows
   should be ≥1m. If `bulletin_status_gather_failures_total` is climbing, the gauges are stale.
-- **The `bulletin_llm_*` series only exist in a `llm-summarization` build.** They are recorded from
-  `bulletin-core` at the single `chat_json` choke point all five `phase`s route through
+- **The `bulletin_llm_*` series are always present** (summarization is mandatory, §3.7). They are
+  recorded from `bulletin-core` at the single `chat_json` choke point all five `phase`s route through
   (`summarize` | `comprehend` | `synthesize` | `label` | `delta`). `bulletin_llm_call_duration_seconds`
   is keyed on `phase` + `outcome` — every call is timed, including failures, so **filter `outcome="ok"`
   for clean prompt latency** (an instant `connect` failure and a 120s `timeout` are in there too). The
@@ -62,5 +62,7 @@ datasource (the dashboard exposes a `datasource` variable, so it isn't pinned to
 | LLM sidecar unreachable | `sum(rate(bulletin_llm_call_duration_seconds_count{outcome=~"connect|timeout"}[10m])) / clamp_min(sum(rate(bulletin_llm_call_duration_seconds_count[10m])), 1) > 0.5` | 15m |
 
 Tune the "no deliveries" / "ingestion stalled" thresholds to your slowest cadence (weekly digests,
-slow feeds). The LLM-sidecar alert only fires where `llm-summarization` is deployed — skip it
-otherwise, since the series won't exist.
+slow feeds). The LLM-sidecar alert applies to every deployment now — summarization is mandatory (§3.7),
+so a sustained `connect`/`timeout` rate means digests are deferring (and clusters/stories quarantining),
+not just degrading. Consider also alerting on `bulletin_digest_lead_unavailable_total` (a window held
+back for want of an LLM lead) and `bulletin_llm_quarantined_total`.

@@ -49,6 +49,7 @@ cron        = "0.16"
 apalis          = { version = "=1.0.0-rc.9" }
 apalis-postgres = { version = "=1.0.0-rc.8" }
 apalis-cron     = { version = "=1.0.0-rc.8" }
+apalis-sql      = { version = "=1.0.0-rc.9" }  # TaskBuilderExt::max_attempts (per-job retry budget)
 anyhow      = "1"
 proptest    = "1"
 reqwest          = { version = "0.12", default-features = false, features = ["rustls-tls"] }

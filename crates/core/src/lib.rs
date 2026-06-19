@@ -10,9 +10,11 @@
 //!   subscriber's stories into persistent `Thread`s and a projected entity-weight map the digest's
 //!   relevance term reads (`docs/thread-layer.md`).
 //! - [`identity`] — tiered, probabilistic entity-identity resolution that feeds the thread layer.
-//! - [`summarize`] — write-side, best-effort LLM pre-summarization (Phase A: the content-hashed
-//!   `cluster.summary` foundation), behind the `llm-summarization` feature and degrading to a
-//!   deterministic baseline (`docs/llm-summarization.md`).
+//! - [`summarize`] — write-side LLM pre-summarization (Phase A: the content-hashed `cluster.summary`
+//!   foundation) and the on-path digest lead (Phase D). A mandatory part of the pipeline (§3.7): a
+//!   cluster ships only with a faithful, gate-passed summary and a digest never ships without an LLM
+//!   lead; failures are tracked errors with bounded escalating retries and quarantine
+//!   (`docs/llm-summarization.md`).
 //! - [`feedback`] — the append-only correction log (care/less, must/cannot-link).
 //!
 //! Each flow exposes a pure entry function over the DB; [`common`] holds the shared vocabulary.
