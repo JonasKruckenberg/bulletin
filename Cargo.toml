@@ -54,6 +54,10 @@ proptest    = "1"
 reqwest          = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 rss              = "2"
 atom_syndication = "0.12"
+# Feed bodies (`<description>` / `content:encoded` / Atom `<content>`) are HTML fragments; render them
+# to plain text at ingest so the summarizer's source corpus and the entity/number miners get real
+# context instead of tag soup (and the DB stores clean text). Well-maintained, html5ever-based.
+html2text        = { version = "0.17", default-features = false }
 lettre           = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "file-transport", "tokio1", "tokio1-rustls-tls"] }
 # Digest render hardening: HTML entity-encode untrusted feed/LLM text instead of hand-rolling it
 # (context-correct `encode_text` / `encode_double_quoted_attribute`), and WHATWG-parse feed links to

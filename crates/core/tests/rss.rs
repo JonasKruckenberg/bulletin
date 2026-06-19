@@ -13,6 +13,7 @@ const RSS_XML: &str = r#"<?xml version="1.0"?>
       <guid>https://example.com/post-1</guid>
       <title>Hello World</title>
       <link>https://example.com/post-1</link>
+      <description><![CDATA[<p>A <strong>bad config</strong> broke <a href="https://example.com/x">logins</a> for 12% of users.</p>]]></description>
       <pubDate>Mon, 09 Jun 2025 10:00:00 +0000</pubDate>
     </item>
     <item>
@@ -32,6 +33,7 @@ const ATOM_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
     <id>urn:example:atom-1</id>
     <title>Atom Entry</title>
     <link href="https://example.com/atom-1"/>
+    <content type="html"><![CDATA[<p>Release <b>v2.0</b> shipped.</p>]]></content>
     <updated>2025-06-09T10:00:00Z</updated>
   </entry>
 </feed>"#;
@@ -40,6 +42,7 @@ fn item(id: &str, title: &str, link: Option<&str>) -> RssItem {
     RssItem {
         id: id.into(),
         title: title.into(),
+        body: None,
         link: link.map(String::from),
         published: Some(Utc.with_ymd_and_hms(2025, 6, 9, 10, 0, 0).unwrap()),
     }
@@ -55,6 +58,50 @@ fn parse_rss_returns_items() {
     assert_eq!(items[0].link, Some("https://example.com/post-1".into()));
     assert_eq!(items[1].id, "https://example.com/post-2");
     assert_eq!(items[1].title, "Second Post");
+
+    // The HTML `<description>` is rendered to plain text: tags stripped, the number kept, and the
+    // link's URL dropped (we keep it in `links`, not pasted into prose for the summarizer to gate out).
+    let body = items[0].body.as_deref().expect("post-1 has a description");
+    assert!(body.contains("bad config broke"), "body was: {body:?}");
+    assert!(body.contains("12% of users"), "body was: {body:?}");
+    assert!(!body.contains('<'), "tags must be stripped: {body:?}");
+    assert!(
+        !body.contains("example.com"),
+        "link URL must not leak into prose: {body:?}"
+    );
+    // No `<description>`/`<content>` on the second item ⇒ no body.
+    assert_eq!(items[1].body, None);
+}
+
+#[test]
+fn parse_rss_caps_body_on_word_boundary() {
+    // A body well over the stored cap, of repeated whole words, so a correct truncation must land on a
+    // word boundary (never a split token like a half-number the miner would treat as grounded).
+    let long = "alpha ".repeat(500); // ~3000 chars of rendered text
+    let xml = format!(
+        r#"<?xml version="1.0"?>
+<rss version="2.0"><channel><title>t</title><link>https://e.com</link><description>d</description>
+<item><guid>g1</guid><title>T</title><link>https://e.com/1</link>
+<description><![CDATA[<p>{long}</p>]]></description></item>
+</channel></rss>"#
+    );
+    let items = parse_feed(xml.as_bytes()).unwrap();
+    let body = items[0]
+        .body
+        .as_deref()
+        .expect("item has a description body");
+
+    assert!(
+        body.chars().count() <= 2000,
+        "body must be capped, was {} chars",
+        body.chars().count()
+    );
+    // Cut on a whitespace boundary: the final token is a complete "alpha", with no trailing space.
+    assert!(
+        body.ends_with("alpha"),
+        "body must end on a whole word: {body:?}"
+    );
+    assert!(!body.ends_with(' '), "no dangling trailing space: {body:?}");
 }
 
 #[test]
@@ -65,6 +112,12 @@ fn parse_atom_returns_items() {
     assert_eq!(items[0].id, "urn:example:atom-1");
     assert_eq!(items[0].title, "Atom Entry");
     assert_eq!(items[0].link, Some("https://example.com/atom-1".into()));
+
+    // Atom `<content type="html">` is rendered to plain text the same way as RSS `<description>`.
+    let body = items[0].body.as_deref().expect("atom entry has content");
+    assert!(body.contains("Release"), "body was: {body:?}");
+    assert!(body.contains("v2.0"), "body was: {body:?}");
+    assert!(!body.contains('<'), "tags must be stripped: {body:?}");
 }
 
 #[test]
