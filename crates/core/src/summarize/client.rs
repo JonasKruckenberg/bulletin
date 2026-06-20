@@ -293,25 +293,33 @@ pub async fn delta_thread(
 pub async fn authored_lead(
     cfg: &SummarizationConfig,
     http: &reqwest::Client,
-    headlines: &[String],
+    dominant: &[String],
+    also: &[String],
     threads: &[String],
+    total_items: usize,
 ) -> LeadOutcome {
-    // The grounding the lead's numbers are checked against: the same headlines + thread labels it is
-    // composed from. A big-picture lead naturally cites a count ("…and 6 other updates"), so the digest's
-    // own item counts — the total and the "N others" (total − 1) — are grounded too; without them the
-    // §3.4 numeric gate would reject every count-bearing lead (the deterministic lead is built around one).
-    let total = headlines.len();
-    let mut grounding = headlines.join("\n");
+    // The grounding the lead's numbers are checked against: the headlines it was actually shown (the
+    // dominant + also tiers) + the thread labels it can name. A big-picture lead naturally cites a count
+    // ("…and 6 other updates"), so the digest's own item counts — the FULL selected total and the
+    // "N others" (total − 1) — are grounded too (the total is the whole selection, not just the tiers,
+    // since the long tail the model never saw still counts toward "N others"); without them the §3.4
+    // numeric gate would reject every count-bearing lead.
+    let mut grounding = dominant.join("\n");
+    grounding.push('\n');
+    grounding.push_str(&also.join("\n"));
     grounding.push('\n');
     grounding.push_str(&threads.join("\n"));
-    grounding.push_str(&format!("\n{total} {}", total.saturating_sub(1)));
+    grounding.push_str(&format!(
+        "\n{total_items} {}",
+        total_items.saturating_sub(1)
+    ));
 
     let out = chat_json::<LeadOutput>(
         cfg,
         http,
         "lead",
         LEAD_SYSTEM_PROMPT,
-        lead_user_prompt(headlines, threads),
+        lead_user_prompt(dominant, also, threads),
         cfg.headline_max_tokens + cfg.tldr_max_tokens,
         lead_schema(),
     )
