@@ -627,6 +627,40 @@ mod tests {
     }
 
     #[test]
+    fn shared_grounded_place_fuses_but_shared_topic_alone_does_not() {
+        // Phase 2: three outlets covering the same happening, each carrying only a per-publisher
+        // domain plus the SAME grounded place — they fuse into one story on the weak place edge (same
+        // day → corroborated). This is the motivating "warning shots in the English Channel" case.
+        let same_place = vec![
+            cluster(1, &["domain:bbc.com", "place:english-channel"], 1),
+            cluster(2, &["domain:reuters.com", "place:english-channel"], 1),
+            cluster(3, &["domain:guardian.com", "place:english-channel"], 1),
+        ];
+        assert_eq!(
+            link(&same_place, &[], minter()).stories.len(),
+            1,
+            "a shared grounded place is a weak link key — corroborated coverage must fuse"
+        );
+
+        // But two items sharing ONLY a broad `topic:` must NOT fuse — topic is non-linking
+        // (link_strength == None), or "everything about AI" collapses into one blob. They never even
+        // become a candidate pair (the blocking index skips non-linkable entities).
+        let same_topic = vec![
+            cluster(1, &["domain:bbc.com", "topic:artificial-intelligence"], 1),
+            cluster(
+                2,
+                &["domain:reuters.com", "topic:artificial-intelligence"],
+                1,
+            ),
+        ];
+        assert_eq!(
+            link(&same_topic, &[], minter()).stories.len(),
+            2,
+            "a shared topic must never fuse stories on its own"
+        );
+    }
+
+    #[test]
     fn weak_edge_links_when_corroborated_but_not_when_stale() {
         // Shared weak entity + same day → linked. Same shared entity but far apart → separate.
         let close = vec![

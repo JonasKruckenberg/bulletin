@@ -4,16 +4,20 @@
 //! repo, a user. The namespace prefix is load-bearing — it both keeps unrelated values from
 //! colliding (`user:rust` ≠ `repo:rust`) and classifies an entity as **strong** or **weak** for
 //! linking ([`link_strength`]): a shared *strong* key (a CVE or an exact URL) is a near-certain
-//! connection that may merge anything; a shared *weak* key (a domain, repo, or person) only links
-//! when corroborated by other signals (design §8.2's asymmetric-merge guard against single-linkage
-//! blobs).
+//! connection that may merge anything; a shared *weak* key (a domain, repo, person, place, or org)
+//! only links when corroborated by other signals (design §8.2's asymmetric-merge guard against
+//! single-linkage blobs).
 //!
-//! Two layers feed an event's entities:
+//! Three layers feed an event's entities:
 //! - **structural**, per source — the connector knows a GitHub event is `repo:`/`user:` (kept where
 //!   the source vocabulary lives, `ingest/github`).
 //! - **derived**, shared — [`derive`] mines CVE ids and URLs/domains out of any event's title, body,
 //!   and links, so every source gets the cross-source keys "for free" (design §8.2: "URLs and native
 //!   ids carry the load"). Run once at the seal point ([`super::event::EventBuilder::finalize`]).
+//! - **enriched**, shared — the Phase-2 best-effort LLM sweep ([`crate::enrich`]) mines grounded
+//!   `place:`/`org:`/`person:`/`topic:` tokens out of the title/body *before* the item is clustered,
+//!   so coverage of the same happening across publishers fuses on what it is ABOUT, not just a
+//!   per-feed `domain:`. Added asynchronously, never at the seal point (it must never block ingest).
 //!
 //! Hand-rolled (no `regex` dep) to match the project's lean-deps ethos; the patterns are narrow
 //! (CVE ids, `http(s)://` URLs) and unit-tested below.
@@ -24,18 +28,34 @@ pub enum LinkStrength {
     /// A shared `cve:`/`url:` — a near-certain connection that may merge anything (incl. two
     /// already-delivered stories, the retro-merge).
     Strong,
-    /// A shared distinctive named entity (`repo:`/`user:`) — links only when corroborated, and never
-    /// collapses two established stories (the asymmetric-merge guard).
+    /// A shared distinctive named entity (`repo:`/`user:`/`place:`/`org:`/`person:`) — links only when
+    /// corroborated, and never collapses two established stories (the asymmetric-merge guard).
     Weak,
 }
 
-/// How an entity participates in linking, or `None` if it is too coarse to link on. `domain:` is
-/// deliberately non-linking: every item from one feed shares its domain, so a shared domain is noise
-/// as an edge — it stays on the cluster for blocking/affinity (M4) but never forms a link by itself.
+/// How an entity participates in linking, or `None` if it is too coarse to link on.
+///
+/// `domain:` and `topic:` are deliberately **non-linking**:
+/// - `domain:` — every item from one feed shares its domain, so a shared domain is noise as an edge.
+/// - `topic:` — a broad subject tag (the Phase-2 enrichment, [`crate::enrich`]). It must never fuse
+///   stories on its own, or "everything about AI" collapses into one blob. Classified like `domain:`
+///   here, but *unlike* `domain:` it stays on the thread spine (Phase 0 drops only `domain:`/`url:`),
+///   so `topic:` shapes threads and affinity without ever forming a link.
+///
+/// Both still ride on the cluster for blocking/affinity (M4); they just never form a link by themselves.
+///
+/// The Phase-2 grounded named entities — `place:`/`org:`/`person:` — are **weak**, like `repo:`/`user:`:
+/// they corroborate (two outlets naming the same place/org in the same window fuse), but a single shared
+/// one can never collapse two already-delivered stories.
 pub fn link_strength(entity: &str) -> Option<LinkStrength> {
     if entity.starts_with("cve:") || entity.starts_with("url:") {
         Some(LinkStrength::Strong)
-    } else if entity.starts_with("repo:") || entity.starts_with("user:") {
+    } else if entity.starts_with("repo:")
+        || entity.starts_with("user:")
+        || entity.starts_with("place:")
+        || entity.starts_with("org:")
+        || entity.starts_with("person:")
+    {
         Some(LinkStrength::Weak)
     } else {
         None
@@ -162,6 +182,18 @@ mod tests {
         assert_eq!(link_strength("repo:acme/widget"), Some(Weak));
         assert_eq!(link_strength("user:alice"), Some(Weak));
         assert_eq!(link_strength("domain:example.com"), None);
+    }
+
+    #[test]
+    fn enriched_namespace_strengths() {
+        use LinkStrength::*;
+        // The Phase-2 grounded named entities corroborate but never collapse delivered stories.
+        assert_eq!(link_strength("place:english-channel"), Some(Weak));
+        assert_eq!(link_strength("org:royal-navy"), Some(Weak));
+        assert_eq!(link_strength("person:jane-smith"), Some(Weak));
+        // `topic:` is non-linking like `domain:` — it must never fuse stories on its own ("everything
+        // about AI" must not become one blob). It still rides on the spine; it just forms no edge.
+        assert_eq!(link_strength("topic:maritime-security"), None);
     }
 
     #[test]

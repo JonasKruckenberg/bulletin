@@ -10,6 +10,10 @@
 //!   subscriber's stories into persistent `Thread`s and a projected entity-weight map the digest's
 //!   relevance term reads (`docs/thread-layer.md`).
 //! - [`identity`] — tiered, probabilistic entity-identity resolution that feeds the thread layer.
+//! - [`enrich`] — Phase-2 best-effort LLM entity/topic enrichment: grounded `place:`/`org:`/`person:`/
+//!   `topic:` tokens mined per item *before* clustering, so cross-publisher coverage of one happening
+//!   fuses into one story/thread. Off the punctual path; a failed/disabled call leaves the item
+//!   fully usable with the entities it already has.
 //! - [`summarize`] — write-side LLM pre-summarization (Phase A: the content-hashed `cluster.summary`
 //!   foundation) and the on-path digest lead (Phase D). A mandatory part of the pipeline (§3.7): a
 //!   cluster ships only with a faithful, gate-passed summary and a digest never ships without an LLM
@@ -23,6 +27,7 @@
 pub mod cluster;
 pub mod common;
 pub mod digest;
+pub mod enrich;
 pub mod feedback;
 pub mod identity;
 pub mod ingest;

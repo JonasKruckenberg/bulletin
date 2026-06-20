@@ -161,7 +161,8 @@ async fn insert_public_from(
 
 /// Runs PublicBuild's core loop inline (the binary's `build::run`, minus the advisory lock).
 async fn build_all(pool: &PgPool) {
-    let (lo, hi) = build_bounds(pool).await.unwrap();
+    // No enrichment grace here: the test inserts events and builds them immediately (hwm = now()).
+    let (lo, hi) = build_bounds(pool, std::time::Duration::ZERO).await.unwrap();
     let groups = dirty_groups(pool, &Scope::Public, lo, hi).await.unwrap();
     for (source, group_key) in &groups {
         let events = list_group_events(pool, &Scope::Public, *source, group_key)

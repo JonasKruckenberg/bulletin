@@ -17,7 +17,7 @@ use tracing::Instrument;
 use ulid::Ulid;
 use uuid::Uuid;
 
-use bulletin_core::cluster::store::unbuilt_public_events_exist;
+use bulletin_core::cluster::store::public_build_due;
 use bulletin_core::digest::subscriber::due_subscribers;
 use bulletin_core::digest::DigestOutcome;
 use bulletin_core::ingest::store::due_connections;
@@ -198,7 +198,16 @@ async fn public_build(
     pool: Data<PgPool>,
 ) -> Result<(), BoxDynError> {
     traced("public_build", task_id, attempt, async move {
-        match bulletin_core::cluster::build(&pool).await {
+        let cfg = bulletin_core::summarize::SummarizationConfig::from_env();
+        // Phase 2: before clustering, run the best-effort entity-enrichment sweep so grounded
+        // place:/org:/person:/topic: tokens are on an event's entity set before it becomes
+        // cluster-eligible (and so drive story fusion). Never blocks/fails the build — a down/disabled
+        // sweep just leaves events with structural+derived entities, and the build's grace deadline
+        // (`cfg.enrich_grace`) ages them in regardless.
+        enrich_public(&pool, &cfg).await;
+        // `effective_enrich_grace()` is zero when enrichment is off, so disabling the pass restores the
+        // pre-Phase-2 build timing (hwm = now()) rather than deferring clustering for no benefit.
+        match bulletin_core::cluster::build(&pool, cfg.effective_enrich_grace()).await {
             Ok(Some(stats)) => {
                 tracing::info!(dirty_groups = stats.dirty_groups, "public build complete");
                 // Off the punctual path: summarize the public clusters whose content changed. Per-cluster
@@ -251,6 +260,26 @@ async fn fetch_articles(
         Ok(())
     })
     .await
+}
+
+/// Phase-2 public entity-enrichment sweep, run *before* the PublicBuild (the pre-cluster point): mine
+/// grounded `place:`/`org:`/`person:`/`topic:` tokens out of new items and union them onto each
+/// event's entities so cross-publisher coverage fuses into one story. Best-effort and never fatal — a
+/// failed/disabled/timed-out call leaves the item fully usable with the entities it already has; this
+/// only ever logs. The `BULLETIN_LLM_*` env configures the sidecar (URL/model) and the `ENRICH`/grace knobs.
+async fn enrich_public(pool: &PgPool, cfg: &bulletin_core::summarize::SummarizationConfig) {
+    match bulletin_core::enrich::sweep_public(pool, cfg).await {
+        Ok(stats) => tracing::info!(
+            enriched = stats.enriched,
+            failed = stats.failed,
+            entities_added = stats.entities_added,
+            "entity enrichment sweep complete"
+        ),
+        Err(e) => tracing::warn!(
+            error = %format!("{e:#}"),
+            "entity enrichment sweep failed (non-fatal)"
+        ),
+    }
 }
 
 /// Public cluster-summarization sweep, hung off a completed PublicBuild (the natural
@@ -510,8 +539,11 @@ async fn run_tick(pool: Data<PgPool>) -> Result<(), BoxDynError> {
         }
     }
 
-    // 2. New public events to cluster → PublicBuild (dedup: watermark gate + advisory lock).
-    if unbuilt_public_events_exist(&*pool).await? {
+    // 2. New public events to cluster (or still pending enrichment) → PublicBuild (dedup: watermark
+    //    gate + advisory lock). The gate is grace-aware so an already-enriched event sitting in the
+    //    Phase-2 grace window doesn't re-enqueue a no-op build + enrichment sweep every tick.
+    let grace = bulletin_core::summarize::SummarizationConfig::from_env().effective_enrich_grace();
+    if public_build_due(&*pool, grace).await? {
         tracing::debug!("tick: enqueuing public build");
         let mut storage: PostgresStorage<PublicBuildJob> = PostgresStorage::new(&pool);
         storage.push(PublicBuildJob).await?;

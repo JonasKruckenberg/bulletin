@@ -4,6 +4,8 @@
 
 pub mod store;
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
@@ -123,9 +125,15 @@ pub struct BuildStats {
 /// Runs in a single transaction holding a transaction-level advisory lock, so concurrent builds
 /// serialize (the loser returns `Ok(None)`) and the whole pass is atomic — a crash rolls back
 /// without advancing the watermark, leaving the events still due next tick. Processes the
-/// half-open ingest range `(built_through, now()]`: finds the groups it dirtied, recomputes each
-/// cluster's rollup over *all* its events, upserts, then advances to `now()`.
-pub async fn build(pool: &PgPool) -> Result<Option<BuildStats>> {
+/// half-open ingest range `(built_through, hwm]`: finds the groups it dirtied, recomputes each
+/// cluster's rollup over *all* its events, upserts, then advances to `hwm`.
+///
+/// `enrich_grace` is the Phase-2 cluster-eligibility deadline: the high watermark is `now() - grace`,
+/// so an event isn't clustered until it has aged past the grace window — by which point the
+/// best-effort enrichment sweep ([`crate::enrich`]) has either added its grounded entities or given
+/// up, and the event clusters with whatever entities it has. `Duration::ZERO` ⇒ `hwm = now()`, the
+/// pre-Phase-2 behavior (and the enrichment sweep itself is then a no-op, so nothing is delayed).
+pub async fn build(pool: &PgPool, enrich_grace: Duration) -> Result<Option<BuildStats>> {
     // PublicBuild runs in the no-subscriber RLS context: it can read and write only public rows, so
     // it physically cannot pull a private event into a public cluster (design §12).
     let mut tx = begin_scope(pool, ScopeCtx::NoSubscriber)
@@ -140,7 +148,7 @@ pub async fn build(pool: &PgPool) -> Result<Option<BuildStats>> {
         return Ok(None);
     }
 
-    let (built_through, hwm) = store::build_bounds(&mut *tx)
+    let (built_through, hwm) = store::build_bounds(&mut *tx, enrich_grace)
         .await
         .context("read build bounds")?;
     let groups = store::dirty_groups(&mut *tx, &Scope::Public, built_through, hwm)
