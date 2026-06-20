@@ -2398,7 +2398,11 @@ mod tests {
                 Some("12% of logins failed for 40m"),
                 // `url:`/`domain:` linking keys ride along on the event but must not reach the
                 // summarizer's referenceable facts (they'd only invite a rule-5 / UrlInProse rejection).
-                &["repo:acme/auth", "url:https://tagesschau.de/x", "domain:tagesschau.de"],
+                &[
+                    "repo:acme/auth",
+                    "url:https://tagesschau.de/x",
+                    "domain:tagesschau.de",
+                ],
             ),
             ev(
                 2,
@@ -2411,7 +2415,7 @@ mod tests {
         let facts = extract_facts(&events);
         // sorted + deduped, and the url:/domain: keys are filtered out of the summarizer's entity set.
         assert_eq!(facts.entities, vec!["repo:acme/auth", "user:dlewis"]);
-                                                                           // The miner keeps digit runs + glue punctuation (`%`), dropping unit-suffix letters: "40m" → "40".
+        // The miner keeps digit runs + glue punctuation (`%`), dropping unit-suffix letters: "40m" → "40".
         assert!(facts.numbers.contains(&"12%".to_string()));
         assert!(facts.numbers.contains(&"40".to_string()));
         assert!(facts.dates.contains(&"14:02".to_string())); // ':' → routed to dates
@@ -2650,7 +2654,11 @@ mod tests {
         s.rebuild_tldr_text();
         // Pre-defang: the gate would reject this outright (and, post-§3.7, withhold the cluster).
         assert!(matches!(
-            faithful(&s, &facts, "Outage tracked. status.claude.com note. The fix landed."),
+            faithful(
+                &s,
+                &facts,
+                "Outage tracked. status.claude.com note. The fix landed."
+            ),
             Err(GateViolation::UrlInProse(_))
         ));
 
@@ -2662,7 +2670,12 @@ mod tests {
         assert!(matches!(&s.tldr[1], TldrRun::Ref { entity, surface }
             if entity == "repo:acme/auth" && surface == "acme/auth"));
         // And the gate now passes — a true, link-inert line ships instead of nothing.
-        assert!(faithful(&s, &facts, "Outage tracked. status.claude.com note. The fix landed.").is_ok());
+        assert!(faithful(
+            &s,
+            &facts,
+            "Outage tracked. status.claude.com note. The fix landed."
+        )
+        .is_ok());
     }
 
     #[test]
@@ -2679,11 +2692,20 @@ mod tests {
         };
         s.rebuild_tldr_text();
         assert!(matches!(
-            faithful(&s, &Facts::default(), "Aid reaches Poland. The corridor stayed open."),
+            faithful(
+                &s,
+                &Facts::default(),
+                "Aid reaches Poland. The corridor stayed open."
+            ),
             Err(GateViolation::UrlInProse(_))
         ));
         s.defang_prose();
-        assert!(faithful(&s, &Facts::default(), "Aid reaches Poland. The corridor stayed open.").is_ok());
+        assert!(faithful(
+            &s,
+            &Facts::default(),
+            "Aid reaches Poland. The corridor stayed open."
+        )
+        .is_ok());
     }
 
     #[test]

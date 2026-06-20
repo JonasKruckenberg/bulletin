@@ -118,8 +118,7 @@ mod tests {
         // html2text wraps the anchor text in `[...]` and, with no whitespace around the tag in the
         // source, glues it to the neighbours: `coast.<a>tagesschau.de</a>The` would render as the single
         // token `coast.[tagesschau.de]The`. We de-glue it into clean, space-separated prose.
-        let html =
-            r#"<p>off the coast.<a href="https://tagesschau.de">tagesschau.de</a>The story continues.</p>"#;
+        let html = r#"<p>off the coast.<a href="https://tagesschau.de">tagesschau.de</a>The story continues.</p>"#;
         let out = render(html, 16_000, 2000).unwrap();
         assert_eq!(out, "off the coast. tagesschau.de The story continues.");
         // No mashed token survives.
