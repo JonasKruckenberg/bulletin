@@ -63,6 +63,23 @@ impl SourceKind {
             SourceKind::Github | SourceKind::Slack => false,
         }
     }
+
+    /// Every source kind — so callers can enumerate the vocabulary instead of hardcoding it. Kept in
+    /// declaration order; the `text_enum!`-derived `Ord` follows the same order.
+    pub const ALL: [SourceKind; 3] = [SourceKind::Rss, SourceKind::Github, SourceKind::Slack];
+
+    /// The source kinds with a fetchable article, as their `as_str()` text — the single source of
+    /// truth (derived from [`has_fetchable_article`](Self::has_fetchable_article)) for the
+    /// `ingest::fetch` work-queue SQL (`source = ANY(...)`), so adding a fetchable source flips one
+    /// `match` arm and every query follows, rather than editing scattered `source = 'rss'` literals.
+    pub fn fetchable_sources() -> Vec<&'static str> {
+        SourceKind::ALL
+            .iter()
+            .copied()
+            .filter(|s| s.has_fetchable_article())
+            .map(SourceKind::as_str)
+            .collect()
+    }
 }
 
 text_enum! {

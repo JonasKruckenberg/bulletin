@@ -517,13 +517,24 @@ async fn run_tick(pool: Data<PgPool>) -> Result<(), BoxDynError> {
         storage.push(PublicBuildJob).await?;
     }
 
-    // 2.5. Public events still wanting a full-text fetch → FetchArticles (dedup: work-queue gate).
-    //      Best-effort enrichment, decoupled from build/digest — an unfetched event just rides its
-    //      snippet until a later sweep lands the article (Phase 1).
+    // 2.5. Public events still wanting a full-text fetch → FetchArticles. Best-effort enrichment,
+    //      decoupled from build/digest — an unfetched event just rides its snippet until a later
+    //      sweep lands the article (Phase 1). Coalesced by a per-minute idempotency key so re-ticks
+    //      (and duplicate ticks across replicas) before the job runs collapse into one; the sweep
+    //      itself also takes an advisory lock, so even a piled-up duplicate no-ops instead of
+    //      double-fetching (mirroring PublicBuild's lock).
     if bulletin_core::ingest::fetch::events_needing_fetch_exist(&*pool).await? {
         tracing::debug!("tick: enqueuing article fetch");
         let mut storage: PostgresStorage<FetchArticlesJob> = PostgresStorage::new(&pool);
-        storage.push(FetchArticlesJob).await?;
+        let bucket = Utc::now().timestamp() / 60;
+        let task = TaskBuilder::new(FetchArticlesJob)
+            .with_idempotency_key(format!("fetch_articles:{bucket}"))
+            .build();
+        match storage.push_task(task).await {
+            Ok(()) => {}
+            Err(e) if is_duplicate_enqueue(&e) => {}
+            Err(e) => return Err(e.into()),
+        }
     }
 
     // 3. Subscribers due → GenerateDigest (dedup: apalis idempotency key). No build gate — the

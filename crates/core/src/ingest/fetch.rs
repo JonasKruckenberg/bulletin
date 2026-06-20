@@ -9,23 +9,27 @@
 //!
 //! **Off the hot path, by contract.** Fetching is a due-gated background sweep ([`sweep_article_fetch`]),
 //! run from its own apalis job exactly like the summarization sweep — never inline in the
-//! poll/cluster/digest/send path. "Fall behind, never wrong": a slow or unreachable site delays only
+//! poll/cluster/digest/send path, and serialized by an advisory lock so duplicate/overlapping jobs
+//! no-op (mirroring PublicBuild). "Fall behind, never wrong": a slow or unreachable site delays only
 //! the *enrichment*, never a punctual digest, and a per-event failure is recorded (with a bounded
 //! retry budget) and simply skipped.
 //!
 //! **Security — this is outbound fetch of attacker-influenced URLs (feed-supplied links).** Every
-//! request is SSRF-guarded ([`fetch_article`]): the scheme must be http(s); the host is DNS-resolved
-//! and rejected if it lands on any loopback/private/link-local/ULA/CGNAT/multicast/reserved range
-//! (v4 + v6, including IPv4-mapped v6); the validated IPs are pinned into the request's resolver to
-//! blunt DNS-rebinding; and **every redirect hop is re-validated**, not just the first URL. A
-//! response-size cap, a request timeout, and a `text/html` content-type allowlist bound what one
-//! fetch can pull. Per-domain politeness (a per-sweep cap + a min-interval) keeps us a good citizen.
+//! request is SSRF-guarded ([`fetch_article`]): the scheme must be http(s); each hop's host is
+//! validated up front (IP literals directly, names by DNS) and rejected if it lands on any
+//! loopback/private/link-local/ULA/CGNAT/multicast/reserved range (v4 + v6, including IPv4-mapped and
+//! NAT64/6to4-embedded v4); **every redirect hop is re-validated**, not just the first URL; and the
+//! shared client's own [`SafeResolver`] re-checks the address actually connected to, closing the
+//! DNS-rebinding (TOCTOU) window for name hosts. A response-size cap, a request timeout, and a
+//! `text/html` content-type allowlist bound what one fetch can pull. Per-domain politeness (a
+//! per-sweep cap) plus bounded fetch concurrency keep us a good citizen.
 //!
-//! Deferred: `robots.txt` is **not** consulted yet. The per-domain rate limit and the conservative
-//! defaults are the interim politeness; honoring `robots.txt` (and `Crawl-delay`) is a follow-up.
+//! Deferred: `robots.txt` is **not** consulted yet. The per-domain cap and conservative defaults are
+//! the interim politeness; honoring `robots.txt` (and `Crawl-delay`) is a follow-up.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sqlx::{postgres::PgRow, PgConnection, Row};
@@ -35,10 +39,16 @@ use uuid::Uuid;
 use crate::common::kind::SourceKind;
 use crate::common::scope::Scope;
 
-/// Consecutive fetch attempts after which an event drops out of the work queue (a permanently
-/// unfetchable link — 404, blocked host, persistent timeout — must not burn the sweep every pass).
-/// A content change does not reset this; the link is fixed for the life of the event.
+/// Consecutive fetch attempts after which an event drops out of the work queue. A *transient* failure
+/// (DNS blip, 5xx, timeout) bumps the counter by one and is retried; a *permanent* one (bad scheme,
+/// blocked host, 4xx, oversize) spends the whole budget at once ([`FetchError::is_permanent`]), so a
+/// dead link doesn't re-burn the sweep. A content change does not reset this; the link is fixed for
+/// the life of the event.
 pub const MAX_FETCH_ATTEMPTS: i16 = 3;
+
+/// A 64-bit key for the fetch-sweep session advisory lock — distinct from the build lock. Serializes
+/// fetch sweeps across replicas/piled-up jobs so a duplicate no-ops instead of double-fetching.
+const FETCH_LOCK_KEY: i64 = 0x6275_6c6c_6574_6e02; // "bulletn\x02"
 
 /// The `bulletin_fetch_*` metrics for the article-fetch path — thin recorders so the metric-name
 /// strings live in one place, mirroring [`summarize::metric`](crate::summarize). The Prometheus
@@ -83,8 +93,10 @@ pub struct FetchConfig {
     pub max_per_sweep: i64,
     /// Max fetches to any single domain in one sweep (politeness — don't hammer one origin).
     pub max_per_domain_per_sweep: usize,
-    /// Minimum wall-clock gap between two fetches to the *same* domain in a sweep (politeness).
-    pub per_domain_min_interval: Duration,
+    /// Max concurrent in-flight fetches in a sweep. Bounds outbound load and keeps one slow/timing-out
+    /// origin from serializing the whole pass, while staying polite (with the per-domain cap, at most
+    /// that many hit one origin at once).
+    pub max_concurrent_fetches: usize,
     /// `User-Agent` sent on every request — identifies the fetcher to the origin.
     pub user_agent: String,
     /// Max stored article text (chars). Richer than the RSS snippet cap, but still bounded so DB rows
@@ -103,7 +115,7 @@ impl Default for FetchConfig {
             max_redirects: 5,
             max_per_sweep: 100,
             max_per_domain_per_sweep: 5,
-            per_domain_min_interval: Duration::from_secs(1),
+            max_concurrent_fetches: 4,
             user_agent: "bulletin/0.1 (+article-fetch)".to_string(),
             full_text_max_chars: 8000,
             max_html_chars: 200_000,
@@ -135,6 +147,13 @@ impl FetchConfig {
             if let Ok(n) = v.trim().parse::<i64>() {
                 if n > 0 {
                     cfg.max_per_sweep = n;
+                }
+            }
+        }
+        if let Ok(v) = std::env::var("BULLETIN_FETCH_MAX_CONCURRENT") {
+            if let Ok(n) = v.trim().parse::<usize>() {
+                if n > 0 {
+                    cfg.max_concurrent_fetches = n;
                 }
             }
         }
@@ -170,7 +189,9 @@ pub enum FetchError {
     TooLarge,
     /// The page rendered to no usable text.
     Empty,
-    /// A transport/protocol error (connect, TLS, read).
+    /// A transport/protocol error (connect, TLS, read) — also the surfaced outcome when the shared
+    /// client's [`SafeResolver`] refuses every resolved address for a name host (defense-in-depth
+    /// rebinding guard, in addition to the up-front [`BlockedAddress`](Self::BlockedAddress) check).
     Transport(String),
 }
 
@@ -189,6 +210,28 @@ impl FetchError {
             FetchError::Transport(_) => "transport",
         }
     }
+
+    /// Whether retrying this failure on a later sweep is pointless — the link/content won't change.
+    /// Permanent failures spend the whole retry budget at once (the dead/disallowed link drops out of
+    /// the work queue immediately rather than re-failing identically for `MAX_FETCH_ATTEMPTS` sweeps);
+    /// transient ones (DNS blips, 5xx, timeouts, connection errors) keep their per-sweep retries so a
+    /// momentarily-flaky-but-live article is not abandoned on the first stumble.
+    pub fn is_permanent(&self) -> bool {
+        match self {
+            FetchError::BadScheme
+            | FetchError::BlockedAddress
+            | FetchError::DisallowedContentType(_)
+            | FetchError::TooLarge
+            | FetchError::Empty
+            | FetchError::TooManyRedirects => true,
+            // 4xx won't change on retry, except the explicitly-retryable 408 (Request Timeout) and 429
+            // (Too Many Requests); 5xx are transient.
+            FetchError::BadStatus(code) => {
+                (400..500).contains(code) && *code != 408 && *code != 429
+            }
+            FetchError::DnsFailure | FetchError::Transport(_) => false,
+        }
+    }
 }
 
 impl std::fmt::Display for FetchError {
@@ -204,15 +247,23 @@ impl std::fmt::Display for FetchError {
 
 /// Is this IP one a public-internet fetch must never connect to? Blocks the SSRF surface: loopback,
 /// private, link-local, CGNAT/shared, multicast/broadcast, documentation, and reserved ranges, for
-/// both v4 and v6 (IPv4-mapped/compatible v6 is unwrapped and re-checked as v4). The single decision
-/// every resolved address — first URL and every redirect hop — is run through.
+/// both v4 and v6. Any v6 form that *embeds* a v4 address (IPv4-mapped/compatible, NAT64, 6to4) is
+/// unwrapped and re-checked as v4, so an internal v4 host can't be reached through a v6 representation.
+/// The single decision every resolved address — first URL and every redirect hop — is run through.
 fn is_disallowed_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_disallowed_v4(v4),
         IpAddr::V6(v6) => {
-            // An IPv4 embedded in a v6 address (::ffff:a.b.c.d mapped, or ::a.b.c.d compatible) reaches
-            // the same v4 host — unwrap and apply the v4 rules so e.g. ::ffff:127.0.0.1 is blocked.
+            // ::ffff:a.b.c.d (mapped) and ::a.b.c.d (compatible) reach the same v4 host.
             if let Some(v4) = v6.to_ipv4() {
+                if is_disallowed_v4(v4) {
+                    return true;
+                }
+            }
+            // NAT64 (64:ff9b::/96 well-known, and the 64:ff9b:1::/48 local-use prefix) and 6to4
+            // (2002::/16) also carry an embedded v4 that `to_ipv4` does not unwrap — extract it from
+            // its standard position and re-check, so e.g. the NAT64 form of 127.0.0.1 is blocked too.
+            if let Some(v4) = embedded_v4(v6) {
                 if is_disallowed_v4(v4) {
                     return true;
                 }
@@ -248,6 +299,32 @@ fn is_disallowed_v6(ip: Ipv6Addr) -> bool {
         || (seg[0] == 0x2001 && seg[1] == 0x0db8) // 2001:db8::/32 documentation
 }
 
+/// Extract the IPv4 address embedded in a transition-mechanism v6 address that `Ipv6Addr::to_ipv4`
+/// does not unwrap: NAT64 (`64:ff9b::/96` and `64:ff9b:1::/48`) carries it in the low 32 bits, 6to4
+/// (`2002::/16`) in segments 1–2. `None` for any other address. Used by [`is_disallowed_ip`] to
+/// re-check the embedded host against the v4 rules, closing a v6-representation SSRF bypass.
+fn embedded_v4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    let s = ip.segments();
+    let from = |hi: u16, lo: u16| {
+        Ipv4Addr::new(
+            (hi >> 8) as u8,
+            (hi & 0xff) as u8,
+            (lo >> 8) as u8,
+            (lo & 0xff) as u8,
+        )
+    };
+    if s[0] == 0x0064 && s[1] == 0xff9b {
+        // NAT64: embedded v4 is the final 32 bits (well-known /96; the /48 local-use prefix places it
+        // there too for the common case we care about — an internal-v4 target).
+        Some(from(s[6], s[7]))
+    } else if s[0] == 0x2002 {
+        // 6to4: embedded v4 is segments 1–2.
+        Some(from(s[1], s[2]))
+    } else {
+        None
+    }
+}
+
 /// The Content-Type allowlist for an article fetch: HTML only. The header's parameters (`; charset=…`)
 /// are dropped and the type compared case-insensitively. A page served as anything else (PDF, image,
 /// JSON, octet-stream) is rejected rather than fed to the HTML renderer.
@@ -261,29 +338,26 @@ fn is_allowed_content_type(ct: &str) -> bool {
     essence == "text/html" || essence == "application/xhtml+xml"
 }
 
-/// Resolve a parsed URL to the set of IP addresses it would connect to, rejecting non-http(s) and
-/// applying the SSRF range checks. For an IP-literal host the address is validated directly (no DNS);
-/// for a domain it is looked up. Returns `(ips, port, pin_domain)` — `pin_domain` is `Some(domain)`
-/// only for a name host, so the caller can pin the validated IPs into the request resolver.
-async fn resolve_and_validate(url: &Url) -> Result<(Vec<IpAddr>, u16, Option<String>), FetchError> {
+/// Validate that a parsed URL's host is safe to connect to: reject a non-http(s) scheme, and reject
+/// the host if any address it resolves to is in a blocked range. IP-literal hosts are checked directly
+/// (no DNS); name hosts are looked up. Returns a clean [`FetchError`] (and so a precise metric/log)
+/// per hop, *before* the request — the shared client's [`SafeResolver`] then re-validates the actual
+/// connect address as defense-in-depth against DNS rebinding.
+async fn validate_url(url: &Url) -> Result<(), FetchError> {
     if !matches!(url.scheme(), "http" | "https") {
         return Err(FetchError::BadScheme);
     }
     let port = url.port_or_known_default().ok_or(FetchError::BadScheme)?;
     let host = url.host().ok_or(FetchError::BadScheme)?;
 
-    let (ips, pin): (Vec<IpAddr>, Option<String>) = match host {
-        url::Host::Ipv4(ip) => (vec![IpAddr::V4(ip)], None),
-        url::Host::Ipv6(ip) => (vec![IpAddr::V6(ip)], None),
-        url::Host::Domain(domain) => {
-            let domain = domain.to_string();
-            let resolved: Vec<IpAddr> = tokio::net::lookup_host((domain.as_str(), port))
-                .await
-                .map_err(|_| FetchError::DnsFailure)?
-                .map(|sa| sa.ip())
-                .collect();
-            (resolved, Some(domain))
-        }
+    let ips: Vec<IpAddr> = match host {
+        url::Host::Ipv4(ip) => vec![IpAddr::V4(ip)],
+        url::Host::Ipv6(ip) => vec![IpAddr::V6(ip)],
+        url::Host::Domain(domain) => tokio::net::lookup_host((domain, port))
+            .await
+            .map_err(|_| FetchError::DnsFailure)?
+            .map(|sa| sa.ip())
+            .collect(),
     };
 
     if ips.is_empty() {
@@ -294,38 +368,65 @@ async fn resolve_and_validate(url: &Url) -> Result<(Vec<IpAddr>, u16, Option<Str
     if ips.iter().copied().any(is_disallowed_ip) {
         return Err(FetchError::BlockedAddress);
     }
-    Ok((ips, port, pin))
+    Ok(())
+}
+
+/// A reqwest DNS resolver that drops every disallowed address ([`is_disallowed_ip`]) before reqwest
+/// connects, returning an error when nothing safe remains. Installed on the shared fetch client so the
+/// address actually dialed for a *name* host is always one we validated — closing the DNS-rebinding
+/// (TOCTOU) gap between the up-front [`validate_url`] check and the connect, with a single reusable
+/// client rather than a per-host pinned one. (IP-literal hosts bypass the resolver, so they are
+/// guarded only by the up-front check — which is why that check is kept.)
+struct SafeResolver;
+
+impl reqwest::dns::Resolve for SafeResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let host = name.as_str().to_owned();
+            // Port 0: reqwest applies the URL's port to the returned addrs (documented behavior).
+            let resolved = tokio::net::lookup_host((host.as_str(), 0u16)).await?;
+            let safe: Vec<SocketAddr> = resolved.filter(|sa| !is_disallowed_ip(sa.ip())).collect();
+            if safe.is_empty() {
+                return Err(format!("blocked or unresolvable host: {host}").into());
+            }
+            Ok(Box::new(safe.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// Build the one HTTP client a sweep reuses across every event and redirect hop (connection pool / TLS
+/// cache amortized), with redirects disabled (we follow them manually to re-validate each hop) and the
+/// [`SafeResolver`] enforcing SSRF at connect time. Mirrors `summarize::build_summarize_http` — client
+/// construction in one place.
+fn build_fetch_http(cfg: &FetchConfig) -> Result<reqwest::Client, FetchError> {
+    reqwest::Client::builder()
+        .timeout(cfg.request_timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(cfg.user_agent.clone())
+        .dns_resolver(Arc::new(SafeResolver))
+        .build()
+        .map_err(|e| FetchError::Transport(e.to_string()))
 }
 
 // ── The fetch (async, network) ─────────────────────────────────────────────────────────────────────
 
-/// Fetch and extract the readable article text at `raw_url`, SSRF-guarding every hop. Returns the
-/// extracted plain text on success, or a [`FetchError`] describing the rejection/failure. Pure of the
-/// DB; the sweep persists the result.
+/// Fetch and extract the readable article text at `raw_url` over the shared `client`, SSRF-guarding
+/// every hop. Returns the extracted plain text on success, or a [`FetchError`] describing the
+/// rejection/failure. Pure of the DB; the sweep persists the result.
 ///
-/// Redirects are followed manually (reqwest's own redirect handling is disabled) so each hop's target
-/// is re-resolved and re-validated *before* it is connected — the first URL passing the guard is not
-/// enough, since a `Location` can point at `127.0.0.1`. The validated IPs are pinned into a per-hop
-/// client's resolver so the address reqwest connects to is the one we checked (DNS-rebinding guard).
-pub async fn fetch_article(cfg: &FetchConfig, raw_url: &str) -> Result<String, FetchError> {
+/// Redirects are followed manually (the client's own redirect handling is disabled) so each hop's
+/// target is re-validated *before* it is connected — the first URL passing the guard is not enough,
+/// since a `Location` can point at `127.0.0.1`. The client's [`SafeResolver`] additionally re-checks
+/// the connect address for name hosts (DNS-rebinding guard).
+pub async fn fetch_article(
+    client: &reqwest::Client,
+    cfg: &FetchConfig,
+    raw_url: &str,
+) -> Result<String, FetchError> {
     let mut url = Url::parse(raw_url).map_err(|_| FetchError::BadScheme)?;
 
     for _hop in 0..=cfg.max_redirects {
-        let (ips, port, pin) = resolve_and_validate(&url).await?;
-
-        let mut builder = reqwest::Client::builder()
-            .timeout(cfg.request_timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent(cfg.user_agent.clone());
-        // Pin the validated addresses for a name host so reqwest connects to exactly what we checked,
-        // not a freshly (and possibly rebound) re-resolution. IP-literal hosts need no pin.
-        if let Some(domain) = &pin {
-            let addrs: Vec<SocketAddr> = ips.iter().map(|ip| SocketAddr::new(*ip, port)).collect();
-            builder = builder.resolve_to_addrs(domain, &addrs);
-        }
-        let client = builder
-            .build()
-            .map_err(|e| FetchError::Transport(e.to_string()))?;
+        validate_url(&url).await?;
 
         let resp = client
             .get(url.as_str())
@@ -380,7 +481,8 @@ pub async fn fetch_article(cfg: &FetchConfig, raw_url: &str) -> Result<String, F
 
 /// Stream a response body into a string, aborting with [`FetchError::TooLarge`] the moment the running
 /// byte count would exceed `max_bytes` — so a lying/absent `Content-Length` can't make us buffer an
-/// unbounded body. Decoded lossily (article HTML is text; a stray invalid byte shouldn't fail it).
+/// unbounded body. Decodes with `from_utf8` and only falls back to a lossy copy on invalid input, so
+/// the common valid-UTF-8 path takes the buffer by value without a second full allocation.
 async fn read_capped(mut resp: reqwest::Response, max_bytes: usize) -> Result<String, FetchError> {
     let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = resp
@@ -393,7 +495,8 @@ async fn read_capped(mut resp: reqwest::Response, max_bytes: usize) -> Result<St
         }
         buf.extend_from_slice(&chunk);
     }
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    Ok(String::from_utf8(buf)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
 }
 
 // ── Store contract (the fetch work queue + write-back) ──────────────────────────────────────────────
@@ -411,11 +514,12 @@ pub async fn events_needing_fetch_exist(
             WHERE scope_kind = 'public'
               AND full_text IS NULL
               AND full_text_attempts < $1
-              AND source = 'rss'
+              AND source = ANY($2)
               AND array_length(links, 1) >= 1
          ) AS pending",
     )
     .bind(MAX_FETCH_ATTEMPTS)
+    .bind(SourceKind::fetchable_sources())
     .fetch_one(executor)
     .await?;
     Ok(row.get("pending"))
@@ -431,8 +535,8 @@ struct FetchTarget {
 }
 
 /// The fetch work queue in `scope`: fetchable-source events with a link, no `full_text` yet, and retry
-/// budget left. Newest-first, bounded by `limit` so one pass drains a slice. (Only RSS is fetchable
-/// today — see [`SourceKind::has_fetchable_article`]; the `source = 'rss'` filter is the SQL mirror.)
+/// budget left. Newest-first, bounded by `limit` so one pass drains a slice. The fetchable-source set
+/// is driven by [`SourceKind::fetchable_sources`], the single typed source of truth.
 async fn due_events_for_fetch(
     conn: &mut PgConnection,
     scope: &Scope,
@@ -445,14 +549,15 @@ async fn due_events_for_fetch(
          WHERE scope_kind = $1 AND scope_subscriber_id IS NOT DISTINCT FROM $2
            AND full_text IS NULL
            AND full_text_attempts < $3
-           AND source = 'rss'
+           AND source = ANY($4)
            AND array_length(links, 1) >= 1
          ORDER BY ingest_time DESC
-         LIMIT $4",
+         LIMIT $5",
     )
     .bind(scope_kind)
     .bind(scope_subscriber_id)
     .bind(MAX_FETCH_ATTEMPTS)
+    .bind(SourceKind::fetchable_sources())
     .bind(limit)
     .try_map(|row: PgRow| {
         Ok(FetchTarget {
@@ -467,11 +572,12 @@ async fn due_events_for_fetch(
 }
 
 /// Persist a successful fetch: set `full_text` (+ provenance), bump the attempt counter, and nudge the
-/// event's cluster (if already built) back into the summarization work queue by bumping its
-/// `updated_at` — so a fetch that lands *after* the cluster was first summarized off the snippet
-/// re-summarizes off the richer text (the `summary_hash` staleness gate then confirms the content
-/// actually moved). A not-yet-built cluster needs no nudge: it'll summarize with `full_text` already
-/// present. Runs in the cluster's scope context (public sweep → no-subscriber).
+/// event's cluster (if already built) back into the summarization work queue via
+/// [`cluster::store::touch_group`](crate::cluster::store::touch_group) — so a fetch that lands *after*
+/// the cluster was first summarized off the snippet re-summarizes off the richer text (the
+/// `summary_hash` staleness gate then confirms the content actually moved). A not-yet-built cluster
+/// needs no nudge: it'll summarize with `full_text` already present. Runs in the cluster's scope
+/// context (public sweep → no-subscriber).
 async fn store_full_text(
     conn: &mut PgConnection,
     id: Uuid,
@@ -490,29 +596,30 @@ async fn store_full_text(
     .execute(&mut *conn)
     .await?;
 
-    let (scope_kind, scope_subscriber_id) = scope.to_columns();
-    sqlx::query(
-        "UPDATE cluster SET updated_at = now()
-         WHERE scope_kind = $1 AND scope_subscriber_id IS NOT DISTINCT FROM $2
-           AND source = $3 AND group_key = $4",
-    )
-    .bind(scope_kind)
-    .bind(scope_subscriber_id)
-    .bind(source)
-    .bind(group_key)
-    .execute(&mut *conn)
-    .await?;
-    Ok(())
+    crate::cluster::store::touch_group(&mut *conn, scope, source, group_key).await
 }
 
-/// Record a failed fetch attempt: bump the counter (leaving `full_text` NULL) so the event is retried
-/// next sweep until the budget ([`MAX_FETCH_ATTEMPTS`]) is spent, after which it drops out of the work
-/// queue and stays at its snippet — a fetch failure is never fatal to summarization.
-async fn record_fetch_failure(conn: &mut PgConnection, id: Uuid) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE event SET full_text_attempts = full_text_attempts + 1 WHERE id = $1")
-        .bind(id)
-        .execute(conn)
-        .await?;
+/// Record a failed fetch attempt (leaving `full_text` NULL). A `permanent` failure spends the whole
+/// budget at once so the dead/disallowed link drops out of the work queue immediately; a transient one
+/// bumps the counter by one and is retried next sweep until [`MAX_FETCH_ATTEMPTS`] is spent. Either
+/// way a fetch failure is never fatal to summarization — the event stays at its snippet.
+async fn record_fetch_failure(
+    conn: &mut PgConnection,
+    id: Uuid,
+    permanent: bool,
+) -> Result<(), sqlx::Error> {
+    if permanent {
+        sqlx::query("UPDATE event SET full_text_attempts = $2 WHERE id = $1")
+            .bind(id)
+            .bind(MAX_FETCH_ATTEMPTS)
+            .execute(conn)
+            .await?;
+    } else {
+        sqlx::query("UPDATE event SET full_text_attempts = full_text_attempts + 1 WHERE id = $1")
+            .bind(id)
+            .execute(conn)
+            .await?;
+    }
     Ok(())
 }
 
@@ -531,15 +638,52 @@ pub struct FetchStats {
 }
 
 /// Run a best-effort full-text fetch sweep over **public** fetchable-source events, in the
-/// no-subscriber RLS context (RSS is public-only, so there is no private counterpart). For each due
-/// event it picks the first valid http(s) link, applies per-domain politeness, fetches with the SSRF
-/// guard, and stores the text (nudging the cluster to re-summarize) or records the failure. The sweep
-/// never errors as a whole — a per-event failure is tracked and skipped, exactly like the
-/// summarization sweep's per-cluster failures (§3.7 spirit).
+/// no-subscriber RLS context (RSS is public-only, so there is no private counterpart).
+///
+/// Serialized by a session advisory lock: if another sweep already holds it (a piled-up duplicate
+/// job, or a concurrent replica), this one no-ops with empty stats rather than double-fetching and
+/// double-spending retry budgets — the same protection PublicBuild gets from its build lock. The lock
+/// is released on the normal and error paths; a hard panic in the body would leak it until the worker
+/// process exits (only the *enrichment* path is affected, never digests).
 pub async fn sweep_article_fetch(
     pool: &sqlx::PgPool,
     cfg: &FetchConfig,
 ) -> anyhow::Result<FetchStats> {
+    use anyhow::Context;
+
+    let mut lock_conn = pool
+        .acquire()
+        .await
+        .context("acquire fetch-lock connection")?;
+    let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(FETCH_LOCK_KEY)
+        .fetch_one(lock_conn.as_mut())
+        .await
+        .context("acquire fetch sweep lock")?;
+    if !locked {
+        tracing::debug!("article fetch sweep already in progress; skipping");
+        return Ok(FetchStats::default());
+    }
+
+    let result = run_sweep(pool, cfg).await;
+
+    // Release the session lock (best-effort: a failure to unlock is logged, not surfaced over the
+    // sweep result, and the lock would in any case clear when this connection's session ends).
+    if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(FETCH_LOCK_KEY)
+        .execute(lock_conn.as_mut())
+        .await
+    {
+        tracing::warn!(error = %e, "failed to release article fetch sweep lock");
+    }
+    result
+}
+
+/// The locked sweep body: load the work queue, apply the per-domain cap (a cheap sequential pre-pass),
+/// then fetch the survivors with bounded concurrency, writing each result back as it lands. Never
+/// errors as a whole — a per-event fetch or write-back failure is tracked and skipped, exactly like
+/// the summarization sweep's per-cluster failures (§3.7 spirit).
+async fn run_sweep(pool: &sqlx::PgPool, cfg: &FetchConfig) -> anyhow::Result<FetchStats> {
     use crate::common::db::{with_scope, ScopeCtx};
     use anyhow::Context;
 
@@ -562,24 +706,25 @@ pub async fn sweep_article_fetch(
     tracing::debug!(due = due.len(), "article fetch sweep starting");
 
     let mut stats = FetchStats::default();
-    let mut domain_counts: HashMap<String, usize> = HashMap::new();
-    let mut domain_last: HashMap<String, Instant> = HashMap::new();
 
+    // Sequential pre-pass: pick each event's candidate link and apply the per-domain cap (cheap, no
+    // network), so the concurrent stage only fetches the survivors. An event with no usable link is a
+    // permanent failure (a malformed link won't fix itself) and is dropped now.
+    let mut domain_counts: HashMap<String, usize> = HashMap::new();
+    let mut to_fetch: Vec<(Uuid, SourceKind, String, String, String)> = Vec::new();
     for target in due {
-        // The work-queue SQL filters to `source = 'rss'`; this ties that string filter back to the
-        // typed contract ([`SourceKind::has_fetchable_article`]) so the two can't silently diverge.
+        // The work-queue SQL filters to fetchable sources; this ties that filter back to the typed
+        // contract ([`SourceKind::has_fetchable_article`]) so the two can't silently diverge.
         debug_assert!(
             target.source.has_fetchable_article(),
             "fetch work queue returned a non-fetchable source"
         );
-        // The first parseable http(s) link is the article candidate.
         let Some((link, domain)) = first_fetchable_link(&target.links) else {
-            // No usable link — burn an attempt so a malformed-link event eventually drops out.
             metric::attempt("no_link", Duration::ZERO);
             let id = target.id;
             let _ = with_scope(pool, ctx, move |conn| {
                 Box::pin(async move {
-                    record_fetch_failure(conn, id)
+                    record_fetch_failure(conn, id, true)
                         .await
                         .context("record fetch failure (no link)")
                 })
@@ -589,7 +734,6 @@ pub async fn sweep_article_fetch(
             continue;
         };
 
-        // Per-domain politeness: a per-sweep cap, then a min-interval since this domain's last fetch.
         let count = domain_counts.entry(domain.clone()).or_insert(0);
         if *count >= cfg.max_per_domain_per_sweep {
             metric::skipped();
@@ -597,59 +741,88 @@ pub async fn sweep_article_fetch(
             continue;
         }
         *count += 1;
-        if let Some(last) = domain_last.get(&domain) {
-            let elapsed = last.elapsed();
-            if elapsed < cfg.per_domain_min_interval {
-                tokio::time::sleep(cfg.per_domain_min_interval - elapsed).await;
-            }
-        }
-        domain_last.insert(domain.clone(), Instant::now());
+        to_fetch.push((target.id, target.source, target.group_key, link, domain));
+    }
 
-        let started = Instant::now();
-        let outcome = fetch_article(cfg, &link).await;
-        let elapsed = started.elapsed();
-        match outcome {
-            Ok(text) => {
-                metric::attempt("ok", elapsed);
-                tracing::debug!(
-                    event_id = %target.id,
-                    %domain,
-                    chars = text.chars().count(),
-                    elapsed_ms = elapsed.as_millis() as u64,
-                    "article fetched"
-                );
-                let scope = scope.clone();
-                let id = target.id;
-                let source = target.source;
-                let group_key = target.group_key.clone();
-                with_scope(pool, ctx, move |conn| {
-                    Box::pin(async move {
-                        store_full_text(conn, id, source, &group_key, &scope, &text)
-                            .await
-                            .context("store full text")
+    // Concurrent fetch stage, bounded by a semaphore so a slow/timing-out origin can't serialize the
+    // whole pass (and at most `max_concurrent_fetches` requests are in flight). Each task fetches and
+    // writes back its own result; a write-back failure is logged, never aborting the sweep.
+    let http =
+        build_fetch_http(cfg).map_err(|e| anyhow::anyhow!("build fetch http client: {e}"))?;
+    let sem = Arc::new(tokio::sync::Semaphore::new(
+        cfg.max_concurrent_fetches.max(1),
+    ));
+    let mut tasks: tokio::task::JoinSet<bool> = tokio::task::JoinSet::new();
+
+    for (id, source, group_key, link, domain) in to_fetch {
+        let permit = sem
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("fetch semaphore is never closed");
+        let http = http.clone();
+        let cfg = cfg.clone();
+        let pool = pool.clone();
+        let scope = scope.clone();
+        tasks.spawn(async move {
+            let _permit = permit;
+            let started = Instant::now();
+            let outcome = fetch_article(&http, &cfg, &link).await;
+            let elapsed = started.elapsed();
+            match outcome {
+                Ok(text) => {
+                    metric::attempt("ok", elapsed);
+                    tracing::debug!(
+                        event_id = %id, %domain, chars = text.chars().count(),
+                        elapsed_ms = elapsed.as_millis() as u64, "article fetched"
+                    );
+                    let store = with_scope(&pool, ctx, move |conn| {
+                        Box::pin(async move {
+                            store_full_text(conn, id, source, &group_key, &scope, &text)
+                                .await
+                                .context("store full text")
+                        })
                     })
-                })
-                .await?;
-                stats.fetched += 1;
+                    .await;
+                    match store {
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::warn!(event_id = %id, error = %format!("{e:#}"), "store full text failed");
+                            false
+                        }
+                    }
+                }
+                Err(e) => {
+                    metric::attempt(e.describe(), elapsed);
+                    tracing::debug!(
+                        event_id = %id, %domain, error = %e,
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        "article fetch failed (event stays at snippet)"
+                    );
+                    let permanent = e.is_permanent();
+                    let rec = with_scope(&pool, ctx, move |conn| {
+                        Box::pin(async move {
+                            record_fetch_failure(conn, id, permanent)
+                                .await
+                                .context("record fetch failure")
+                        })
+                    })
+                    .await;
+                    if let Err(e) = rec {
+                        tracing::warn!(event_id = %id, error = %format!("{e:#}"), "record fetch failure failed");
+                    }
+                    false
+                }
             }
+        });
+    }
+
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(true) => stats.fetched += 1,
+            Ok(false) => stats.failed += 1,
             Err(e) => {
-                metric::attempt(e.describe(), elapsed);
-                tracing::debug!(
-                    event_id = %target.id,
-                    %domain,
-                    error = %e,
-                    elapsed_ms = elapsed.as_millis() as u64,
-                    "article fetch failed (event stays at snippet)"
-                );
-                let id = target.id;
-                with_scope(pool, ctx, move |conn| {
-                    Box::pin(async move {
-                        record_fetch_failure(conn, id)
-                            .await
-                            .context("record fetch failure")
-                    })
-                })
-                .await?;
+                tracing::warn!(error = %e, "article fetch task panicked");
                 stats.failed += 1;
             }
         }
@@ -660,7 +833,7 @@ pub async fn sweep_article_fetch(
 
 /// Pick the first link that parses as an absolute http(s) URL with a host, returning
 /// `(url, domain)`. The domain (host, lowercased, leading `www.` dropped) keys the per-domain
-/// politeness map. `None` when no link is fetchable.
+/// politeness cap. `None` when no link is fetchable.
 fn first_fetchable_link(links: &[String]) -> Option<(String, String)> {
     for link in links {
         let Ok(url) = Url::parse(link) else { continue };
@@ -730,6 +903,19 @@ mod tests {
     }
 
     #[test]
+    fn blocks_embedded_v4_in_nat64_and_6to4() {
+        // NAT64 (64:ff9b::/96) of internal v4 targets — the embedded host must be unwrapped + blocked.
+        assert!(is_disallowed_ip("64:ff9b::7f00:1".parse().unwrap())); // 127.0.0.1
+        assert!(is_disallowed_ip("64:ff9b::a00:1".parse().unwrap())); // 10.0.0.1
+        assert!(is_disallowed_ip("64:ff9b::a9fe:a9fe".parse().unwrap())); // 169.254.169.254
+                                                                          // 6to4 (2002::/16) of a private v4.
+        assert!(is_disallowed_ip("2002:c0a8:0101::1".parse().unwrap())); // 192.168.1.1
+                                                                         // NAT64/6to4 of a *public* v4 stays allowed (no false positive).
+        assert!(!is_disallowed_ip("64:ff9b::808:808".parse().unwrap())); // 8.8.8.8
+        assert!(!is_disallowed_ip("2002:0808:0808::1".parse().unwrap())); // 8.8.8.8
+    }
+
+    #[test]
     fn allows_public_addresses() {
         for ip in ["8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:2800:220:1::1"] {
             assert!(!is_disallowed_ip(ip.parse().unwrap()), "should allow {ip}");
@@ -754,11 +940,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn permanent_vs_transient_classification() {
+        // Permanent — spend the budget at once (won't change on retry).
+        for e in [
+            FetchError::BadScheme,
+            FetchError::BlockedAddress,
+            FetchError::DisallowedContentType("application/pdf".into()),
+            FetchError::TooLarge,
+            FetchError::Empty,
+            FetchError::TooManyRedirects,
+            FetchError::BadStatus(404),
+            FetchError::BadStatus(403),
+        ] {
+            assert!(e.is_permanent(), "should be permanent: {e}");
+        }
+        // Transient — keep retrying.
+        for e in [
+            FetchError::DnsFailure,
+            FetchError::Transport("connect".into()),
+            FetchError::BadStatus(503),
+            FetchError::BadStatus(500),
+            FetchError::BadStatus(408),
+            FetchError::BadStatus(429),
+        ] {
+            assert!(!e.is_permanent(), "should be transient: {e}");
+        }
+    }
+
     #[tokio::test]
     async fn rejects_non_http_scheme() {
+        let cfg = FetchConfig::default();
+        let client = build_fetch_http(&cfg).unwrap();
         for bad in ["ftp://example.com/x", "file:///etc/passwd", "gopher://x"] {
             assert_eq!(
-                fetch_article(&FetchConfig::default(), bad).await,
+                fetch_article(&client, &cfg, bad).await,
                 Err(FetchError::BadScheme),
                 "should reject {bad}"
             );
@@ -767,44 +983,41 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_url_resolving_to_loopback() {
-        // An explicit loopback/private IP host is validated without DNS and blocked.
+        // An explicit loopback/private IP host is validated without DNS and blocked before any connect.
         let cfg = FetchConfig::default();
-        assert_eq!(
-            fetch_article(&cfg, "http://127.0.0.1/secret").await,
-            Err(FetchError::BlockedAddress)
-        );
-        assert_eq!(
-            fetch_article(&cfg, "http://169.254.169.254/latest/meta-data").await,
-            Err(FetchError::BlockedAddress)
-        );
-        assert_eq!(
-            fetch_article(&cfg, "http://[::1]:80/x").await,
-            Err(FetchError::BlockedAddress)
-        );
-        assert_eq!(
-            fetch_article(&cfg, "http://10.0.0.5/internal").await,
-            Err(FetchError::BlockedAddress)
-        );
+        let client = build_fetch_http(&cfg).unwrap();
+        for bad in [
+            "http://127.0.0.1/secret",
+            "http://169.254.169.254/latest/meta-data",
+            "http://[::1]:80/x",
+            "http://10.0.0.5/internal",
+        ] {
+            assert_eq!(
+                fetch_article(&client, &cfg, bad).await,
+                Err(FetchError::BlockedAddress),
+                "should block {bad}"
+            );
+        }
     }
 
     #[test]
-    fn resolve_and_validate_blocks_private_literal_and_allows_public() {
-        // Drive the resolver synchronously (IP-literal hosts take no DNS) to assert the validation arm
-        // that `fetch_article` relies on for every redirect hop.
+    fn validate_url_blocks_private_literal_and_allows_public() {
+        // IP-literal hosts take no DNS, so this drives the per-hop validation arm synchronously.
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let blocked = rt.block_on(resolve_and_validate(
-            &Url::parse("http://192.168.1.1/admin").unwrap(),
-        ));
-        assert_eq!(blocked, Err(FetchError::BlockedAddress));
-
-        let ok = rt
-            .block_on(resolve_and_validate(
-                &Url::parse("http://8.8.8.8/").unwrap(),
-            ))
-            .expect("public literal validates");
-        assert_eq!(ok.0, vec!["8.8.8.8".parse::<IpAddr>().unwrap()]);
-        assert_eq!(ok.1, 80);
-        assert_eq!(ok.2, None);
+        assert_eq!(
+            rt.block_on(validate_url(
+                &Url::parse("http://192.168.1.1/admin").unwrap()
+            )),
+            Err(FetchError::BlockedAddress)
+        );
+        assert_eq!(
+            rt.block_on(validate_url(&Url::parse("ftp://8.8.8.8/").unwrap())),
+            Err(FetchError::BadScheme)
+        );
+        assert_eq!(
+            rt.block_on(validate_url(&Url::parse("http://8.8.8.8/").unwrap())),
+            Ok(())
+        );
     }
 
     #[test]

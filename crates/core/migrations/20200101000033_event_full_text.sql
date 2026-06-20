@@ -13,8 +13,12 @@ ALTER TABLE event ADD COLUMN full_text_fetched_at timestamptz NULL;
 ALTER TABLE event ADD COLUMN full_text_attempts   smallint    NOT NULL DEFAULT 0;
 
 -- The fetch work-queue gate (`due_events_for_fetch` / `events_needing_fetch_exist`): only events
--- that still want a fetch. A partial index keeps the recurring "is there work?" probe cheap as the
--- event log grows — the overwhelming majority of rows (already fetched, or never fetchable) are
--- excluded from the index entirely.
+-- that could still want a fetch. The partial predicate must match the work-queue WHERE clause's most
+-- selective, never-changing terms so the recurring "is there work?" probe stays cheap as the log
+-- grows: `source = 'rss'` excludes the GitHub/Slack rows (whose `full_text` is NULL forever because
+-- they are never fetchable) from the index entirely — without it the index would bloat with exactly
+-- the rows that can never match. (Keep `source = 'rss'` in sync with `SourceKind::fetchable_sources`;
+-- a second fetchable source would widen this predicate. `full_text_attempts` is deliberately left out
+-- — retry-exhausted RSS rows are few and bounded by RSS volume.)
 CREATE INDEX event_fetch_pending ON event (ingest_time)
-    WHERE full_text IS NULL;
+    WHERE full_text IS NULL AND source = 'rss';

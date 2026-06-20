@@ -143,13 +143,14 @@ async fn event_stats(conn: &mut PgConnection) -> Result<EventStats, sqlx::Error>
                     WHERE scope_kind = 'public'
                       AND full_text IS NULL
                       AND full_text_attempts < $1
-                      AND source = 'rss'
+                      AND source = ANY($2)
                       AND array_length(links, 1) >= 1
                 ) AS fetch_pending,
                 max(ingest_time) AS latest_ingest
          FROM event",
     )
     .bind(crate::ingest::fetch::MAX_FETCH_ATTEMPTS)
+    .bind(crate::common::kind::SourceKind::fetchable_sources())
     .fetch_one(&mut *conn)
     .await?;
 
