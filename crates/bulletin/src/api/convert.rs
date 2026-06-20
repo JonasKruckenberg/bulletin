@@ -244,5 +244,6 @@ pub fn scoring_config(c: ScoringConfig) -> proto::ScoringConfig {
         story_cap: c.story_cap as u64,
         note_cap: c.note_cap as u64,
         resurface_penalty: c.resurface_penalty,
+        resurface_cap: c.resurface_cap as u64,
     }
 }

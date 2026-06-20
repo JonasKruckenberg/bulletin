@@ -253,6 +253,7 @@ message ScoringConfig {
   uint64 story_cap = 6;
   uint64 note_cap = 7;
   float resurface_penalty = 8;
+  uint64 resurface_cap = 9;
 }
 message GetConfigRequest {}
 // Sparse update: only the fields present change; the server merges onto the live config and returns it.
@@ -265,4 +266,5 @@ message SetConfigRequest {
   optional uint64 story_cap = 6;
   optional uint64 note_cap = 7;
   optional float resurface_penalty = 8;
+  optional uint64 resurface_cap = 9;
 }

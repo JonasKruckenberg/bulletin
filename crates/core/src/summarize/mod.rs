@@ -116,8 +116,11 @@ impl Default for SummarizationConfig {
             // corpus re-summarizes without the leaked raw source links. Bumped to 4 with the longer
             // tldr (2–4 sentences, wider token + gate budgets), so the corpus re-summarizes at length.
             // Bumped to 5 when the URL rule widened to bare domains too, so the corpus re-summarizes
-            // without the bare-domain mentions a mail client would auto-linkify.
-            prompt_version: 5,
+            // without the bare-domain mentions a mail client would auto-linkify. Bumped to 6 with the
+            // opinion/discussion hedge rule (comprehension marks a viewpoint `tentative`; the summarizer
+            // attributes it — "argues/says" — rather than asserting a contested take as settled fact), so
+            // the corpus re-summarizes without op-eds rendered as plain fact.
+            prompt_version: 6,
             headline_max_tokens: 24,
             tldr_max_tokens: 144,
             comprehension_max_tokens: 256,
@@ -570,7 +573,7 @@ Fill these fields:
 - analysis: 1-2 short sentences. What happened, and does the source state it as settled fact or hedge it (suspected, appears to, proposed, under investigation)?
 - event_type: one of incident, release, advisory, announcement, discussion, change, other.
 - state: where it is in its lifecycle - one of detected, investigating, resolved, proposed, in_progress, merged, published, closed, none. Use none if no lifecycle applies.
-- certainty: asserted if the source states it as settled fact; tentative if the source hedges.
+- certainty: asserted if the source reports it as settled fact; tentative if the source hedges (suspected, may, proposed) OR is opinion/argument - an op-ed, a "why/should" take, a debate. A viewpoint is not settled fact, so opinion and discussion are tentative even when stated forcefully.
 
 Use only what the source says. Do not guess beyond it. Output only the JSON the schema asks for. No preamble.
 
@@ -579,7 +582,10 @@ source: A bad config in the 14:02 rollout broke token validation; ~12% of logins
 out: {"analysis":"A deploy broke logins and was rolled back; the source states it as resolved fact.","certainty":"asserted","event_type":"incident","state":"resolved"}
 
 source: A high-severity advisory appears to affect billing's PDF path; no patch yet, still under investigation.
-out: {"analysis":"A security advisory that may affect billing; the source hedges and is still investigating.","certainty":"tentative","event_type":"advisory","state":"investigating"}"#;
+out: {"analysis":"A security advisory that may affect billing; the source hedges and is still investigating.","certainty":"tentative","event_type":"advisory","state":"investigating"}
+
+source: An engineer argues the team should drop microservices and go back to a monolith to cut ops overhead.
+out: {"analysis":"An opinion arguing for a monolith; the author's view, not a settled fact.","certainty":"tentative","event_type":"discussion","state":"none"}"#;
 
 /// Format a fact list for a prompt line: comma-joined, or the literal `(none)` for an empty list (so
 /// the model is *told* a category is empty rather than left to infer it from a blank value). Shared by
@@ -822,8 +828,10 @@ You rephrase the facts. You add nothing.
 1. Use only the facts and source text given. Every name, number, and date you write
    must be in the input. Not given -> leave it out.
 2. Refer to people, repos, services, and CVEs only by the entity ids listed. Nothing more.
-3. Each fact has "certainty". tentative -> use a hedge verb (suspected, appears to,
-   reportedly, proposed). asserted -> say it plainly. Never change a fact's certainty.
+3. Each fact has "certainty" and "event_type". asserted -> say it plainly.
+   tentative + discussion -> attribute the view, do not assert it (the source
+   argues / says / calls for ...). tentative otherwise -> hedge the claim
+   (suspected, appears to, reportedly, proposed). Never change a fact's certainty.
 4. Plain words. Active voice. Do not use: massive, huge, critical (unless in the
    source), game-changing, exciting, "!", "you", "we".
 5. No web addresses at all: no URLs ("http://...", "www...") and no bare domains
@@ -844,7 +852,12 @@ facts: {event: SSRF advisory, state: investigating, certainty: tentative,
 out: {"headline":"Suspected SSRF in the invoice PDF renderer",
       "tldr":[{"text":"A high-severity advisory, "},
               {"ref":"cve:CVE-2026-2200","surface":"CVE-2026-2200"},
-              {"text":", appears to affect billing's PDF path; no patch yet."}]}"#;
+              {"text":", appears to affect billing's PDF path; no patch yet."}]}
+
+facts: {event: drop microservices for a monolith, event_type: discussion,
+        certainty: tentative}
+out: {"headline":"A case for going back to a monolith",
+      "tldr":[{"text":"An engineer argues the team should drop microservices and return to a monolith to cut operational overhead."}]}"#;
 
 /// The per-cluster user prompt (§3.6): the extracted facts + the closed entity-id set + the budgeted
 /// source text, with the concrete ask. Short and concrete, over the §4 pre-distilled inputs.
@@ -1080,7 +1093,8 @@ You write ONE headline and ONE tldr for the whole thing. You add nothing.
 2. Use only the facts and text given. Every name, number, and date you write must be in the input.
 3. Refer to people, repos, services, and CVEs only by the entity ids listed. Nothing more.
 4. Do NOT list or name the sources ("across GitHub and Slack"). The interface shows them.
-5. Each fact has "certainty". tentative -> hedge (suspected, appears to). asserted -> say it plainly.
+5. Each fact has "certainty" and "event_type". asserted -> say it plainly. tentative + discussion ->
+   attribute the view (argues, says), don't assert it. tentative otherwise -> hedge (suspected, appears to).
 6. Plain words. Active voice. Do not use: massive, huge, critical (unless in the source),
    game-changing, exciting, "!", "you", "we".
 7. Don't paste raw URLs (no "http://...", no "www...").
@@ -2659,7 +2673,7 @@ mod tests {
     #[test]
     fn summary_model_string() {
         let cfg = SummarizationConfig::default();
-        assert_eq!(cfg.summary_model(), "qwen3.5-4b-instruct@5");
+        assert_eq!(cfg.summary_model(), "qwen3.5-4b-instruct@6");
     }
 
     // ── Phase C — story synthesis ────────────────────────────────────────────────────────────────

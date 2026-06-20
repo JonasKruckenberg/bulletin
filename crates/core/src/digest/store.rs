@@ -17,7 +17,7 @@ use uuid::Uuid;
 pub async fn load_config(pool: &PgPool) -> Result<ScoringConfig, sqlx::Error> {
     let row = sqlx::query(
         "SELECT relevance_floor, scope_bonus, severity_weight, recency_half_life_days,
-                thread_half_life_days, story_cap, note_cap, resurface_penalty
+                thread_half_life_days, story_cap, note_cap, resurface_penalty, resurface_cap
          FROM digest_config WHERE id = true",
     )
     .fetch_one(pool)
@@ -31,6 +31,7 @@ pub async fn load_config(pool: &PgPool) -> Result<ScoringConfig, sqlx::Error> {
         story_cap: row.get::<i32, _>("story_cap") as usize,
         note_cap: row.get::<i32, _>("note_cap") as usize,
         resurface_penalty: row.get::<f64, _>("resurface_penalty") as f32,
+        resurface_cap: row.get::<i32, _>("resurface_cap") as usize,
     })
 }
 
@@ -42,7 +43,7 @@ pub async fn update_config(pool: &PgPool, cfg: &ScoringConfig) -> Result<(), sql
         "UPDATE digest_config SET
             relevance_floor = $1, scope_bonus = $2, severity_weight = $3,
             recency_half_life_days = $4, thread_half_life_days = $5,
-            story_cap = $6, note_cap = $7, resurface_penalty = $8
+            story_cap = $6, note_cap = $7, resurface_penalty = $8, resurface_cap = $9
          WHERE id = true",
     )
     .bind(cfg.relevance_floor as f64)
@@ -53,6 +54,7 @@ pub async fn update_config(pool: &PgPool, cfg: &ScoringConfig) -> Result<(), sql
     .bind(cfg.story_cap as i32)
     .bind(cfg.note_cap as i32)
     .bind(cfg.resurface_penalty as f64)
+    .bind(cfg.resurface_cap as i32)
     .execute(pool)
     .await?;
     Ok(())

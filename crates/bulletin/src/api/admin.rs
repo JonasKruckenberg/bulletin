@@ -372,6 +372,9 @@ impl UnstableDebugService for AdminApi {
         if let Some(v) = r.resurface_penalty {
             cfg.resurface_penalty = v;
         }
+        if let Some(v) = r.resurface_cap {
+            cfg.resurface_cap = v as usize;
+        }
         digest::set_config(&self.pool, cfg)
             .await
             .map_err(error::internal("set config"))?;
