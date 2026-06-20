@@ -48,6 +48,11 @@ pub struct PollConnectionJob {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublicBuildJob;
 
+/// FetchArticles carries no payload — it always processes "every public event still wanting a
+/// full-text fetch" (the work-queue gate). Best-effort, off the punctual path (Phase 1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FetchArticlesJob;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenerateDigestJob {
     pub subscriber_id: Uuid,
@@ -205,6 +210,42 @@ async fn public_build(
             Err(e) => {
                 tracing::error!(error = %format!("{e:#}"), "public build failed");
                 return Err(boxed(e));
+            }
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// Best-effort full-article fetch sweep (Phase 1), run from its own due-gated job — never inline in
+/// the poll/cluster/digest path. It enriches public, link-based (RSS) events with the real article
+/// text behind their link (`event.full_text`), SSRF-guarded inside `core`. The sweep never fails the
+/// job: a per-event fetch failure is tracked (bounded retries) and skipped, leaving the event
+/// summarizable from its snippet. When any text was newly fetched, a public summarization pass is run
+/// so the richer text flows downstream — the fetch nudged each affected cluster's `updated_at`, so the
+/// staleness gate re-summarizes exactly those.
+async fn fetch_articles(
+    _job: FetchArticlesJob,
+    task_id: TaskId<Ulid>,
+    attempt: Attempt,
+    pool: Data<PgPool>,
+) -> Result<(), BoxDynError> {
+    traced("fetch_articles", task_id, attempt, async move {
+        let cfg = bulletin_core::ingest::fetch::FetchConfig::from_env();
+        match bulletin_core::ingest::fetch::sweep_article_fetch(&pool, &cfg).await {
+            Ok(stats) => {
+                tracing::info!(
+                    fetched = stats.fetched,
+                    failed = stats.failed,
+                    skipped = stats.skipped,
+                    "article fetch sweep complete"
+                );
+                if stats.fetched > 0 {
+                    summarize_public(&pool).await;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "article fetch sweep failed (non-fatal)");
             }
         }
         Ok(())
@@ -476,6 +517,26 @@ async fn run_tick(pool: Data<PgPool>) -> Result<(), BoxDynError> {
         storage.push(PublicBuildJob).await?;
     }
 
+    // 2.5. Public events still wanting a full-text fetch → FetchArticles. Best-effort enrichment,
+    //      decoupled from build/digest — an unfetched event just rides its snippet until a later
+    //      sweep lands the article (Phase 1). Coalesced by a per-minute idempotency key so re-ticks
+    //      (and duplicate ticks across replicas) before the job runs collapse into one; the sweep
+    //      itself also takes an advisory lock, so even a piled-up duplicate no-ops instead of
+    //      double-fetching (mirroring PublicBuild's lock).
+    if bulletin_core::ingest::fetch::events_needing_fetch_exist(&*pool).await? {
+        tracing::debug!("tick: enqueuing article fetch");
+        let mut storage: PostgresStorage<FetchArticlesJob> = PostgresStorage::new(&pool);
+        let bucket = Utc::now().timestamp() / 60;
+        let task = TaskBuilder::new(FetchArticlesJob)
+            .with_idempotency_key(format!("fetch_articles:{bucket}"))
+            .build();
+        match storage.push_task(task).await {
+            Ok(()) => {}
+            Err(e) if is_duplicate_enqueue(&e) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+
     // 3. Subscribers due → GenerateDigest (dedup: apalis idempotency key). No build gate — the
     //    digest reads the latest materialized snapshot; unbuilt events ride the next fire.
     let subs = due_subscribers(&pool).await?;
@@ -564,6 +625,15 @@ pub async fn start(pool: PgPool, email: EmailConfig, connectors: ConnectorCtx) -
                     .backend(PostgresStorage::<PublicBuildJob>::new(&pool))
                     .data(pool.clone())
                     .build(public_build)
+            }
+        })
+        .register({
+            let pool = pool.clone();
+            move |_| {
+                WorkerBuilder::new("bulletin-fetch-articles")
+                    .backend(PostgresStorage::<FetchArticlesJob>::new(&pool))
+                    .data(pool.clone())
+                    .build(fetch_articles)
             }
         })
         .register({

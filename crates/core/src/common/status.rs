@@ -39,6 +39,10 @@ pub struct EventStats {
     pub total: i64,
     /// Public events ingested after the build watermark — not yet clustered.
     pub unbuilt: i64,
+    /// Public, fetchable-source events still awaiting a full-text fetch (link present, no `full_text`
+    /// yet, retry budget left) — the Phase-1 enrichment backlog. A persistently high value means the
+    /// fetch sweep is falling behind or systematically blocked.
+    pub fetch_pending: i64,
     pub latest_ingest: Option<DateTime<Utc>>,
     pub by_source: Vec<(String, i64)>,
 }
@@ -135,9 +139,18 @@ async fn event_stats(conn: &mut PgConnection) -> Result<EventStats, sqlx::Error>
                     WHERE scope_kind = 'public'
                       AND ingest_time > (SELECT built_through FROM build_watermark)
                 ) AS unbuilt,
+                count(*) FILTER (
+                    WHERE scope_kind = 'public'
+                      AND full_text IS NULL
+                      AND full_text_attempts < $1
+                      AND source = ANY($2)
+                      AND array_length(links, 1) >= 1
+                ) AS fetch_pending,
                 max(ingest_time) AS latest_ingest
          FROM event",
     )
+    .bind(crate::ingest::fetch::MAX_FETCH_ATTEMPTS)
+    .bind(crate::common::kind::SourceKind::fetchable_sources())
     .fetch_one(&mut *conn)
     .await?;
 
@@ -152,6 +165,7 @@ async fn event_stats(conn: &mut PgConnection) -> Result<EventStats, sqlx::Error>
     Ok(EventStats {
         total: agg.get("total"),
         unbuilt: agg.get("unbuilt"),
+        fetch_pending: agg.get("fetch_pending"),
         latest_ingest: agg.get("latest_ingest"),
         by_source,
     })

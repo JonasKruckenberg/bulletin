@@ -1,7 +1,9 @@
 //! The ingest flow: poll a connection's source, normalize items to events, and append them to
 //! the event log (`store::insert_event`). Producer side of the ingest→clustering seam.
 
+pub mod fetch;
 pub mod github;
+pub(crate) mod html_text;
 pub mod realtime;
 pub mod rss;
 pub mod store;

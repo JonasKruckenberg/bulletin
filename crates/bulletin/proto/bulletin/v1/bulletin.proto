@@ -154,6 +154,7 @@ message EventStats {
   int64 unbuilt = 2;
   optional google.protobuf.Timestamp latest_ingest = 3;
   repeated SourceCount by_source = 4;
+  int64 fetch_pending = 5;
 }
 message SourceCount { string source = 1; int64 count = 2; }
 message BuildStatus { google.protobuf.Timestamp built_through = 1; int64 lag_secs = 2; }

@@ -114,6 +114,33 @@ pub async fn upsert_cluster(
     Ok(row.get("id"))
 }
 
+/// Bump a group's cluster `updated_at` so the summarization staleness gate (`updated_at >
+/// summarized_at`) re-picks it, without a full rebuild — used by the best-effort article fetch
+/// (`ingest::fetch`) when late-arriving `full_text` should re-summarize an already-built cluster.
+/// A no-op (0 rows) when the group has no cluster yet: it will summarize with the `full_text` already
+/// present once first built. Keeps the cluster-identity match in one place (here, beside the build's
+/// `upsert_cluster`) instead of re-spelling it in the fetcher.
+pub async fn touch_group(
+    executor: impl PgExecutor<'_>,
+    scope: &Scope,
+    source: SourceKind,
+    group_key: &str,
+) -> Result<(), sqlx::Error> {
+    let (scope_kind, scope_subscriber_id) = scope.to_columns();
+    sqlx::query(
+        "UPDATE cluster SET updated_at = now()
+         WHERE scope_kind = $1 AND scope_subscriber_id IS NOT DISTINCT FROM $2
+           AND source = $3 AND group_key = $4",
+    )
+    .bind(scope_kind)
+    .bind(scope_subscriber_id)
+    .bind(source)
+    .bind(group_key)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
 /// Advances the build watermark to `hwm` (monotonic via GREATEST).
 pub async fn advance_build_watermark(
     executor: impl PgExecutor<'_>,
@@ -158,7 +185,7 @@ pub async fn list_group_events(
     sqlx::query(
         "SELECT id, fingerprint, source, scope_kind, scope_subscriber_id,
                 event_time, title, body, links, group_key, entities,
-                content_kind, severity_hint, ingest_time, raw, connection_id
+                content_kind, severity_hint, ingest_time, raw, connection_id, full_text
          FROM event
          WHERE scope_kind = $1 AND scope_subscriber_id IS NOT DISTINCT FROM $2
            AND source = $3 AND group_key = $4

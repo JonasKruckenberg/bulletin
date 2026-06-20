@@ -365,9 +365,14 @@ impl ClusterSummary {
 // ── Content signature (§2.1 staleness gate) ──────────────────────────────────────────────────────
 
 /// The content signature of a cluster's summary inputs: SHA-256 over each event's
-/// `title‖body‖links‖entities`, in `(event_time, id)` order. The summary is recomputed **only when
-/// this changes** — the cheap staleness gate that makes a unit summarized once per content change,
-/// not once per fire or per subscriber. Order-independent of the caller (sorted defensively).
+/// `title‖best_text‖links‖entities`, in `(event_time, id)` order. The summary is recomputed **only
+/// when this changes** — the cheap staleness gate that makes a unit summarized once per content
+/// change, not once per fire or per subscriber. Order-independent of the caller (sorted defensively).
+///
+/// Hashes [`Event::best_text`] (the fetched `full_text`, else `body`), not `body` directly, so a
+/// best-effort article fetch that lands *after* a cluster was first summarized from its snippet moves
+/// the hash and re-summarizes the cluster off the richer text — the §3.7 staleness gate doing the
+/// Phase-1 re-grounding for free. An event with no `full_text` hashes exactly as before.
 pub fn summary_hash(events: &[Event]) -> Vec<u8> {
     const FIELD: u8 = 0x00; // field separator
     const ITEM: u8 = 0x1f; // intra-field list separator (ASCII unit separator)
@@ -379,7 +384,7 @@ pub fn summary_hash(events: &[Event]) -> Vec<u8> {
     for e in order {
         h.update(e.title.as_bytes());
         h.update([FIELD]);
-        if let Some(b) = &e.body {
+        if let Some(b) = e.best_text() {
             h.update(b.as_bytes());
         }
         h.update([FIELD]);
@@ -422,7 +427,10 @@ pub fn extract_facts(events: &[Event]) -> Facts {
     for e in events {
         entities.extend(e.entities.iter().cloned());
         mine_numeric(&e.title, &mut numbers, &mut dates);
-        if let Some(b) = &e.body {
+        // Mine the richest available text (fetched `full_text`, else `body`) so numbers/dates that
+        // appear only in the full article are grounded for the faithfulness gate — the model is fed
+        // the same text by `source_corpus`.
+        if let Some(b) = e.best_text() {
             mine_numeric(b, &mut numbers, &mut dates);
         }
     }
@@ -956,9 +964,13 @@ pub fn response_schema(allowed_entities: &[String]) -> serde_json::Value {
 }
 
 /// Concatenate a cluster's events into the budgeted source corpus fed to the model (§4 — the only tier
-/// that touches raw text). Title + body per event, separated by blank lines, truncated to
-/// `max_chars` (the §7 long-context cliff). Events are taken newest-first so a truncation keeps the
+/// that touches raw text). Title + best-available text per event, separated by blank lines, truncated
+/// to `max_chars` (the §7 long-context cliff). Events are taken newest-first so a truncation keeps the
 /// most recent context.
+///
+/// Per event the body is [`Event::best_text`] — the fetched `full_text` when present, else the
+/// connector's `body` snippet — so the model grounds off the real article for link-based sources and
+/// degrades to the snippet/body for everything else (the Phase-1 enhancement, transparent here).
 pub fn source_corpus(events: &[Event], max_chars: usize) -> String {
     let mut order: Vec<&Event> = events.iter().collect();
     order.sort_by(|a, b| b.event_time.cmp(&a.event_time).then(b.id.cmp(&a.id)));
@@ -977,7 +989,7 @@ pub fn source_corpus(events: &[Event], max_chars: usize) -> String {
         let title = e.title.trim();
         out.push_str(title);
         len += title.chars().count();
-        if let Some(b) = &e.body {
+        if let Some(b) = e.best_text() {
             let b = b.trim();
             if !b.is_empty() {
                 out.push('\n');
@@ -2273,6 +2285,7 @@ mod tests {
             ingest_time: Utc.timestamp_opt(secs, 0).single().unwrap(),
             raw: None,
             connection_id: None,
+            full_text: None,
         }
     }
 

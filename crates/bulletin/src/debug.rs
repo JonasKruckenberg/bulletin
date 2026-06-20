@@ -655,9 +655,10 @@ fn print_status(r: &proto::StatusReport) {
 
     let e = r.events.clone().unwrap_or_default();
     println!(
-        "events       {} total, {} unbuilt; latest ingest {}",
+        "events       {} total, {} unbuilt, {} fetch-pending; latest ingest {}",
         e.total,
         e.unbuilt,
+        e.fetch_pending,
         opt_ts(&e.latest_ingest)
     );
     for sc in &e.by_source {

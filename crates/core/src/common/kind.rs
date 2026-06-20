@@ -51,6 +51,35 @@ impl SourceKind {
             SourceKind::Slack => true,
         }
     }
+
+    /// Whether this source's events carry a *link to fetchable article content* distinct from the
+    /// event body — the gate for the best-effort full-text fetch (`ingest::fetch`, Phase 1). RSS items
+    /// link out to an article whose `body` is only a snippet, so fetching the page enriches grounding.
+    /// GitHub and Slack events ARE the content (a PR description, a chat message) — their link points
+    /// back at the item itself, so there is nothing to fetch and they degrade to `body` unchanged.
+    pub fn has_fetchable_article(self) -> bool {
+        match self {
+            SourceKind::Rss => true,
+            SourceKind::Github | SourceKind::Slack => false,
+        }
+    }
+
+    /// Every source kind — so callers can enumerate the vocabulary instead of hardcoding it. Kept in
+    /// declaration order; the `text_enum!`-derived `Ord` follows the same order.
+    pub const ALL: [SourceKind; 3] = [SourceKind::Rss, SourceKind::Github, SourceKind::Slack];
+
+    /// The source kinds with a fetchable article, as their `as_str()` text — the single source of
+    /// truth (derived from [`has_fetchable_article`](Self::has_fetchable_article)) for the
+    /// `ingest::fetch` work-queue SQL (`source = ANY(...)`), so adding a fetchable source flips one
+    /// `match` arm and every query follows, rather than editing scattered `source = 'rss'` literals.
+    pub fn fetchable_sources() -> Vec<&'static str> {
+        SourceKind::ALL
+            .iter()
+            .copied()
+            .filter(|s| s.has_fetchable_article())
+            .map(SourceKind::as_str)
+            .collect()
+    }
 }
 
 text_enum! {
