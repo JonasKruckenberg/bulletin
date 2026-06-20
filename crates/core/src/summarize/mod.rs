@@ -169,6 +169,19 @@ impl SummarizationConfig {
         format!("{}@{}", self.model, self.prompt_version)
     }
 
+    /// The cluster-eligibility grace the public build should actually apply: [`enrich_grace`](Self::enrich_grace)
+    /// when enrichment is on, **zero when it is off**. Enrichment off ⇒ the sweep adds nothing, so
+    /// deferring clustering would buy nothing but latency — disabling enrichment restores the exact
+    /// pre-Phase-2 build timing (`hwm = now()`). The single source of this coupling, so the build,
+    /// the debug build, and the tick gate can't disagree on it.
+    pub fn effective_enrich_grace(&self) -> Duration {
+        if self.enrich {
+            self.enrich_grace
+        } else {
+            Duration::ZERO
+        }
+    }
+
     /// A copy of this config with the generation seed (and, mildly, the temperature) perturbed for a
     /// given retry `attempt` (§3.7). Attempt `0` is this config unchanged — the first try stays at the
     /// deterministic base seed/temperature, so the content-hash cache (§3.3) keeps its meaning for a
@@ -242,7 +255,9 @@ impl SummarizationConfig {
         }
         if let Ok(v) = std::env::var("BULLETIN_LLM_ENRICH_GRACE_SECS") {
             if let Ok(secs) = v.trim().parse::<u64>() {
-                cfg.enrich_grace = Duration::from_secs(secs);
+                if secs > 0 {
+                    cfg.enrich_grace = Duration::from_secs(secs);
+                }
             }
         }
         // The lead deadline only bounds the punctual send if it sits at or under the per-call HTTP
@@ -2722,6 +2737,23 @@ mod tests {
     fn summary_model_string() {
         let cfg = SummarizationConfig::default();
         assert_eq!(cfg.summary_model(), "qwen3.5-4b-instruct@6");
+    }
+
+    #[test]
+    fn effective_enrich_grace_is_zero_when_enrichment_off() {
+        // Disabling enrichment must collapse the build grace to zero (restore pre-Phase-2 timing) —
+        // a no-op sweep should never defer clustering.
+        let on = SummarizationConfig {
+            enrich: true,
+            enrich_grace: Duration::from_secs(90),
+            ..SummarizationConfig::default()
+        };
+        assert_eq!(on.effective_enrich_grace(), Duration::from_secs(90));
+        let off = SummarizationConfig {
+            enrich: false,
+            ..on
+        };
+        assert_eq!(off.effective_enrich_grace(), Duration::ZERO);
     }
 
     // ── Phase C — story synthesis ────────────────────────────────────────────────────────────────

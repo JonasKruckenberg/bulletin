@@ -17,7 +17,7 @@ use tracing::Instrument;
 use ulid::Ulid;
 use uuid::Uuid;
 
-use bulletin_core::cluster::store::unbuilt_public_events_exist;
+use bulletin_core::cluster::store::public_build_due;
 use bulletin_core::digest::subscriber::due_subscribers;
 use bulletin_core::digest::DigestOutcome;
 use bulletin_core::ingest::store::due_connections;
@@ -205,7 +205,9 @@ async fn public_build(
         // sweep just leaves events with structural+derived entities, and the build's grace deadline
         // (`cfg.enrich_grace`) ages them in regardless.
         enrich_public(&pool, &cfg).await;
-        match bulletin_core::cluster::build(&pool, cfg.enrich_grace).await {
+        // `effective_enrich_grace()` is zero when enrichment is off, so disabling the pass restores the
+        // pre-Phase-2 build timing (hwm = now()) rather than deferring clustering for no benefit.
+        match bulletin_core::cluster::build(&pool, cfg.effective_enrich_grace()).await {
             Ok(Some(stats)) => {
                 tracing::info!(dirty_groups = stats.dirty_groups, "public build complete");
                 // Off the punctual path: summarize the public clusters whose content changed. Per-cluster
@@ -537,8 +539,11 @@ async fn run_tick(pool: Data<PgPool>) -> Result<(), BoxDynError> {
         }
     }
 
-    // 2. New public events to cluster → PublicBuild (dedup: watermark gate + advisory lock).
-    if unbuilt_public_events_exist(&*pool).await? {
+    // 2. New public events to cluster (or still pending enrichment) → PublicBuild (dedup: watermark
+    //    gate + advisory lock). The gate is grace-aware so an already-enriched event sitting in the
+    //    Phase-2 grace window doesn't re-enqueue a no-op build + enrichment sweep every tick.
+    let grace = bulletin_core::summarize::SummarizationConfig::from_env().effective_enrich_grace();
+    if public_build_due(&*pool, grace).await? {
         tracing::debug!("tick: enqueuing public build");
         let mut storage: PostgresStorage<PublicBuildJob> = PostgresStorage::new(&pool);
         storage.push(PublicBuildJob).await?;

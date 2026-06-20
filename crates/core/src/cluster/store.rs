@@ -160,21 +160,32 @@ pub async fn advance_build_watermark(
     Ok(())
 }
 
-/// True iff any public event is ingested-but-not-yet-built. The tick uses this to decide
-/// whether to enqueue a PublicBuild (watermark-gated; no redundant builds when quiet).
-pub async fn unbuilt_public_events_exist(
+/// True iff the tick should enqueue a PublicBuild: some public event is ingested-but-not-yet-built
+/// **and** either (a) already aged past the enrichment grace deadline — clusterable now — or (b) still
+/// pending enrichment (`enriched_at IS NULL`), so the pre-cluster sweep has work to do.
+///
+/// The grace awareness matters: under the Phase-2 grace the build only advances to `now() - grace`, so
+/// an already-enriched event still inside the grace window is intentionally *not* clusterable yet and
+/// has no pending enrichment — it matches neither clause, so a quiet grace tail no longer spins a
+/// no-op build (and a redundant enrichment sweep) on every tick. With `enrich_grace == 0`, clause (a)
+/// covers every unbuilt event, so this collapses to the pre-Phase-2 "any unbuilt public event"
+/// behavior exactly.
+pub async fn public_build_due(
     executor: impl PgExecutor<'_>,
+    enrich_grace: std::time::Duration,
 ) -> Result<bool, sqlx::Error> {
     let row = sqlx::query(
         "SELECT EXISTS (
             SELECT 1 FROM event
             WHERE scope_kind = 'public'
               AND ingest_time > (SELECT built_through FROM build_watermark)
-         ) AS dirty",
+              AND (ingest_time <= now() - make_interval(secs => $1) OR enriched_at IS NULL)
+         ) AS due",
     )
+    .bind(enrich_grace.as_secs_f64())
     .fetch_one(executor)
     .await?;
-    Ok(row.get("dirty"))
+    Ok(row.get("due"))
 }
 
 /// Loads every event *in `scope`* within one source group `(source, group_key)`, ordered by

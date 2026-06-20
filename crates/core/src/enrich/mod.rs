@@ -23,7 +23,7 @@
 //! This module splits like [`crate::summarize`]:
 //! - **The pure core (unit-tested without a sidecar):** the prompt/schema ([`ENRICH_SYSTEM_PROMPT`] /
 //!   [`enrichment_schema`]), the extracted shape ([`Enrichment`]), and the deterministic grounding +
-//!   canonicalization ([`ground_entities`]).
+//!   slugging gate ([`ground_entities`]).
 //! - **The model edge:** [`client`] (the local-sidecar call) and [`store`] / [`sweep_public`] (the DB
 //!   sweep that walks the pending frontier and writes grounded tokens back onto events).
 
@@ -32,13 +32,8 @@ pub mod store;
 
 use serde::Deserialize;
 
-use crate::common::db::{begin_scope, ScopeCtx};
-use crate::summarize::SummarizationConfig;
-
-/// The grounded entity namespaces this pass emits, paired with the `Enrichment` list each is drawn
-/// from. `place:`/`org:`/`person:` are weak link keys; `topic:` is non-linking (see
-/// [`crate::common::entity::link_strength`]). Iterated by [`ground_entities`].
-const NAMESPACES: &[&str] = &["place", "org", "person", "topic"];
+use crate::common::db::{with_scope, ScopeCtx};
+use crate::summarize::{build_summarize_http, SummarizationConfig};
 
 /// The constrained extraction output (§ mirrors [`crate::summarize::Comprehension`]): a short
 /// free-text `analysis` scratchpad **first** (the "reason, then constrain" lever — named `analysis`
@@ -69,44 +64,47 @@ pub struct Enrichment {
 }
 
 impl Enrichment {
-    /// The proposed values for a namespace, for [`ground_entities`]'s uniform loop.
-    fn list(&self, namespace: &str) -> &[String] {
-        match namespace {
-            "place" => &self.places,
-            "org" => &self.orgs,
-            "person" => &self.people,
-            "topic" => &self.topics,
-            _ => &[],
-        }
+    /// Each grounded namespace paired with the proposed values it draws from — the single structural
+    /// source of the name↔field mapping, so [`ground_entities`] iterates one place and a new namespace
+    /// can't be added to one half without the other. `place:`/`org:`/`person:` are weak link keys;
+    /// `topic:` is non-linking (see [`crate::common::entity::link_strength`]).
+    fn namespaced(&self) -> [(&'static str, &[String]); 4] {
+        [
+            ("place", &self.places),
+            ("org", &self.orgs),
+            ("person", &self.people),
+            ("topic", &self.topics),
+        ]
     }
 }
 
 /// The grounding gate (non-negotiable, §). Turn a model [`Enrichment`] into the set of grounded,
 /// canonicalized namespaced tokens to union onto the event's entities — **dropping every value that
 /// does not actually appear in the source text**. For each proposed value:
-/// 1. normalize it (lowercase, punctuation→spaces, drop a leading article) and require it to appear
-///    as a whole-word run in the normalized title+body (so a hallucinated "NATO" the model added is
-///    rejected, and "art" can't match inside "smart");
-/// 2. canonicalize the surviving value to a slug token (`"the English Channel"` → `place:english-channel`)
-///    through the shared identity machinery, so two outlets writing it two ways collide on one token.
+/// 1. normalize it (lowercase, punctuation→spaces, drop a leading "the") and require it to appear
+///    as a whole-word run in the normalized title *or* body (so a hallucinated "NATO" the model added
+///    is rejected, and "art" can't match inside "smart");
+/// 2. slug the surviving value to a `kind:value` token (`"the English Channel"` → `place:english-channel`),
+///    canonical by construction, so two outlets writing it two ways collide on one token.
 ///
 /// Pure + deterministic (no model, no clock) — the returned tokens are sorted + de-duplicated.
 pub fn ground_entities(title: &str, body: Option<&str>, e: &Enrichment) -> Vec<String> {
-    // The source haystack, normalized once and space-padded so containment is whole-word: a needle
-    // " royal navy " matches only on word boundaries, never inside another word.
-    let mut source = normalize_text(title);
+    // Title and body are kept as *separate* padded haystacks (each normalized + space-padded so a
+    // needle " royal navy " matches only on whole-word boundaries). Checking them independently — not
+    // a single title‖body concatenation — is deliberate: a value must appear contiguously within one
+    // field, so a phrase straddling the title-end/body-start boundary ("…Royal" + "Navy…") can't
+    // falsely ground. The grounding gate is non-negotiable, so it must not invent boundary matches.
+    let mut haystacks: Vec<String> = vec![format!(" {} ", normalize_text(title))];
     if let Some(b) = body {
         if !b.is_empty() {
-            source.push(' ');
-            source.push_str(&normalize_text(b));
+            haystacks.push(format!(" {} ", normalize_text(b)));
         }
     }
-    let haystack = format!(" {source} ");
 
     let mut out: Vec<String> = Vec::new();
-    for &namespace in NAMESPACES {
-        for value in e.list(namespace) {
-            if let Some(token) = grounded_token(namespace, value, &haystack) {
+    for (namespace, values) in e.namespaced() {
+        for value in values {
+            if let Some(token) = grounded_token(namespace, value, &haystacks) {
                 out.push(token);
             }
         }
@@ -116,28 +114,25 @@ pub fn ground_entities(title: &str, body: Option<&str>, e: &Enrichment) -> Vec<S
     out
 }
 
-/// Validate one proposed `value` against the space-padded normalized `haystack` and, if it is
-/// grounded, return its canonical `kind:slug` token. `None` when the value is empty after
-/// normalization or does not appear (as a whole-word run) in the source — the hallucination drop.
-fn grounded_token(namespace: &str, value: &str, haystack: &str) -> Option<String> {
+/// Validate one proposed `value` against the space-padded normalized `haystacks` (title, body) and, if
+/// it appears as a whole-word run in *any one* of them, return its `kind:slug` token. `None` when the
+/// value is empty after normalization or appears in none of the haystacks — the hallucination drop.
+fn grounded_token(namespace: &str, value: &str, haystacks: &[String]) -> Option<String> {
     let normalized = normalize_text(value);
     let needle = strip_article(&normalized);
     if needle.is_empty() {
         return None;
     }
-    // Whole-word containment: the value's words must appear, in order, on word boundaries.
-    if !haystack.contains(&format!(" {needle} ")) {
+    // Whole-word containment within a single field: the value's words must appear, in order, on word
+    // boundaries somewhere in one haystack.
+    let padded = format!(" {needle} ");
+    if !haystacks.iter().any(|h| h.contains(&padded)) {
         return None;
     }
-    let slug = needle.replace(' ', "-");
-    if slug.is_empty() {
-        return None;
-    }
-    // Reuse the identity canonicalizer (lower-cases the `kind:`, leaves the already-normalized value),
-    // so the token form matches what the resolver/feedback path sees.
-    Some(crate::identity::canonicalize(&format!(
-        "{namespace}:{slug}"
-    )))
+    // `namespace` is a lowercase literal and `needle` is already normalized (lowercased, alnum-only),
+    // so the token is canonical by construction — no `identity::canonicalize` pass is needed (it would
+    // be an identity transform here), and `needle` non-empty ⇒ the slug is non-empty.
+    Some(format!("{namespace}:{}", needle.replace(' ', "-")))
 }
 
 /// Normalize free text for grounding: lower-case, map every run of non-alphanumeric characters to a
@@ -162,15 +157,13 @@ fn normalize_text(s: &str) -> String {
     out
 }
 
-/// Drop a single leading article from a normalized value, so `"the English Channel"` and
-/// `"English Channel"` slug to the same token. Leaves a bare article (`"the"`) alone.
+/// Drop a leading **definite** article from a normalized value, so `"the English Channel"` and
+/// `"English Channel"` slug to the same token. Only `"the "` is stripped — the indefinite articles
+/// `"a "`/`"an "` are left in place, since (unlike "the") they are rarely a throwaway prefix on a
+/// proper name and stripping them mangles legitimately article-leading names ("A Tribe Called Quest").
+/// Leaves a bare `"the"` alone.
 fn strip_article(s: &str) -> &str {
-    for article in ["the ", "an ", "a "] {
-        if let Some(rest) = s.strip_prefix(article) {
-            return rest;
-        }
-    }
-    s
+    s.strip_prefix("the ").unwrap_or(s)
 }
 
 // ── The model edge: prompt + schema ──────────────────────────────────────────────────────────────
@@ -274,34 +267,46 @@ pub async fn sweep_public(
     pool: &sqlx::PgPool,
     cfg: &SummarizationConfig,
 ) -> anyhow::Result<EnrichStats> {
+    use anyhow::Context;
+
     if !cfg.enrich {
         return Ok(EnrichStats::default());
     }
 
-    // Snapshot the pending frontier in one short read; the per-event writes follow individually.
-    let events = {
-        let mut tx = begin_scope(pool, ScopeCtx::NoSubscriber).await?;
-        let evs = store::pending_public_events(&mut *tx, cfg.enrich_max_per_sweep).await?;
-        tx.commit().await?;
-        evs
-    };
+    // Snapshot the pending frontier in one short scoped transaction; the per-event writes follow
+    // individually (the same `with_scope`-per-DB-step shape the summarization sweep uses, so the model
+    // calls are never held inside a transaction).
+    let limit = cfg.enrich_max_per_sweep;
+    let events = with_scope(pool, ScopeCtx::NoSubscriber, move |conn| {
+        Box::pin(async move {
+            store::pending_public_events(conn, limit)
+                .await
+                .context("load pending events for enrichment")
+        })
+    })
+    .await?;
     if events.is_empty() {
         return Ok(EnrichStats::default());
     }
 
-    // One client (and connection pool) for the whole pass, with the same generous per-call timeout the
-    // summarizer uses — a slow call just defers that event, it never blocks the build.
-    let http = reqwest::Client::builder()
-        .timeout(cfg.request_timeout)
-        .build()?;
+    // One client (and connection pool) for the whole pass, via the shared constructor so client setup
+    // (and its error context) lives in one place with the summarizer's.
+    let http = build_summarize_http(cfg, "enrich")?;
 
     let mut stats = EnrichStats::default();
     for ev in &events {
         match client::enrich_event(cfg, &http, ev).await {
             Some(tokens) => {
-                let mut tx = begin_scope(pool, ScopeCtx::NoSubscriber).await?;
-                store::apply_enrichment(&mut *tx, ev.id, &tokens).await?;
-                tx.commit().await?;
+                let event_id = ev.id;
+                let tokens_for_write = tokens.clone();
+                with_scope(pool, ScopeCtx::NoSubscriber, move |conn| {
+                    Box::pin(async move {
+                        store::apply_enrichment(conn, event_id, &tokens_for_write)
+                            .await
+                            .context("apply enrichment to event")
+                    })
+                })
+                .await?;
                 stats.enriched += 1;
                 stats.entities_added += tokens.len();
             }
@@ -406,5 +411,48 @@ mod tests {
         let title = "Anything at all";
         let tokens = ground_entities(title, None, &enr(&["", "   "], &[], &[], &[]));
         assert!(tokens.is_empty(), "{tokens:?}");
+    }
+
+    #[test]
+    fn value_straddling_the_title_body_boundary_does_not_falsely_ground() {
+        // "Royal" ends the title and "Navy" begins the body; "Royal Navy" appears contiguously in
+        // NEITHER field, so grounding it against the title‖body seam would be a hallucination. The
+        // separate-haystack check must reject it.
+        let title = "Honours for the Royal";
+        let body = "Navy budget cuts announced today.";
+        let tokens = ground_entities(title, Some(body), &enr(&[], &["Royal Navy"], &[], &[]));
+        assert!(
+            !tokens.contains(&"org:royal-navy".to_string()),
+            "boundary-straddling phrase must not ground: {tokens:?}"
+        );
+        // A value wholly inside one field still grounds (here, "Navy" alone is in the body).
+        let ok = ground_entities(title, Some(body), &enr(&[], &["Navy"], &[], &[]));
+        assert!(ok.contains(&"org:navy".to_string()), "{ok:?}");
+    }
+
+    #[test]
+    fn only_the_definite_article_is_stripped() {
+        // "the" is dropped so "the English Channel" == "English Channel" (the fusion case), but an
+        // indefinite article that is part of a real name is preserved rather than mangled.
+        let title = "the English Channel and the band A Tribe Called Quest";
+        let tokens = ground_entities(
+            title,
+            None,
+            &enr(
+                &["the English Channel"],
+                &["A Tribe Called Quest"],
+                &[],
+                &[],
+            ),
+        );
+        assert!(
+            tokens.contains(&"place:english-channel".to_string()),
+            "{tokens:?}"
+        );
+        // "A " is kept, so the slug matches the real name rather than "tribe-called-quest".
+        assert!(
+            tokens.contains(&"org:a-tribe-called-quest".to_string()),
+            "{tokens:?}"
+        );
     }
 }

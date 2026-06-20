@@ -4,7 +4,7 @@
 //! (migration 20200101000035) authorizes the write.
 
 use crate::common::event::{from_row, Event};
-use sqlx::{PgExecutor, Row};
+use sqlx::PgExecutor;
 use uuid::Uuid;
 
 /// The `event` column list in [`from_row`] order — mirrors the ingest/cluster stores' projection
@@ -63,24 +63,4 @@ pub async fn apply_enrichment(
     .execute(executor)
     .await?;
     Ok(())
-}
-
-/// True iff any public event is ingested-but-not-yet-enriched and still ahead of the build watermark —
-/// the same shape as `cluster::store::unbuilt_public_events_exist`, for a tick that wants to gate the
-/// enrichment/build job on real pending work. (Currently the sweep is hung off the build, which already
-/// gates on unbuilt events; provided for symmetry and future direct scheduling.)
-pub async fn pending_public_events_exist(
-    executor: impl PgExecutor<'_>,
-) -> Result<bool, sqlx::Error> {
-    let row = sqlx::query(
-        "SELECT EXISTS (
-            SELECT 1 FROM event
-            WHERE scope_kind = 'public'
-              AND enriched_at IS NULL
-              AND ingest_time > (SELECT built_through FROM build_watermark)
-         ) AS pending",
-    )
-    .fetch_one(executor)
-    .await?;
-    Ok(row.get("pending"))
 }
