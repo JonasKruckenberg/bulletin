@@ -708,7 +708,7 @@ mod tests {
                 c
             })
             .collect();
-        let out = select(stale, &cfg, 1000, at(1000));
+        let out = select(stale, &cfg, 1000, at(1000), no_floor());
         let selected: Vec<&Decision> = out.iter().filter(|d| d.is_selected()).collect();
         assert_eq!(selected.len(), 3, "only resurface_cap stale notes render");
         assert!(selected.iter().all(|d| d.richness == "still developing"));
@@ -736,7 +736,7 @@ mod tests {
                 c
             })
             .collect();
-        let out = select(fresh, &cfg, 1000, at(1000));
+        let out = select(fresh, &cfg, 1000, at(1000), no_floor());
         assert_eq!(out.iter().filter(|d| d.is_selected()).count(), 5);
     }
 
