@@ -50,13 +50,13 @@ pub(crate) fn render(html: &str, max_html_chars: usize, max_chars: usize) -> Opt
     //      `coast.<a>tagesschau.de</a>The` -> `coast.[tagesschau.de]The`. That single mashed token then
     //      both reads as garbage and trips the summarizer's bare-domain faithfulness gate downstream.
     //   2. It prefixes a heading with a markdown `##` marker.
-    // Turn the link brackets into spaces (de-gluing the boundary while keeping the link's visible text as
-    // plain content) and drop standalone heading markers, *before* the whitespace collapse folds it into
-    // clean single-spaced prose.
-    let unbracketed = rendered.replace(['[', ']'], " ");
-    let normalized = unbracketed
-        .split_whitespace()
-        .filter(|tok| !tok.bytes().all(|b| b == b'#'))
+    // Split on the link brackets as well as whitespace — de-gluing the boundary while keeping the link's
+    // visible text as plain content — and drop standalone heading markers, in the same tokenization pass
+    // that collapses whitespace into clean single-spaced prose (so no extra full-string allocation just to
+    // swap the brackets out first). Empty pieces from adjacent delimiters are filtered with the markers.
+    let normalized = rendered
+        .split(|c: char| c.is_whitespace() || c == '[' || c == ']')
+        .filter(|tok| !tok.is_empty() && !tok.bytes().all(|b| b == b'#'))
         .collect::<Vec<_>>()
         .join(" ");
     if normalized.is_empty() {
