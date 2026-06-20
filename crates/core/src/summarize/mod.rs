@@ -409,6 +409,28 @@ impl ClusterSummary {
     pub fn rebuild_tldr_text(&mut self) {
         self.tldr_text = self.tldr.iter().map(TldrRun::surface).collect();
     }
+
+    /// Neutralize any clickable-looking token (an explicit URL or a bare domain) the model wrote into the
+    /// editorial prose — bracketing its dots (`acme.com` → `acme[.]com`) via the shared
+    /// [`link_safety::defang`](crate::common::link_safety::defang) backstop — *instead of* the gate
+    /// rejecting the whole summary for it. The reasoning: §3.7 left no deterministic baseline to fall
+    /// back to, so a [`GateViolation::UrlInProse`] reject doesn't downgrade the line — it withholds the
+    /// cluster entirely (and, after the retry budget, quarantines it). The render path defangs displayed
+    /// text anyway, so doing it here lets an otherwise-faithful summary ship a true, link-inert line
+    /// rather than nothing. Applied to the visible `headline` and run `surface`/`text` only; an entity
+    /// `ref` id is resolved to a badge, never displayed raw, so it is left untouched. `tldr_text` is
+    /// rebuilt so the flat fallback can't drift from the defanged runs.
+    pub fn defang_prose(&mut self) {
+        use crate::common::link_safety::defang;
+        self.headline = defang(&self.headline).into_owned();
+        for run in &mut self.tldr {
+            match run {
+                TldrRun::Text { text } => *text = defang(text).into_owned(),
+                TldrRun::Ref { surface, .. } => *surface = defang(surface).into_owned(),
+            }
+        }
+        self.rebuild_tldr_text();
+    }
 }
 
 // ── Content signature (§2.1 staleness gate) ──────────────────────────────────────────────────────
@@ -474,7 +496,21 @@ pub fn extract_facts(events: &[Event]) -> Facts {
     let mut numbers: Vec<String> = Vec::new();
     let mut dates: Vec<String> = Vec::new();
     for e in events {
-        entities.extend(e.entities.iter().cloned());
+        // `url:`/`domain:` entities are cross-source *linking* keys (see [`entity::link_strength`] —
+        // a `url:` is a Strong blocking key), not nameable references. They must not enter the
+        // summarizer's facts: the prompt offers `facts.entities` to the model as the allowed `ref`
+        // surfaces, but the house voice forbids writing any web address (§3.6 rule 5) and the
+        // faithfulness gate rejects one ([`GateViolation::UrlInProse`]). Feeding a `domain:tagesschau.de`
+        // into the allowed-ref list therefore only tempts the model into a guaranteed rejection (the
+        // observed `tagesschau.de` / `1990.tagesschau.de` leaks). Keep the referenceable kinds
+        // (`cve:`/`repo:`/`user:`/`person:`/`org:`/`place:`/`topic:`); the link layer still reads the
+        // url/domain keys off the cluster's own `entities`, untouched.
+        entities.extend(
+            e.entities
+                .iter()
+                .filter(|t| !t.starts_with("url:") && !t.starts_with("domain:"))
+                .cloned(),
+        );
         mine_numeric(&e.title, &mut numbers, &mut dates);
         // Mine the richest available text (fetched `full_text`, else `body`) so numbers/dates that
         // appear only in the full article are grounded for the faithfulness gate — the model is fed
@@ -2360,7 +2396,13 @@ mod tests {
                 100,
                 "Auth broke at 14:02",
                 Some("12% of logins failed for 40m"),
-                &["repo:acme/auth"],
+                // `url:`/`domain:` linking keys ride along on the event but must not reach the
+                // summarizer's referenceable facts (they'd only invite a rule-5 / UrlInProse rejection).
+                &[
+                    "repo:acme/auth",
+                    "url:https://tagesschau.de/x",
+                    "domain:tagesschau.de",
+                ],
             ),
             ev(
                 2,
@@ -2371,8 +2413,9 @@ mod tests {
             ),
         ];
         let facts = extract_facts(&events);
-        assert_eq!(facts.entities, vec!["repo:acme/auth", "user:dlewis"]); // sorted + deduped
-                                                                           // The miner keeps digit runs + glue punctuation (`%`), dropping unit-suffix letters: "40m" → "40".
+        // sorted + deduped, and the url:/domain: keys are filtered out of the summarizer's entity set.
+        assert_eq!(facts.entities, vec!["repo:acme/auth", "user:dlewis"]);
+        // The miner keeps digit runs + glue punctuation (`%`), dropping unit-suffix letters: "40m" → "40".
         assert!(facts.numbers.contains(&"12%".to_string()));
         assert!(facts.numbers.contains(&"40".to_string()));
         assert!(facts.dates.contains(&"14:02".to_string())); // ':' → routed to dates
@@ -2581,6 +2624,88 @@ mod tests {
             faithful(&bare, &facts, "Databricks announced LTAP"),
             Err(GateViolation::UrlInProse(_))
         ));
+    }
+
+    #[test]
+    fn defang_prose_neutralizes_links_and_passes_the_gate() {
+        let facts = Facts {
+            entities: vec!["repo:acme/auth".to_string()],
+            ..Default::default()
+        };
+        // A summary the model leaked a bare domain into — both in the headline and in a text run — plus a
+        // grounded entity ref that must survive untouched.
+        let mut s = ClusterSummary {
+            headline: "Outage tracked on databricks.com".to_string(),
+            tldr: vec![
+                TldrRun::Text {
+                    text: "The fix landed in ".to_string(),
+                },
+                TldrRun::Ref {
+                    entity: "repo:acme/auth".to_string(),
+                    surface: "acme/auth".to_string(),
+                },
+                TldrRun::Text {
+                    text: " after the status.claude.com note.".to_string(),
+                },
+            ],
+            tldr_text: String::new(),
+            ..Default::default()
+        };
+        s.rebuild_tldr_text();
+        // Pre-defang: the gate would reject this outright (and, post-§3.7, withhold the cluster).
+        assert!(matches!(
+            faithful(
+                &s,
+                &facts,
+                "Outage tracked. status.claude.com note. The fix landed."
+            ),
+            Err(GateViolation::UrlInProse(_))
+        ));
+
+        s.defang_prose();
+        // The domains are now inert; the entity `ref` id is preserved (only its visible surface is
+        // defanged, and that surface holds no link to defang).
+        assert_eq!(s.headline, "Outage tracked on databricks[.]com");
+        assert!(s.tldr_text.contains("status[.]claude[.]com"));
+        assert!(matches!(&s.tldr[1], TldrRun::Ref { entity, surface }
+            if entity == "repo:acme/auth" && surface == "acme/auth"));
+        // And the gate now passes — a true, link-inert line ships instead of nothing.
+        assert!(faithful(
+            &s,
+            &facts,
+            "Outage tracked. status.claude.com note. The fix landed."
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn defang_prose_rescues_a_glued_sentence_boundary_false_positive() {
+        // A missing space after a period ("Poland.The") looks like a bare host to the gate. Defang turns
+        // it inert so the otherwise-clean line is no longer rejected as a URL leak.
+        let mut s = ClusterSummary {
+            headline: "Aid reaches Poland".to_string(),
+            tldr: vec![TldrRun::Text {
+                text: "Supplies arrived in Poland.The corridor stayed open.".to_string(),
+            }],
+            tldr_text: String::new(),
+            ..Default::default()
+        };
+        s.rebuild_tldr_text();
+        assert!(matches!(
+            faithful(
+                &s,
+                &Facts::default(),
+                "Aid reaches Poland. The corridor stayed open."
+            ),
+            Err(GateViolation::UrlInProse(_))
+        ));
+        s.defang_prose();
+        assert!(faithful(
+            &s,
+            &Facts::default(),
+            "Aid reaches Poland. The corridor stayed open."
+        )
+        .is_ok());
     }
 
     #[test]

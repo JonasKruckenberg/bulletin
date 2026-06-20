@@ -44,7 +44,7 @@ pub async fn summarize_cluster(
     http: &reqwest::Client,
     events: &[Event],
 ) -> SummaryOutcome {
-    let (summary, facts, source) = match generate_candidate(cfg, http, events).await {
+    let (mut summary, facts, source) = match generate_candidate(cfg, http, events).await {
         Ok(generated) => generated,
         Err(e) => {
             let kind = failure_kind(&e);
@@ -59,6 +59,11 @@ pub async fn summarize_cluster(
         }
     };
 
+    // Defang a leaked URL/bare-domain into an inert `acme[.]com` rather than letting the gate reject the
+    // whole summary for it — with no §3.7 baseline to fall back to, a reject withholds (then quarantines)
+    // an otherwise-faithful cluster. The eval path (`eval_cluster`) deliberately does *not* defang, so it
+    // still measures the model's raw bare-domain leak rate.
+    summary.defang_prose();
     if cfg.faithfulness_gate {
         if let Err(v) = faithful(&summary, &facts, &source) {
             tracing::debug!(violation = ?v, "faithfulness gate rejected summary; will retry with an escalated seed");
@@ -210,6 +215,9 @@ pub async fn synthesize_story(
     };
     summary.rebuild_tldr_text();
 
+    // Same §3.7 reasoning as the cluster path: defang a leaked URL/bare-domain so an otherwise-faithful
+    // cross-source synthesis ships a link-inert line instead of being withheld and retried to quarantine.
+    summary.defang_prose();
     if cfg.faithfulness_gate {
         if let Err(v) = faithful(&summary, &facts, &corpus) {
             tracing::debug!(violation = ?v, "story synthesis gate rejected; will retry with an escalated seed");
