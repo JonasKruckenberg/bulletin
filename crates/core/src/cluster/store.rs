@@ -27,15 +27,22 @@ pub async fn try_build_lock(executor: impl PgExecutor<'_>) -> Result<bool, sqlx:
     Ok(row.get("locked"))
 }
 
-/// Reads `(built_through, now())` in one shot. `now()` is the high-watermark snapshot for
-/// this build; processing the half-open range `(built_through, hwm]` and advancing to `hwm`
+/// Reads `(built_through, now() - enrich_grace)` in one shot. The high-watermark snapshot is held
+/// `enrich_grace` behind `now()` (the Phase-2 cluster-eligibility deadline — see [`crate::cluster::build`]),
+/// so an event in the grace window stays out of this build's half-open range `(built_through, hwm]`
+/// and is left for the enrichment sweep; once it ages past the window it is clustered with whatever
+/// entities it has. `Duration::ZERO` ⇒ `hwm = now()`, the pre-Phase-2 behavior. Advancing to `hwm`
 /// keeps the watermark monotonic and race-free against concurrent inserts.
 pub async fn build_bounds(
     executor: impl PgExecutor<'_>,
+    enrich_grace: std::time::Duration,
 ) -> Result<(DateTime<Utc>, DateTime<Utc>), sqlx::Error> {
-    let row = sqlx::query("SELECT built_through, now() AS hwm FROM build_watermark")
-        .fetch_one(executor)
-        .await?;
+    let row = sqlx::query(
+        "SELECT built_through, now() - make_interval(secs => $1) AS hwm FROM build_watermark",
+    )
+    .bind(enrich_grace.as_secs_f64())
+    .fetch_one(executor)
+    .await?;
     Ok((row.get("built_through"), row.get("hwm")))
 }
 

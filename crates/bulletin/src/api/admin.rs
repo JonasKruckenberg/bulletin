@@ -247,7 +247,10 @@ impl UnstableDebugService for AdminApi {
         &self,
         _req: Request<proto::RunBuildRequest>,
     ) -> Result<Response<proto::RunBuildResponse>, Status> {
-        let resp = match cluster::build(&self.pool)
+        // Debug hook: force a build now. Honour the configured enrichment grace so a manual build
+        // doesn't cluster still-enrichable events ahead of the sweep (`ZERO` when enrichment is off).
+        let grace = bulletin_core::summarize::SummarizationConfig::from_env().enrich_grace;
+        let resp = match cluster::build(&self.pool, grace)
             .await
             .map_err(error::internal("run build"))?
         {

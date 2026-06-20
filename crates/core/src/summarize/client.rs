@@ -519,13 +519,14 @@ async fn call_model(
     .await
 }
 
-/// The shared chat-completion plumbing every summarization call routes through (the summarizer, the
-/// comprehension pass, and Phase C's story synthesis later): build the OpenAI-compatible body with the
-/// `response_format: json_schema` (llama.cpp's GBNF token-masking → structurally valid JSON), POST to
-/// the local sidecar, and deserialize `choices[0].message.content` into `T`. Errors (transport,
-/// non-success status, malformed envelope/JSON) bubble up to the caller, which degrades to its
-/// deterministic fallback.
-async fn chat_json<T: serde::de::DeserializeOwned>(
+/// The shared chat-completion plumbing every constrained call routes through (the summarizer, the
+/// comprehension pass, Phase C's story synthesis, and the Phase-2 entity [enrichment](crate::enrich)
+/// pass): build the OpenAI-compatible body with the `response_format: json_schema` (llama.cpp's GBNF
+/// token-masking → structurally valid JSON), POST to the local sidecar, and deserialize
+/// `choices[0].message.content` into `T`. Errors (transport, non-success status, malformed
+/// envelope/JSON) bubble up to the caller, which degrades to its deterministic fallback. `pub(crate)`
+/// so the enrichment client can reuse the exact same plumbing rather than re-implement it.
+pub(crate) async fn chat_json<T: serde::de::DeserializeOwned>(
     cfg: &SummarizationConfig,
     http: &reqwest::Client,
     phase: &'static str,

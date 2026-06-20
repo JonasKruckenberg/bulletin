@@ -198,7 +198,14 @@ async fn public_build(
     pool: Data<PgPool>,
 ) -> Result<(), BoxDynError> {
     traced("public_build", task_id, attempt, async move {
-        match bulletin_core::cluster::build(&pool).await {
+        let cfg = bulletin_core::summarize::SummarizationConfig::from_env();
+        // Phase 2: before clustering, run the best-effort entity-enrichment sweep so grounded
+        // place:/org:/person:/topic: tokens are on an event's entity set before it becomes
+        // cluster-eligible (and so drive story fusion). Never blocks/fails the build — a down/disabled
+        // sweep just leaves events with structural+derived entities, and the build's grace deadline
+        // (`cfg.enrich_grace`) ages them in regardless.
+        enrich_public(&pool, &cfg).await;
+        match bulletin_core::cluster::build(&pool, cfg.enrich_grace).await {
             Ok(Some(stats)) => {
                 tracing::info!(dirty_groups = stats.dirty_groups, "public build complete");
                 // Off the punctual path: summarize the public clusters whose content changed. Per-cluster
@@ -251,6 +258,26 @@ async fn fetch_articles(
         Ok(())
     })
     .await
+}
+
+/// Phase-2 public entity-enrichment sweep, run *before* the PublicBuild (the pre-cluster point): mine
+/// grounded `place:`/`org:`/`person:`/`topic:` tokens out of new items and union them onto each
+/// event's entities so cross-publisher coverage fuses into one story. Best-effort and never fatal — a
+/// failed/disabled/timed-out call leaves the item fully usable with the entities it already has; this
+/// only ever logs. The `BULLETIN_LLM_*` env configures the sidecar (URL/model) and the `ENRICH`/grace knobs.
+async fn enrich_public(pool: &PgPool, cfg: &bulletin_core::summarize::SummarizationConfig) {
+    match bulletin_core::enrich::sweep_public(pool, cfg).await {
+        Ok(stats) => tracing::info!(
+            enriched = stats.enriched,
+            failed = stats.failed,
+            entities_added = stats.entities_added,
+            "entity enrichment sweep complete"
+        ),
+        Err(e) => tracing::warn!(
+            error = %format!("{e:#}"),
+            "entity enrichment sweep failed (non-fatal)"
+        ),
+    }
 }
 
 /// Public cluster-summarization sweep, hung off a completed PublicBuild (the natural

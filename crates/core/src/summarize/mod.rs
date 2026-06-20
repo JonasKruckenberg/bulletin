@@ -103,6 +103,24 @@ pub struct SummarizationConfig {
     /// Max clusters summarized per sweep — bounds one best-effort pass so a large backlog drains over
     /// several sweeps rather than one long-running job.
     pub max_per_sweep: i64,
+
+    // ── Phase 2: entity/topic enrichment (the early grounded-NER pass, `crate::enrich`) ────────────
+    /// Run the best-effort entity-enrichment sweep ahead of clustering: a constrained LLM call per new
+    /// item that extracts grounded `place:`/`org:`/`person:`/`topic:` tokens so cross-publisher
+    /// coverage fuses on what a story is ABOUT. Off ⇒ the sweep is a no-op and the build's grace
+    /// collapses to zero (today's behavior). Genuinely best-effort (an item is always usable without
+    /// it), so this *is* a real toggle, unlike summarization.
+    pub enrich: bool,
+    /// Token ceiling for one enrichment call — a short `analysis` scratchpad + four small entity lists.
+    pub enrich_max_tokens: u32,
+    /// The cluster-eligibility grace deadline: an event becomes cluster-eligible only once it has aged
+    /// this far past ingest, by which point it is either enriched or the sweep gave up — it then
+    /// clusters with the entities it already has (structural + derived). Bounds how long the build
+    /// "falls behind" to wait for enrichment; the punctual send path is never affected. Zero (or
+    /// `enrich == false`) ⇒ no grace, the build runs to `now()` exactly as before.
+    pub enrich_grace: Duration,
+    /// Max events enriched per sweep — bounds one best-effort pass like [`max_per_sweep`](Self::max_per_sweep).
+    pub enrich_max_per_sweep: i64,
 }
 
 impl Default for SummarizationConfig {
@@ -133,6 +151,12 @@ impl Default for SummarizationConfig {
             lead_deadline: Duration::from_secs(20),
             max_source_chars: 4000,
             max_per_sweep: 200,
+            enrich: true,
+            enrich_max_tokens: 256,
+            // Small relative to a digest cadence (hours): the most an event's clustering is deferred to
+            // wait for enrichment. Sized for a few sweep attempts on a slow CPU model before it ages in.
+            enrich_grace: Duration::from_secs(90),
+            enrich_max_per_sweep: 200,
         }
     }
 }
@@ -210,6 +234,16 @@ impl SummarizationConfig {
         }
         if let Some(b) = env_bool("BULLETIN_LLM_DISABLE_THINKING") {
             cfg.disable_thinking = b;
+        }
+        // Phase-2 enrichment toggle + its cluster-eligibility grace deadline. A `0`/garbage grace keeps
+        // the default rather than collapsing the window silently; disable the pass with the toggle.
+        if let Some(b) = env_bool("BULLETIN_LLM_ENRICH") {
+            cfg.enrich = b;
+        }
+        if let Ok(v) = std::env::var("BULLETIN_LLM_ENRICH_GRACE_SECS") {
+            if let Ok(secs) = v.trim().parse::<u64>() {
+                cfg.enrich_grace = Duration::from_secs(secs);
+            }
         }
         // The lead deadline only bounds the punctual send if it sits at or under the per-call HTTP
         // timeout — past that, `request_timeout` is the real cap and the "at most `lead_deadline`"
