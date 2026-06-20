@@ -29,6 +29,17 @@ fn rss(stable_id: &str, title: &str) -> EventBuilder {
     .links(vec![format!("https://example.com/{stable_id}")])
 }
 
+/// Inserts a minimal `subscriber` row with the given id (everything but `email` defaults), so a
+/// private event can finalize to it — `event.scope_subscriber_id` is an FK to `subscriber`.
+async fn seed_subscriber(pool: &sqlx::PgPool, id: Uuid) {
+    sqlx::query("INSERT INTO subscriber (id, email) VALUES ($1, $2)")
+        .bind(id)
+        .bind(format!("{id}@example.com"))
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
 // First insert returns the full event with all fields round-tripped correctly.
 #[tokio::test]
 async fn insert_returns_event() {
@@ -103,6 +114,9 @@ async fn fingerprint_dedup_is_scoped_per_owner() {
     let (pool, _pg) = setup().await;
     let alice = Uuid::new_v4();
     let bob = Uuid::new_v4();
+    // Private events bind to these owners, which must exist — scope_subscriber_id is an FK.
+    seed_subscriber(&pool, alice).await;
+    seed_subscriber(&pool, bob).await;
 
     let a = rss("issue:999", "Alice's view")
         .private(true)
