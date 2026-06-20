@@ -496,7 +496,21 @@ pub fn extract_facts(events: &[Event]) -> Facts {
     let mut numbers: Vec<String> = Vec::new();
     let mut dates: Vec<String> = Vec::new();
     for e in events {
-        entities.extend(e.entities.iter().cloned());
+        // `url:`/`domain:` entities are cross-source *linking* keys (see [`entity::link_strength`] —
+        // a `url:` is a Strong blocking key), not nameable references. They must not enter the
+        // summarizer's facts: the prompt offers `facts.entities` to the model as the allowed `ref`
+        // surfaces, but the house voice forbids writing any web address (§3.6 rule 5) and the
+        // faithfulness gate rejects one ([`GateViolation::UrlInProse`]). Feeding a `domain:tagesschau.de`
+        // into the allowed-ref list therefore only tempts the model into a guaranteed rejection (the
+        // observed `tagesschau.de` / `1990.tagesschau.de` leaks). Keep the referenceable kinds
+        // (`cve:`/`repo:`/`user:`/`person:`/`org:`/`place:`/`topic:`); the link layer still reads the
+        // url/domain keys off the cluster's own `entities`, untouched.
+        entities.extend(
+            e.entities
+                .iter()
+                .filter(|t| !t.starts_with("url:") && !t.starts_with("domain:"))
+                .cloned(),
+        );
         mine_numeric(&e.title, &mut numbers, &mut dates);
         // Mine the richest available text (fetched `full_text`, else `body`) so numbers/dates that
         // appear only in the full article are grounded for the faithfulness gate — the model is fed
@@ -2382,7 +2396,9 @@ mod tests {
                 100,
                 "Auth broke at 14:02",
                 Some("12% of logins failed for 40m"),
-                &["repo:acme/auth"],
+                // `url:`/`domain:` linking keys ride along on the event but must not reach the
+                // summarizer's referenceable facts (they'd only invite a rule-5 / UrlInProse rejection).
+                &["repo:acme/auth", "url:https://tagesschau.de/x", "domain:tagesschau.de"],
             ),
             ev(
                 2,
@@ -2393,7 +2409,8 @@ mod tests {
             ),
         ];
         let facts = extract_facts(&events);
-        assert_eq!(facts.entities, vec!["repo:acme/auth", "user:dlewis"]); // sorted + deduped
+        // sorted + deduped, and the url:/domain: keys are filtered out of the summarizer's entity set.
+        assert_eq!(facts.entities, vec!["repo:acme/auth", "user:dlewis"]);
                                                                            // The miner keeps digit runs + glue punctuation (`%`), dropping unit-suffix letters: "40m" → "40".
         assert!(facts.numbers.contains(&"12%".to_string()));
         assert!(facts.numbers.contains(&"40".to_string()));
