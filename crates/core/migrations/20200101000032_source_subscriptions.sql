@@ -36,6 +36,10 @@ CREATE TABLE subscription (
     PRIMARY KEY (subscriber_id, connection_id)
 );
 
+-- The PK (subscriber_id, connection_id) serves the per-subscriber read; the connection-delete cascade
+-- probes by connection_id (the PK's trailing column → no index), so it needs its own.
+CREATE INDEX subscription_connection ON subscription (connection_id);
+
 -- ── (3) reclaim private cache on subscriber delete ─────────────────────────
 -- These three tables carry a private owner with no FK (clusters/events are a "rebuildable cache", so
 -- the columns were added scope-first in 0002/0012/0021). A bare `scope_subscriber_id` left a deleted
@@ -47,6 +51,12 @@ ALTER TABLE cluster     ADD CONSTRAINT cluster_scope_subscriber_fk
     FOREIGN KEY (scope_subscriber_id) REFERENCES subscriber(id) ON DELETE CASCADE;
 ALTER TABLE entity_edge ADD CONSTRAINT entity_edge_scope_subscriber_fk
     FOREIGN KEY (scope_subscriber_id) REFERENCES subscriber(id) ON DELETE CASCADE;
+
+-- Index the new cascades' probe column so deleting a subscriber doesn't seq-scan the (large) event
+-- log and the edge table. Partial on the private rows — public rows have a NULL scope_subscriber_id a
+-- cascade never probes. (cluster already has `cluster_private_recency (scope_subscriber_id, …)`.)
+CREATE INDEX event_scope_subscriber       ON event       (scope_subscriber_id) WHERE scope_kind = 'private';
+CREATE INDEX entity_edge_scope_subscriber ON entity_edge (scope_subscriber_id) WHERE scope_kind = 'private';
 
 -- ── RLS: subscription is per-subscriber control-plane (mirrors 0020) ───────
 -- `admin OR own`: the digest fire reads the subscriber's own rows in their context (the candidate

@@ -62,12 +62,15 @@ pub async fn list_subscriptions(
     subscriber_id: Uuid,
 ) -> Result<Vec<ConnectionRow>, sqlx::Error> {
     let mut tx = begin_scope(pool, ScopeCtx::Admin).await?;
+    // Membership via an IN-subquery rather than a JOIN: `connection` and `subscription` both carry a
+    // `subscriber_id` column (the connection's owner vs the subscription's subscriber), so a joined
+    // `SELECT {CONNECTION_COLUMNS}` would be an ambiguous-column error. The subquery keeps the
+    // projection unambiguously on `connection`, reusing the shared column list + its row mapper.
     let rows = sqlx::query(&format!(
         "SELECT {CONNECTION_COLUMNS}
-         FROM connection c
-         JOIN subscription s ON s.connection_id = c.id
-         WHERE s.subscriber_id = $1
-         ORDER BY c.next_poll_at"
+         FROM connection
+         WHERE id IN (SELECT connection_id FROM subscription WHERE subscriber_id = $1)
+         ORDER BY next_poll_at"
     ))
     .bind(subscriber_id)
     .try_map(row_to_connection)
