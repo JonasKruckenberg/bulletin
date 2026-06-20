@@ -30,6 +30,14 @@ const LLM_CALL_DURATION_BUCKETS: &[f64] = &[
     0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0, 45.0, 60.0, 90.0, 120.0,
 ];
 
+/// Per-fetch latency buckets for `bulletin_fetch_duration_seconds`, in seconds. An article fetch is a
+/// handful of HTTP round-trips that either complete in well under a second or run out to the fetch
+/// timeout (default 10s); a near-instant SSRF/scheme rejection lands in the low buckets. Denser in the
+/// sub-second working range, reaching past the default timeout ceiling.
+const FETCH_DURATION_BUCKETS: &[f64] = &[
+    0.001, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0,
+];
+
 /// Installs the global Prometheus recorder and starts its own HTTP exporter on `addr` (not an app
 /// route — the exporter's listener also drives histogram upkeep). Must run inside the tokio
 /// runtime, since it spawns the listener.
@@ -51,6 +59,11 @@ pub fn init(addr: SocketAddr) -> Result<()> {
             LLM_CALL_DURATION_BUCKETS,
         )
         .context("set llm-call-duration buckets")?
+        .set_buckets_for_metric(
+            Matcher::Full("bulletin_fetch_duration_seconds".to_string()),
+            FETCH_DURATION_BUCKETS,
+        )
+        .context("set fetch-duration buckets")?
         .install()
         .context("install prometheus exporter")?;
     tracing::info!(%addr, "metrics exporter listening");
@@ -133,6 +146,8 @@ pub fn publish_gauges(r: &StatusReport) {
 
     // Ingest / build freshness.
     metrics::gauge!("bulletin_events_unbuilt").set(r.events.unbuilt as f64);
+    // The Phase-1 full-text fetch backlog — fetchable events still awaiting their article text.
+    metrics::gauge!("bulletin_events_fetch_pending").set(r.events.fetch_pending as f64);
     metrics::gauge!("bulletin_build_lag_seconds").set(r.build.lag_secs as f64);
     if let Some(ts) = r.events.latest_ingest {
         metrics::gauge!("bulletin_last_ingest_timestamp_seconds").set(ts.timestamp() as f64);

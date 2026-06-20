@@ -187,6 +187,25 @@ pub struct Event {
     pub raw: Option<Vec<u8>>,
     /// The originating `connection` (source-subscription key); `None` for pre-attribution rows.
     pub connection_id: Option<Uuid>,
+    /// The full readable article body, fetched best-effort post-ingest from the event's link
+    /// (`ingest::fetch`) for link-based sources whose `body` is only an RSS snippet. `None` until/
+    /// unless a fetch lands — the original `body` is never overwritten, so a failed or absent fetch
+    /// always leaves the event summarizable from what it already carried. See [`Event::best_text`].
+    pub full_text: Option<String>,
+}
+
+impl Event {
+    /// The richest grounding text available for this event: the fetched `full_text` when present and
+    /// non-blank, else the connector's `body` snippet (`None` when neither exists — a title-only
+    /// event). The single accessor every downstream raw-text tier reads — `summary_hash`,
+    /// `extract_facts`, and `source_corpus` — so they all prefer the article over the snippet
+    /// uniformly, and a source whose body *is* the content (GitHub) degrades to `body` for free.
+    pub fn best_text(&self) -> Option<&str> {
+        match self.full_text.as_deref() {
+            Some(t) if !t.trim().is_empty() => Some(t),
+            _ => self.body.as_deref(),
+        }
+    }
 }
 
 fn decode_err(msg: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> sqlx::Error {
@@ -220,6 +239,7 @@ pub fn from_row(row: PgRow) -> Result<Event, sqlx::Error> {
         ingest_time: row.get("ingest_time"),
         raw: row.get("raw"),
         connection_id: row.get("connection_id"),
+        full_text: row.get("full_text"),
     })
 }
 

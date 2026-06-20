@@ -114,6 +114,7 @@ fn event_stats(s: EventStats) -> proto::EventStats {
     proto::EventStats {
         total: s.total,
         unbuilt: s.unbuilt,
+        fetch_pending: s.fetch_pending,
         latest_ingest: opt_ts(s.latest_ingest),
         by_source: s
             .by_source

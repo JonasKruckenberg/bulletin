@@ -158,7 +158,7 @@ pub async fn list_group_events(
     sqlx::query(
         "SELECT id, fingerprint, source, scope_kind, scope_subscriber_id,
                 event_time, title, body, links, group_key, entities,
-                content_kind, severity_hint, ingest_time, raw, connection_id
+                content_kind, severity_hint, ingest_time, raw, connection_id, full_text
          FROM event
          WHERE scope_kind = $1 AND scope_subscriber_id IS NOT DISTINCT FROM $2
            AND source = $3 AND group_key = $4

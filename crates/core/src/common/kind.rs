@@ -51,6 +51,18 @@ impl SourceKind {
             SourceKind::Slack => true,
         }
     }
+
+    /// Whether this source's events carry a *link to fetchable article content* distinct from the
+    /// event body — the gate for the best-effort full-text fetch (`ingest::fetch`, Phase 1). RSS items
+    /// link out to an article whose `body` is only a snippet, so fetching the page enriches grounding.
+    /// GitHub and Slack events ARE the content (a PR description, a chat message) — their link points
+    /// back at the item itself, so there is nothing to fetch and they degrade to `body` unchanged.
+    pub fn has_fetchable_article(self) -> bool {
+        match self {
+            SourceKind::Rss => true,
+            SourceKind::Github | SourceKind::Slack => false,
+        }
+    }
 }
 
 text_enum! {

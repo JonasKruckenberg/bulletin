@@ -18,7 +18,7 @@ pub(crate) const CONNECTION_COLUMNS: &str =
 /// shared by the append `RETURNING` and the debug list `SELECT`.
 const EVENT_COLUMNS: &str = "id, fingerprint, source, scope_kind, scope_subscriber_id, \
      event_time, title, body, links, group_key, entities, \
-     content_kind, severity_hint, ingest_time, raw, connection_id";
+     content_kind, severity_hint, ingest_time, raw, connection_id, full_text";
 
 // ── Connections ────────────────────────────────────────────────────────
 //
