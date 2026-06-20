@@ -39,6 +39,9 @@ pub struct ClusterRollup {
     pub content_depth: ContentKind,
     /// Max source-provided `severity_hint` over the group, or `None` — a priority boost input.
     pub max_severity: Option<i16>,
+    /// The representative event's originating `connection` — the source-subscription key a public
+    /// cluster is filtered by. `None` for a group of pre-attribution events (no connection stamped).
+    pub connection_id: Option<Uuid>,
 }
 
 /// Pure rollup: fold a within-source group of events into a cluster rollup. The representative
@@ -72,6 +75,9 @@ pub fn rollup(events: &[Event]) -> Option<ClusterRollup> {
         event_count: events.len() as i32,
         content_depth,
         max_severity,
+        // The representative (latest) event's source — a within-source group shares it; for the
+        // single-article public RSS cluster this is exactly the feed the subscriber subscribes to.
+        connection_id: representative.connection_id,
     })
 }
 
@@ -263,6 +269,7 @@ mod tests {
             severity_hint: None,
             ingest_time: Utc.timestamp_opt(secs, 0).single().unwrap(),
             raw: None,
+            connection_id: None,
         }
     }
 

@@ -128,6 +128,10 @@ service AdminService {
   rpc CreateSubscriber  (CreateSubscriberRequest)  returns (Subscriber);
   rpc DeleteSubscriber  (DeleteSubscriberRequest)  returns (DeleteSubscriberResponse);
   rpc IssueSubscriberToken (IssueSubscriberTokenRequest) returns (IssueSubscriberTokenResponse);
+  // Subscriptions — the sources comprising a subscriber's digest (mirrors `debug subscription-add/list/rm`)
+  rpc Subscribe         (SubscribeRequest)         returns (SubscribeResponse);
+  rpc Unsubscribe       (UnsubscribeRequest)       returns (UnsubscribeResponse);
+  rpc ListSubscriptions (ListSubscriptionsRequest) returns (ListSubscriptionsResponse);
   // Ops / read (mirrors `debug status`, `event-list`, `digest-list` — metadata only)
   rpc GetStatus         (GetStatusRequest)         returns (StatusReport);
   rpc ListEvents        (ListEventsRequest)        returns (ListEventsResponse);
@@ -174,6 +178,9 @@ Almost every RPC is a thin wrapper over a function that exists today:
 | `AdminService.DeleteConnection` | `ingest::store::delete_connection` | Admin |
 | `AdminService.ListSubscribers` | `digest::subscriber::list_subscribers` | Admin |
 | `AdminService.CreateSubscriber` | `digest::subscriber::insert_subscriber` | Admin |
+| `AdminService.Subscribe` | `subscription::subscribe` | Admin |
+| `AdminService.Unsubscribe` | `subscription::unsubscribe` | Admin |
+| `AdminService.ListSubscriptions` | `subscription::list_subscriptions` | Admin |
 | `AdminService.GetStatus` | `status::gather` | Admin |
 | `AdminService.ListEvents` | `ingest::store::list_events` | Admin |
 | `AdminService.ListDigests` | `digest::store::list_digests` | Admin |

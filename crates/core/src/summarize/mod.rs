@@ -2272,6 +2272,7 @@ mod tests {
             severity_hint: None,
             ingest_time: Utc.timestamp_opt(secs, 0).single().unwrap(),
             raw: None,
+            connection_id: None,
         }
     }
 

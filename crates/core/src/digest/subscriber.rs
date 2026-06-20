@@ -279,7 +279,11 @@ pub async fn delete_subscriber(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Er
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok(result.rows_affected() > 0)
+    let deleted = result.rows_affected() > 0;
+    // The delete cascades to the subscriber's connections, subscriptions, digests, stories, and
+    // (via the scope-FK) their private clusters/events — the whole private footprint is reclaimed.
+    tracing::info!(subscriber_id = %id, deleted, "subscriber deleted (private cache reclaimed)");
+    Ok(deleted)
 }
 
 /// Loads one subscriber by id — generate's first step, so it runs in *that subscriber's* context

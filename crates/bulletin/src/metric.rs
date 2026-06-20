@@ -145,6 +145,8 @@ pub fn publish_gauges(r: &StatusReport) {
     metrics::gauge!("bulletin_subscribers", "freq" => "daily").set(r.subscribers.daily as f64);
     metrics::gauge!("bulletin_subscribers", "freq" => "weekly").set(r.subscribers.weekly as f64);
     metrics::gauge!("bulletin_subscribers_due").set(r.subscribers.due_now as f64);
+    // Subscriptions: the steady-state size of the subscriber↔source relation that drives digests.
+    metrics::gauge!("bulletin_subscriptions_total").set(r.subscribers.subscriptions as f64);
 
     // Digests (delivery backlog + last-delivery freshness).
     metrics::gauge!("bulletin_digests_pending").set(r.digests.pending as f64);
