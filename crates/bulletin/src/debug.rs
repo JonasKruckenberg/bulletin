@@ -682,6 +682,10 @@ fn print_status(r: &proto::StatusReport) {
         s.due_now,
         opt_ts(&s.next_run)
     );
+    println!(
+        "subscriptions {} total (subscriber↔source edges)",
+        s.subscriptions
+    );
 
     let d = r.digests.unwrap_or_default();
     println!(

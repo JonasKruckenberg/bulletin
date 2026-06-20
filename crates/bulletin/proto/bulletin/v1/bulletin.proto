@@ -158,7 +158,7 @@ message EventStats {
 message SourceCount { string source = 1; int64 count = 2; }
 message BuildStatus { google.protobuf.Timestamp built_through = 1; int64 lag_secs = 2; }
 message ClusterStats { int64 total = 1; optional google.protobuf.Timestamp latest_updated = 2; }
-message SubscriberStats { int64 total = 1; int64 daily = 2; int64 weekly = 3; int64 due_now = 4; optional google.protobuf.Timestamp next_run = 5; }
+message SubscriberStats { int64 total = 1; int64 daily = 2; int64 weekly = 3; int64 due_now = 4; optional google.protobuf.Timestamp next_run = 5; int64 subscriptions = 6; }
 message DigestStats { int64 total = 1; int64 pending = 2; int64 delivered = 3; optional google.protobuf.Timestamp last_delivered = 4; }
 message QueueStats {
   string job_type = 1;

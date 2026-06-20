@@ -114,6 +114,18 @@ async fn link_and_select(
     })
     .await?;
 
+    // Candidate composition — how the subscriber's subscribed public sources vs their own private
+    // content fed this digest. The split makes "why is my digest empty/sparse?" answerable: no
+    // subscribed-public candidates usually means no (or too-narrow) source subscriptions.
+    let own_private = clusters.iter().filter(|c| c.is_own_private).count();
+    tracing::debug!(
+        subscriber_id = %sub_id,
+        candidate_clusters = clusters.len(),
+        subscribed_public = clusters.len() - own_private,
+        own_private,
+        "candidate clusters loaded"
+    );
+
     let assignment = link::link(&clusters, &prior, Uuid::now_v7);
     if persist {
         // Writes the subscriber's own stories → its RLS context (self-scoped inside the store fn).

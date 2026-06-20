@@ -34,7 +34,13 @@ pub async fn subscribe(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(result.rows_affected() > 0)
+    let created = result.rows_affected() > 0;
+    // Only count/announce a real change; a redundant re-subscribe is a no-op, not an edit.
+    if created {
+        metrics::counter!("bulletin_subscription_changes_total", "op" => "subscribe").increment(1);
+    }
+    tracing::info!(%subscriber_id, %connection_id, created, "subscribe");
+    Ok(created)
 }
 
 /// Unsubscribes `subscriber_id` from `connection_id`. Returns `true` if a row was removed. The
@@ -52,7 +58,13 @@ pub async fn unsubscribe(
             .execute(&mut *tx)
             .await?;
     tx.commit().await?;
-    Ok(result.rows_affected() > 0)
+    let removed = result.rows_affected() > 0;
+    if removed {
+        metrics::counter!("bulletin_subscription_changes_total", "op" => "unsubscribe")
+            .increment(1);
+    }
+    tracing::info!(%subscriber_id, %connection_id, removed, "unsubscribe");
+    Ok(removed)
 }
 
 /// The connections a subscriber is subscribed to — the sources comprising their digest — ordered for
@@ -77,5 +89,6 @@ pub async fn list_subscriptions(
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
+    tracing::debug!(%subscriber_id, count = rows.len(), "list subscriptions");
     Ok(rows)
 }

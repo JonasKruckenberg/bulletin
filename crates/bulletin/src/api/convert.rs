@@ -144,6 +144,7 @@ fn subscriber_stats(s: SubscriberStats) -> proto::SubscriberStats {
         weekly: s.weekly,
         due_now: s.due_now,
         next_run: opt_ts(s.next_run),
+        subscriptions: s.subscriptions,
     }
 }
 

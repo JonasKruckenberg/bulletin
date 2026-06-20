@@ -114,8 +114,11 @@ pub async fn insert_connection(
         .bind(id)
         .execute(&mut *tx)
         .await?;
+        metrics::counter!("bulletin_subscription_changes_total", "op" => "subscribe").increment(1);
+        tracing::debug!(subscriber_id = %owner, connection_id = %id, "implicit owner subscription");
     }
     tx.commit().await?;
+    tracing::info!(connection_id = %id, source = source.as_str(), owned = owner.is_some(), "connection created");
     Ok(id)
 }
 

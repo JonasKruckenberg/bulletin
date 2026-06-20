@@ -65,6 +65,9 @@ pub struct SubscriberStats {
     /// this is exactly what the next tick will dispatch.
     pub due_now: i64,
     pub next_run: Option<DateTime<Utc>>,
+    /// Total `subscription` rows — subscriber↔source edges across all subscribers. The steady-state
+    /// size of the relation that drives digest composition.
+    pub subscriptions: i64,
 }
 
 #[derive(Debug)]
@@ -185,7 +188,8 @@ async fn subscriber_stats(conn: &mut PgConnection) -> Result<SubscriberStats, sq
                 count(*) FILTER (WHERE freq = 'daily')  AS daily,
                 count(*) FILTER (WHERE freq = 'weekly') AS weekly,
                 count(*) FILTER (WHERE next_run_at <= now()) AS due_now,
-                min(next_run_at) AS next_run
+                min(next_run_at) AS next_run,
+                (SELECT count(*) FROM subscription) AS subscriptions
          FROM subscriber",
     )
     .fetch_one(&mut *conn)
@@ -196,6 +200,7 @@ async fn subscriber_stats(conn: &mut PgConnection) -> Result<SubscriberStats, sq
         weekly: row.get("weekly"),
         due_now: row.get("due_now"),
         next_run: row.get("next_run"),
+        subscriptions: row.get("subscriptions"),
     })
 }
 
