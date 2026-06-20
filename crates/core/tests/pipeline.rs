@@ -177,15 +177,23 @@ async fn select_stories(
         .iter()
         .map(|s| Candidate::new(s.id, s.last_event_time, Vec::new()))
         .collect();
-    select(candidates, &ScoringConfig::default(), max_items, Utc::now())
-        .into_iter()
-        .filter(|d| matches!(d.verdict, Verdict::Selected { .. }))
-        .map(|d| FrozenItem {
-            story_id: d.id,
-            last_event_time: d.last_event_time,
-            format: d.format,
-        })
-        .collect()
+    select(
+        candidates,
+        &ScoringConfig::default(),
+        max_items,
+        Utc::now(),
+        // Fixtures use far-past event times to exercise scoring, not the cadence freshness gate, so
+        // the display floor is pinned fully open here.
+        chrono::DateTime::<Utc>::MIN_UTC,
+    )
+    .into_iter()
+    .filter(|d| matches!(d.verdict, Verdict::Selected { .. }))
+    .map(|d| FrozenItem {
+        story_id: d.id,
+        last_event_time: d.last_event_time,
+        format: d.format,
+    })
+    .collect()
 }
 
 // Each distinct group_key becomes its own cluster; events sharing a group_key collapse into one,
@@ -229,10 +237,16 @@ async fn build_groups_events_into_clusters() {
         story_cap: 2,
         ..Default::default()
     };
-    let selected = select(cands, &cfg, 1000, Utc::now())
-        .into_iter()
-        .filter(|d| matches!(d.verdict, Verdict::Selected { .. }))
-        .count();
+    let selected = select(
+        cands,
+        &cfg,
+        1000,
+        Utc::now(),
+        chrono::DateTime::<Utc>::MIN_UTC,
+    )
+    .into_iter()
+    .filter(|d| matches!(d.verdict, Verdict::Selected { .. }))
+    .count();
     assert_eq!(selected, 2);
 }
 
@@ -1205,7 +1219,13 @@ async fn scoring_classifies_story_and_note() {
         .iter()
         .map(|s| Candidate::from_story(s, Vec::new(), None))
         .collect();
-    let decisions = select(cands, &ScoringConfig::default(), 1000, Utc::now());
+    let decisions = select(
+        cands,
+        &ScoringConfig::default(),
+        1000,
+        Utc::now(),
+        chrono::DateTime::<Utc>::MIN_UTC,
+    );
 
     let sel_fmt = |f: Format| {
         decisions
@@ -1258,7 +1278,13 @@ async fn resurface_without_new_events_fades_to_note() {
     );
     // last_event_time unchanged → no new events since shown.
     let cand = Candidate::from_story(&story, Vec::new(), shown.get(&story.id).copied());
-    let decisions = select(vec![cand], &ScoringConfig::default(), 1000, Utc::now());
+    let decisions = select(
+        vec![cand],
+        &ScoringConfig::default(),
+        1000,
+        Utc::now(),
+        chrono::DateTime::<Utc>::MIN_UTC,
+    );
     assert_eq!(decisions[0].format, Format::Note);
     assert_eq!(decisions[0].richness, "still developing");
 }

@@ -1,5 +1,5 @@
 use crate::common::db::{begin_scope, ScopeCtx};
-use chrono::{DateTime, NaiveTime, Utc};
+use chrono::{DateTime, Duration, NaiveTime, Utc};
 use sqlx::{postgres::PgRow, PgExecutor, PgPool, Row};
 use uuid::Uuid;
 
@@ -47,6 +47,28 @@ impl Recurrence {
 
     fn from_columns(freq: &str, on_weekday: Option<i32>) -> Result<Self, sqlx::Error> {
         Self::new(freq, on_weekday).map_err(|e| sqlx::Error::Decode(e.into()))
+    }
+
+    /// How far back a digest of this cadence may *display* items (design: the "freshness floor").
+    ///
+    /// The candidate window deliberately reaches 30 days back for *linking/threading context*
+    /// (see `CONTEXT_HORIZON_DAYS` / `link::store`), but a subscriber's digest should only ever
+    /// *surface* items recent enough for their chosen cadence — otherwise, when fresh content is
+    /// thin, stale (e.g. 3-week-old) items quietly fill the slots even though selection's recency
+    /// only *decays* rank, never *gates* inclusion. This is one cadence plus a deliberate **grace**
+    /// margin: a late or outage-delayed run (the schedule coalesces missed boundaries rather than
+    /// firing a backlog burst — see [`advance_after_delivery`]) should still surface ~one cadence
+    /// of items, not collapse to nothing nor reach all the way back to 30 days.
+    pub fn display_window(self) -> Duration {
+        // Cadence period + grace, kept as named bindings so the grace is documented, not magic.
+        // Daily cadence is 1 day; +12h grace covers a run that slips into the next morning.
+        let daily_grace = Duration::hours(12);
+        // Weekly cadence is 7 days; +1 day grace covers a delayed/coalesced weekly run.
+        let weekly_grace = Duration::days(1);
+        match self {
+            Recurrence::Daily => Duration::days(1) + daily_grace, // 36h
+            Recurrence::Weekly { .. } => Duration::days(7) + weekly_grace, // 8d
+        }
     }
 
     /// A compact human label for the debug CLI / status output.
@@ -349,6 +371,17 @@ mod tests {
     fn timezone_is_canonicalized() {
         let s = validate_schedule("daily", None, "America/New_York", "09:00").unwrap();
         assert_eq!(s.timezone, "America/New_York");
+    }
+
+    #[test]
+    fn display_window_is_one_cadence_plus_grace() {
+        // Daily → 1 day + 12h grace = 36h; Weekly → 7 days + 1 day grace = 8 days. The grace lets a
+        // late/coalesced run still surface ~one cadence of items rather than reaching back 30 days.
+        assert_eq!(Recurrence::Daily.display_window(), Duration::hours(36));
+        assert_eq!(
+            Recurrence::Weekly { weekday: 3 }.display_window(),
+            Duration::days(8)
+        );
     }
 
     #[test]
