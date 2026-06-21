@@ -11,8 +11,11 @@
 //! The algorithm is textbook entity-resolution, in four stages (design §8.2):
 //! 1. **Blocking** — an inverted index over `entities` yields only the candidate pairs that share a
 //!    key, the O(n²) guard. We never compare two clusters with nothing in common.
-//! 2. **Scoring** — each candidate pair gets a weighted score (entity Jaccard + temporal closeness),
-//!    promoted to a **strong** edge when it shares a *strong* key (a CVE/URL — `entity::link_strength`).
+//! 2. **Scoring** — each candidate pair gets a weighted score (a **weighted** entity Jaccard +
+//!    temporal closeness). Entities are *graded* by namespace prior × corpus IDF × feedback multiplier
+//!    ([`entity_weight`]), so a rare, specific shared token corroborates far more than a common one (a
+//!    broad place, a bot, a stock agency). A pair is promoted to a **strong** edge when it shares a
+//!    *strong* key (a CVE/URL — `entity::link_strength`).
 //! 3. **Components** — connected components (union-find) over the edges; each is a story. Computed
 //!    fresh every run from the full candidate set, so it is order-independent (no arrival-order bias)
 //!    and late retro-connections form automatically. **Strong edges merge anything; a weak edge may
@@ -120,19 +123,106 @@ const W_JACCARD: f64 = 0.7;
 const W_TEMPORAL: f64 = 0.3;
 /// A weak edge forms only at or above this score — corroboration beyond a single shared weak token.
 const WEAK_EDGE_THRESHOLD: f64 = 0.35;
+/// A weak edge also requires at least this much **weighted** entity overlap (the weighted Jaccard over
+/// the distinctive linkable entities, [`build_edge`]). Temporal proximity **corroborates** an edge; it
+/// must not be able to *carry* one. Without this floor two same-window items linked on a single broad
+/// shared token — `place:germany`, a shared stock-photo agency — because the temporal term
+/// (`W_TEMPORAL`) alone nearly clears the threshold, chaining unrelated coverage into one blob (the
+/// reported "wildly inaccurate" grouping). Tuned so a genuine same-story pair (several shared
+/// distinctive entities, or one dominant high-weight one) still links, while a lone broad coincidence —
+/// already IDF-demoted to a small weight — does not.
+const WEAK_MIN_JACCARD: f64 = 0.2;
+/// A weighted Jaccard at/above this is **saturated**: the shared entities are (essentially) the whole of
+/// *both* clusters' linkable sets, so the weight cancels in the ratio (`w/(w+w−w)=1`) and `wj` reports a
+/// perfect match no matter how IDF-demoted the shared token is. This is the one case where IDF can't bite
+/// — two entity-sparse items sharing a single broad token (`place:germany` and nothing else linkable).
+const SATURATED_WJ: f64 = 0.999;
+/// For a **saturated** weak edge ([`SATURATED_WJ`]) the ratio is uninformative, so the shared mass must
+/// clear this **absolute** weight instead — restoring IDF's say-so. A single broad, IDF-demoted token
+/// (high df ⇒ small weight) falls below it and can't fuse two sparse items, while a rare/specific shared
+/// token, or several shared tokens (their weights sum), clears it. Picked so a `place:`/`org:` that recurs
+/// across a large fraction of the candidate set is rejected while a distinctive single share passes; like
+/// the other thresholds this is conservative and lands in the §15 config table once tuned on real digests.
+const MIN_SATURATED_SHARED_WEIGHT: f64 = 1.2;
 /// Temporal closeness decays linearly to zero across this many days apart.
 const TEMPORAL_WINDOW_DAYS: f64 = 14.0;
+
+/// Per-entity **linking-weight override** (the feedback/affinity seam, §10.3): a multiplier on an
+/// entity's graded weight, `1.0` for any entity absent. This is where a subscriber's care-more /
+/// care-less affinity flows *into linking* once wired — "weight connections through what I care about
+/// more, and through what I've muted less". The thread layer already produces a per-entity affinity map
+/// of exactly this shape ([`thread::store::load_entity_weights`](crate::thread::store::load_entity_weights)),
+/// so wiring it is a one-line change at the [`link_with`] call site. Empty today ⇒ every multiplier 1.0.
+pub type EntityWeights = std::collections::BTreeMap<String, f64>;
+
+/// Pairwise **must-link / cannot-link** corrections over *cluster ids* — the §8.7 "this aggregation is
+/// wrong / right" feedback, applied as an edge added / dropped in the subscriber's next recompute.
+/// `cannot_link` drops the direct edge between two clusters (they never fuse on it); `must_link` forces
+/// a strong edge (they always fuse). Stored normalized `(min, max)` so the pair is order-independent.
+/// Empty today — the seam for the story-level feedback the [`crate::feedback`] log already records
+/// (`TargetType::Story`), pending the projection that turns a "wrong story" correction into a
+/// cluster-pair constraint here.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LinkConstraints {
+    pub must_link: BTreeSet<(Uuid, Uuid)>,
+    pub cannot_link: BTreeSet<(Uuid, Uuid)>,
+}
+
+impl LinkConstraints {
+    /// Normalize a cluster-id pair to `(min, max)` so membership is order-independent.
+    fn key(a: Uuid, b: Uuid) -> (Uuid, Uuid) {
+        if a <= b {
+            (a, b)
+        } else {
+            (b, a)
+        }
+    }
+
+    /// Record a must-link ("these belong together") between two clusters.
+    pub fn must(&mut self, a: Uuid, b: Uuid) {
+        self.must_link.insert(Self::key(a, b));
+    }
+
+    /// Record a cannot-link ("these don't belong together") between two clusters.
+    pub fn cannot(&mut self, a: Uuid, b: Uuid) {
+        self.cannot_link.insert(Self::key(a, b));
+    }
+}
+
+/// The per-subscriber tuning [`link_with`] applies — the feedback seams, defaulting to neutral. Held as
+/// one struct so a new seam is added in one place and every caller threads it unchanged. `Default` is
+/// "no feedback": empty weight overrides (every multiplier 1.0) and no constraints, i.e. exactly the
+/// behavior of the bare [`link`].
+#[derive(Debug, Default, Clone)]
+pub struct LinkTuning {
+    pub entity_weights: EntityWeights,
+    pub constraints: LinkConstraints,
+}
 
 /// Link a subscriber's candidate `clusters` into stories, forwarding ids from the `prior` assignment.
 /// `mint` allocates a fresh id for a genuinely new component; it is injected (not an ambient
 /// `Uuid::now_v7`) so the function stays pure and tests are deterministic. The pipeline passes
-/// `Uuid::now_v7`.
+/// `Uuid::now_v7`. Equivalent to [`link_with`] under the neutral [`LinkTuning::default`] (no feedback).
 pub fn link(
     clusters: &[LinkCluster],
     prior: &[PriorMember],
+    mint: impl FnMut() -> Uuid,
+) -> Assignment {
+    link_with(clusters, prior, &LinkTuning::default(), mint)
+}
+
+/// Link with explicit per-subscriber [`LinkTuning`] — the feedback-aware entry point. Identical to
+/// [`link`] but for the `tuning` it threads into edge scoring (the graded entity-weight overrides) and
+/// component formation (the must/cannot-link constraints). The production path calls this so feedback,
+/// once collected, flows in by populating `tuning` — no change to the algorithm below.
+pub fn link_with(
+    clusters: &[LinkCluster],
+    prior: &[PriorMember],
+    tuning: &LinkTuning,
     mut mint: impl FnMut() -> Uuid,
 ) -> Assignment {
-    let edges = score_edges(clusters);
+    let mut edges = score_edges(clusters, &tuning.entity_weights);
+    apply_constraints(&mut edges, clusters, &tuning.constraints);
     let components = components(clusters, &edges, prior);
     let reasons = member_reasons(clusters, &edges, &components);
     forward_ids(clusters, &components, &reasons, prior, &mut mint)
@@ -149,13 +239,35 @@ struct Edge {
     reason: String,
 }
 
-/// Blocking + scoring: build the candidate pairs (clusters sharing ≥1 entity) via an inverted index,
-/// then score each. Returns the edges that clear the bar — strong (shared CVE/URL) unconditionally,
-/// weak (entity overlap + recency) above [`WEAK_EDGE_THRESHOLD`]. Deterministic: the index and pair
-/// set are built in a fixed order.
-fn score_edges(clusters: &[LinkCluster]) -> Vec<Edge> {
-    // Inverted index entity → cluster indices, over *linkable* entities only (a shared domain is
-    // noise as an edge, so it never seeds a candidate pair). BTree keeps iteration stable.
+/// What one candidate pair accumulates as each shared entity is scattered onto it (see [`score_edges`]):
+/// the running sum of shared-entity *weights*, the strongest shared key (a `cve:`/`url:` → a strong
+/// edge), and the highest-weight shared *weak* entity (its `link_reason`). A `'a` borrow of the index
+/// keys — the entity strings live on the clusters for the whole pass.
+#[derive(Default)]
+struct PairAcc<'a> {
+    /// Σ of the graded weights of the entities this pair shares — the numerator of the weighted Jaccard.
+    shared_weight: f64,
+    /// A shared near-unique id (`cve:`/`url:`), if any — promotes the pair to a strong edge. Lexically
+    /// first (the index iterates in sorted order), for a deterministic reason string.
+    strong_key: Option<&'a str>,
+    /// The highest-weight shared *weak* entity (weight, token) — the most distinctive shared key, used
+    /// as the edge's `link_reason`. Ties break to the lexically-first token (strict `>` on update).
+    best_weak: Option<(f64, &'a str)>,
+}
+
+/// Blocking + **graded** scoring: build the candidate pairs via an inverted index over the *linkable*
+/// entities, then score each as a weighted overlap. Every shared entity contributes its *weight* —
+/// namespace prior × corpus IDF × feedback multiplier ([`entity_weight`]) — so a rare, specific shared
+/// token (a CVE, a named person) corroborates a link far more than one that recurs across the candidate
+/// set (a broad place, a bot, a stock-photo agency). Returns the edges that clear the bar: a shared
+/// strong key (`cve:`/`url:`) unconditionally, else a weighted-Jaccard + recency blend over
+/// [`WEAK_EDGE_THRESHOLD`] with at least [`WEAK_MIN_JACCARD`] overlap. Deterministic: the index, the
+/// per-entity weights, and the pair accumulator are all built in a fixed (sorted) order.
+fn score_edges(clusters: &[LinkCluster], entity_weights: &EntityWeights) -> Vec<Edge> {
+    let n = clusters.len();
+    // Inverted index entity → cluster indices, over *linkable* entities only (a `domain:`/`topic:` is
+    // noise as an edge, so it never seeds a candidate pair). It doubles as the **document-frequency**
+    // table: `members.len()` is df(entity), the IDF input. BTree keeps iteration stable.
     let mut index: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     for (i, c) in clusters.iter().enumerate() {
         for e in c.entities.iter().filter(|e| link_strength(e).is_some()) {
@@ -163,75 +275,176 @@ fn score_edges(clusters: &[LinkCluster]) -> Vec<Edge> {
         }
     }
 
-    // Candidate pairs: any two clusters co-occurring under some entity. A BTreeSet dedups and orders.
-    let mut pairs: BTreeSet<(usize, usize)> = BTreeSet::new();
-    for members in index.values() {
+    // The graded weight of each linkable entity, computed once from its df. This is the "grade" — how
+    // much *sharing this token* is worth — pre-seeded by the namespace prior and the live corpus IDF,
+    // and nudged by any feedback override; no labelled data or denylist required.
+    let weight: BTreeMap<&str, f64> = index
+        .iter()
+        .map(|(&e, members)| (e, entity_weight(e, members.len(), n, entity_weights)))
+        .collect();
+
+    // Per-cluster Σ of its linkable entities' weights — the |A|/|B| terms of the weighted Jaccard.
+    let mut cluster_weight = vec![0.0f64; n];
+    for (&e, members) in &index {
+        let w = weight[e];
+        for &i in members {
+            cluster_weight[i] += w;
+        }
+    }
+
+    // One scatter pass over the index: each entity adds its weight to every pair of clusters it
+    // co-occurs in, and records whether it is a strong key or the pair's best weak reason — so a pair's
+    // shared weight, strong-promotion, and reason all fall out without re-intersecting two clusters per
+    // pair. The cost is Σ C(df,2) — the blocking work the old pair enumeration already paid.
+    let mut acc: BTreeMap<(usize, usize), PairAcc> = BTreeMap::new();
+    for (&e, members) in &index {
+        let w = weight[e];
+        let strong = link_strength(e) == Some(LinkStrength::Strong);
         for (oi, &i) in members.iter().enumerate() {
             for &j in &members[oi + 1..] {
-                pairs.insert((i.min(j), i.max(j)));
+                let p = acc.entry((i.min(j), i.max(j))).or_default();
+                p.shared_weight += w;
+                if strong {
+                    p.strong_key.get_or_insert(e);
+                } else if p.best_weak.is_none_or(|(bw, _)| w > bw) {
+                    p.best_weak = Some((w, e));
+                }
             }
         }
     }
 
-    pairs
-        .into_iter()
-        .filter_map(|(a, b)| {
-            scored_edge(&clusters[a], &clusters[b]).map(|(strong, score, reason)| Edge {
+    acc.into_iter()
+        .filter_map(|((a, b), p)| build_edge(a, b, &p, clusters, &cluster_weight))
+        .collect()
+}
+
+/// Turn one accumulated candidate pair into an [`Edge`], or `None` if it doesn't clear the bar. A shared
+/// strong key is a strong edge at score 1.0; otherwise the weighted Jaccard (`shared / union` of the
+/// entity weights) blended with temporal closeness must clear [`WEAK_EDGE_THRESHOLD`] *and* the overlap
+/// itself must reach [`WEAK_MIN_JACCARD`] — temporal proximity corroborates a weak edge, it can't carry
+/// one (the single-broad-token chaining guard).
+fn build_edge(
+    a: usize,
+    b: usize,
+    p: &PairAcc,
+    clusters: &[LinkCluster],
+    cluster_weight: &[f64],
+) -> Option<Edge> {
+    if let Some(key) = p.strong_key {
+        return Some(Edge {
+            a,
+            b,
+            strong: true,
+            score: 1.0,
+            reason: format!("shared {key}"),
+        });
+    }
+    let union = cluster_weight[a] + cluster_weight[b] - p.shared_weight;
+    let wj = if union > 0.0 {
+        p.shared_weight / union
+    } else {
+        0.0
+    };
+    let score = W_JACCARD * wj + W_TEMPORAL * temporal_closeness(&clusters[a], &clusters[b]);
+    if score < WEAK_EDGE_THRESHOLD || wj < WEAK_MIN_JACCARD {
+        return None;
+    }
+    // Saturation guard: when `wj` is saturated (the shared entities are the whole of both clusters'
+    // linkable sets) the ratio is a no-op and IDF can't demote a broad shared token, so fall back to an
+    // absolute floor on the shared weight — a single IDF-demoted token can't fuse two sparse items, a
+    // distinctive one (or several shared) still can. Non-saturated pairs are unaffected (the ratio
+    // already carries the corroboration signal).
+    if wj >= SATURATED_WJ && p.shared_weight < MIN_SATURATED_SHARED_WEIGHT {
+        return None;
+    }
+    let (_, key) = p.best_weak?;
+    Some(Edge {
+        a,
+        b,
+        strong: false,
+        score,
+        reason: format!("shared {key}"),
+    })
+}
+
+/// The graded weight of a shared linkable entity: **namespace prior × corpus IDF × feedback multiplier**.
+/// The prior pre-seeds the kind's specificity (a named person outweighs a broad place); the IDF demotes
+/// whatever recurs across *this* candidate set (a feed's house entities, a bot, a stock agency, the
+/// repo owner shared by all of one account's repos), so quality emerges from the corpus rather than a
+/// hand-maintained denylist; the `overrides` multiplier (default 1.0) is the feedback/affinity seam.
+fn entity_weight(entity: &str, df: usize, n: usize, overrides: &EntityWeights) -> f64 {
+    let mult = overrides.get(entity).copied().unwrap_or(1.0);
+    namespace_prior(entity) * idf(df, n) * mult
+}
+
+/// The static **namespace prior** — the specificity grade of an entity *kind*, before the corpus IDF
+/// adjusts for how common a particular token is. A unique-ish id (`cve:`/`url:`) and a named person are
+/// the most specific; an `org:` or `repo:` is solid; a `place:` is often broad (a country); a non-linking
+/// `domain:`/`topic:`/unknown is `0.0` (it never reaches scoring anyway, the index excludes it). These
+/// are deliberately coarse — the IDF carries the within-kind discrimination — and are the natural knob a
+/// future calibration (or the §15 config table) tunes against real digests.
+fn namespace_prior(entity: &str) -> f64 {
+    match crate::identity::namespace(entity).map(|(ns, _)| ns) {
+        Some("cve") | Some("url") => 1.0,
+        Some("person") => 1.0,
+        Some("repo") | Some("user") => 0.9,
+        Some("org") => 0.8,
+        Some("place") => 0.7,
+        _ => 0.0,
+    }
+}
+
+/// Smoothed **inverse document frequency** over the candidate set: `ln((n+1)/(df+1)) + 1`. The `+1`
+/// floor keeps a token that appears in *every* cluster at idf 1 rather than 0 — corroborated coverage
+/// of one happening (three outlets, one shared place) must still link — while a rarer token scores
+/// strictly higher. The smoothing also makes the small-corpus / cold-start case well-behaved (df is not
+/// yet meaningful when `n` is tiny), so no separate minimum-`n` guard is needed.
+fn idf(df: usize, n: usize) -> f64 {
+    ((n as f64 + 1.0) / (df as f64 + 1.0)).ln() + 1.0
+}
+
+/// Apply the per-subscriber must/cannot-link [`LinkConstraints`] to the scored edges (the §8.7 feedback
+/// seam): drop any edge a `cannot_link` forbids, then force a strong edge for each `must_link` pair
+/// (upgrading an existing edge in place, else adding one). A no-op when both sets are empty — the
+/// default, until story-level feedback is projected into cluster-pair constraints. Acts on the *direct*
+/// edge between the two clusters (matching the design's "an edge dropped/added"); a cannot-link doesn't
+/// chase a transitive merge through a third cluster.
+fn apply_constraints(edges: &mut Vec<Edge>, clusters: &[LinkCluster], c: &LinkConstraints) {
+    if c.must_link.is_empty() && c.cannot_link.is_empty() {
+        return;
+    }
+    let pair_id = |e: &Edge| LinkConstraints::key(clusters[e.a].id, clusters[e.b].id);
+    if !c.cannot_link.is_empty() {
+        edges.retain(|e| !c.cannot_link.contains(&pair_id(e)));
+    }
+    for &(id1, id2) in &c.must_link {
+        let (Some(i), Some(j)) = (index_of(clusters, id1), index_of(clusters, id2)) else {
+            continue; // a constraint naming a cluster outside this candidate set is inert
+        };
+        if i == j {
+            continue;
+        }
+        let (a, b) = (i.min(j), i.max(j));
+        if let Some(e) = edges.iter_mut().find(|e| e.a == a && e.b == b) {
+            e.strong = true;
+            e.score = 1.0;
+            e.reason = "must-link (feedback)".to_string();
+        } else {
+            edges.push(Edge {
                 a,
                 b,
-                strong,
-                score,
-                reason,
-            })
-        })
-        .collect()
-}
-
-/// Score one candidate pair → `(strong, score, reason)` if it forms an edge, else `None`. A shared
-/// *strong* key (CVE/URL) is a strong edge at score 1.0; otherwise a weighted blend of entity Jaccard
-/// and temporal closeness must clear [`WEAK_EDGE_THRESHOLD`]. The shared entities are computed once
-/// here and reused for both the reason and the Jaccard count.
-fn scored_edge(a: &LinkCluster, b: &LinkCluster) -> Option<(bool, f64, String)> {
-    let shared = shared_entities(a, b); // sorted; entities are deduped sets, so this is the ∩
-    if let Some(key) = shared
-        .iter()
-        .find(|e| link_strength(e) == Some(LinkStrength::Strong))
-    {
-        return Some((true, 1.0, format!("shared {key}")));
-    }
-    let score = W_JACCARD * jaccard(shared.len(), a.entities.len(), b.entities.len())
-        + W_TEMPORAL * temporal_closeness(a, b);
-    if score >= WEAK_EDGE_THRESHOLD {
-        // A shared domain isn't linkable, so the weak reason is a repo/user (blocking guaranteed one).
-        let key = shared
-            .iter()
-            .find(|e| link_strength(e) == Some(LinkStrength::Weak))?;
-        Some((false, score, format!("shared {key}")))
-    } else {
-        None
+                strong: true,
+                score: 1.0,
+                reason: "must-link (feedback)".to_string(),
+            });
+        }
     }
 }
 
-/// The shared entities of two clusters, sorted. Entities are stored sorted+deduped (genuine sets),
-/// so this is their intersection and `.len()` is `|∩|`.
-fn shared_entities(a: &LinkCluster, b: &LinkCluster) -> Vec<String> {
-    let sb: BTreeSet<&String> = b.entities.iter().collect();
-    a.entities
-        .iter()
-        .filter(|e| sb.contains(e))
-        .cloned()
-        .collect()
-}
-
-/// Jaccard similarity from set sizes — `|∩| / |∪|`, with `|∪| = |a| + |b| − |∩|`. No set rebuild:
-/// the entity vecs are already deduped, so the counts suffice.
-fn jaccard(intersection: usize, a_len: usize, b_len: usize) -> f64 {
-    let union = (a_len + b_len - intersection) as f64;
-    if union == 0.0 {
-        0.0
-    } else {
-        intersection as f64 / union
-    }
+/// The candidate-set index of the cluster with id `id`, or `None` if it isn't in this set. Linear, but
+/// only walked per must-link constraint (a handful), so it stays off the hot path.
+fn index_of(clusters: &[LinkCluster], id: Uuid) -> Option<usize> {
+    clusters.iter().position(|c| c.id == id)
 }
 
 /// Temporal closeness in `0..=1`: 1.0 for same-instant clusters, decaying linearly to 0 across
@@ -630,16 +843,30 @@ mod tests {
     fn shared_grounded_place_fuses_but_shared_topic_alone_does_not() {
         // Phase 2: three outlets covering the same happening, each carrying only a per-publisher
         // domain plus the SAME grounded place — they fuse into one story on the weak place edge (same
-        // day → corroborated). This is the motivating "warning shots in the English Channel" case.
-        let same_place = vec![
+        // day → corroborated). This is the motivating "warning shots in the English Channel" case. The
+        // candidate set carries unrelated filler so the place is *distinctive* (low df → high IDF →
+        // weight above the saturated floor): three of nine clusters share it, the realistic shape of one
+        // incident in a digest, not a degenerate 3-cluster universe.
+        let mut same_place = vec![
             cluster(1, &["domain:bbc.com", "place:english-channel"], 1),
             cluster(2, &["domain:reuters.com", "place:english-channel"], 1),
             cluster(3, &["domain:guardian.com", "place:english-channel"], 1),
         ];
+        // Six unrelated filler clusters (each a distinct repo, sharing nothing) — they form no edges,
+        // they just make `place:english-channel` rare across the corpus.
+        for i in 0..6 {
+            same_place.push(cluster(10 + i, &[&format!("repo:filler/r{i}")], 1));
+        }
+        let stories = link(&same_place, &[], minter()).stories;
+        // The three channel items fuse into one story; the six filler items stay singletons (7 total).
         assert_eq!(
-            link(&same_place, &[], minter()).stories.len(),
-            1,
-            "a shared grounded place is a weak link key — corroborated coverage must fuse"
+            stories.len(),
+            7,
+            "a distinctive shared place is a weak link key — corroborated coverage must fuse"
+        );
+        assert!(
+            stories.iter().any(|s| s.clusters.len() == 3),
+            "the three English-Channel items must be the one 3-member story"
         );
 
         // But two items sharing ONLY a broad `topic:` must NOT fuse — topic is non-linking
@@ -661,6 +888,29 @@ mod tests {
     }
 
     #[test]
+    fn pervasive_place_does_not_fuse_sparse_items() {
+        // The saturated-Jaccard gap: items whose ONLY linkable entity is a broad place share it at
+        // wj=1.0 (the weight cancels in the ratio), so IDF can't demote it through the ratio alone. The
+        // absolute saturated-weight floor catches it: a place that recurs across the candidate set is
+        // IDF-demoted below the floor, so five same-day items sharing only `place:germany` stay five
+        // separate stories instead of collapsing into one blob.
+        let pervasive: Vec<LinkCluster> = (0..5)
+            .map(|i| {
+                cluster(
+                    i as u128 + 1,
+                    &[&format!("domain:p{i}.com"), "place:germany"],
+                    1,
+                )
+            })
+            .collect();
+        assert_eq!(
+            link(&pervasive, &[], minter()).stories.len(),
+            5,
+            "a broad place that is the items' only linkable token must not fuse them"
+        );
+    }
+
+    #[test]
     fn weak_edge_links_when_corroborated_but_not_when_stale() {
         // Shared weak entity + same day → linked. Same shared entity but far apart → separate.
         let close = vec![
@@ -674,6 +924,145 @@ mod tests {
             cluster(2, &["repo:acme/api", "user:bob"], 60), // far outside the temporal window
         ];
         assert_eq!(link(&stale, &[], minter()).stories.len(), 2);
+    }
+
+    #[test]
+    fn one_broad_shared_entity_in_a_rich_set_does_not_fuse() {
+        // Two same-day items that share a single broad entity (`place:germany`) but are otherwise about
+        // different things must NOT fuse: temporal proximity corroborates, it can't carry the edge. With
+        // ~5 distinctive entities each and only one shared, the Jaccard sits under `WEAK_MIN_JACCARD`.
+        let broad_only = vec![
+            cluster(
+                1,
+                &[
+                    "place:germany",
+                    "org:bundestag",
+                    "org:spd",
+                    "person:alice",
+                    "topic:pensions",
+                    "domain:tagesschau.de",
+                ],
+                1,
+            ),
+            cluster(
+                2,
+                &[
+                    "place:germany",
+                    "org:dwd",
+                    "place:cottbus",
+                    "person:bob",
+                    "topic:weather",
+                    "domain:tagesschau.de",
+                ],
+                1,
+            ),
+        ];
+        assert_eq!(
+            link(&broad_only, &[], minter()).stories.len(),
+            2,
+            "a lone broad shared entity (same day) must not fuse two otherwise-distinct items"
+        );
+
+        // But a genuine same-story pair — several shared distinctive entities — still fuses on the day.
+        let same_story = vec![
+            cluster(
+                1,
+                &[
+                    "place:strait-of-hormuz",
+                    "org:iran",
+                    "org:usa",
+                    "domain:a.com",
+                ],
+                1,
+            ),
+            cluster(
+                2,
+                &[
+                    "place:strait-of-hormuz",
+                    "org:iran",
+                    "org:usa",
+                    "domain:b.com",
+                ],
+                1,
+            ),
+        ];
+        assert_eq!(
+            link(&same_story, &[], minter()).stories.len(),
+            1,
+            "several shared distinctive entities is a real connection — it must fuse"
+        );
+    }
+
+    #[test]
+    fn idf_demotes_a_corpus_wide_entity() {
+        // The graded weight of a token shared by *every* cluster (idf floored at 1) is strictly below
+        // that of a rare one (idf > 1), at equal namespace prior — quality emerges from the corpus, no
+        // denylist. `org:` at df=5/5 vs df=1/5.
+        let n = 5;
+        let pervasive = entity_weight("org:acme", 5, n, &EntityWeights::new());
+        let rare = entity_weight("org:acme", 1, n, &EntityWeights::new());
+        assert!(
+            rare > pervasive,
+            "rare {rare} should outweigh pervasive {pervasive}"
+        );
+        // ...and the feedback override scales it (the affinity seam): care-less halves, care-more doubles.
+        let mut w = EntityWeights::new();
+        w.insert("org:acme".to_string(), 0.5);
+        let muted = entity_weight("org:acme", 1, n, &w);
+        assert!(muted < rare, "a care-less override must reduce the weight");
+    }
+
+    #[test]
+    fn pervasive_owner_entity_does_not_bridge_distinct_clusters() {
+        // The reported GitHub blob: one account's repos all carry a shared `org:<owner>` (here mined
+        // onto every cluster). With it in *every* cluster its IDF collapses, so it can't by itself fuse
+        // two clusters that otherwise share nothing — each repo's own activity stays its own story.
+        let owner = "org:acme-corp";
+        let clusters = vec![
+            cluster(1, &[owner, "repo:acme-corp/api", "user:alice"], 1),
+            cluster(2, &[owner, "repo:acme-corp/web", "user:bob"], 1),
+            cluster(3, &[owner, "repo:acme-corp/cli", "user:carol"], 1),
+            cluster(4, &[owner, "repo:acme-corp/docs", "user:dave"], 1),
+        ];
+        assert_eq!(
+            link(&clusters, &[], minter()).stories.len(),
+            4,
+            "a corpus-wide owner entity must not bridge otherwise-distinct repos"
+        );
+    }
+
+    #[test]
+    fn feedback_constraints_force_and_block_links() {
+        // cannot-link overrides even a strong shared key: two clusters sharing a CVE would always fuse,
+        // but a cannot-link correction keeps them apart.
+        let shared_cve = vec![
+            cluster(1, &["cve:CVE-2026-1", "repo:a/one"], 1),
+            cluster(2, &["cve:CVE-2026-1", "repo:b/two"], 1),
+        ];
+        let mut tuning = LinkTuning::default();
+        tuning
+            .constraints
+            .cannot(shared_cve[0].id, shared_cve[1].id);
+        assert_eq!(
+            link_with(&shared_cve, &[], &tuning, minter()).stories.len(),
+            2,
+            "a cannot-link correction must keep two clusters apart despite a shared CVE"
+        );
+
+        // must-link fuses two clusters that share nothing (no candidate pair would otherwise form).
+        let disjoint = vec![
+            cluster(1, &["repo:a/one"], 1),
+            cluster(2, &["repo:b/two"], 1),
+        ];
+        let mut tuning = LinkTuning::default();
+        tuning.constraints.must(disjoint[0].id, disjoint[1].id);
+        let a = link_with(&disjoint, &[], &tuning, minter());
+        assert_eq!(
+            a.stories.len(),
+            1,
+            "a must-link correction must fuse two otherwise-unconnected clusters"
+        );
+        assert_eq!(a.stories[0].clusters.len(), 2);
     }
 
     #[test]

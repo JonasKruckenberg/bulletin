@@ -64,6 +64,21 @@ impl SourceKind {
         }
     }
 
+    /// Whether this source benefits from the best-effort LLM **entity-enrichment** sweep
+    /// ([`crate::enrich`]). Enrichment exists to hand *link-poor* sources the grounded
+    /// `place:`/`org:`/`person:` tokens that let cross-publisher coverage of the same happening fuse: an
+    /// RSS item carries only a per-feed `domain:`, so it needs them. A GitHub (or Slack) event already
+    /// arrives with clean **structural** entities (`repo:`/`user:`), so running enrichment over it buys
+    /// nothing and actively *harms* linking — it mines noise out of the title (the repo owner as a bogus
+    /// `org:jonaskruckenberg`, a photo-credit byline as a `person:`) that then over-links unrelated
+    /// repos. So enrichment is scoped to the link-poor sources, mirroring [`has_fetchable_article`](Self::has_fetchable_article).
+    pub fn benefits_from_enrichment(self) -> bool {
+        match self {
+            SourceKind::Rss => true,
+            SourceKind::Github | SourceKind::Slack => false,
+        }
+    }
+
     /// Every source kind — so callers can enumerate the vocabulary instead of hardcoding it. Kept in
     /// declaration order; the `text_enum!`-derived `Ord` follows the same order.
     pub const ALL: [SourceKind; 3] = [SourceKind::Rss, SourceKind::Github, SourceKind::Slack];
@@ -77,6 +92,19 @@ impl SourceKind {
             .iter()
             .copied()
             .filter(|s| s.has_fetchable_article())
+            .map(SourceKind::as_str)
+            .collect()
+    }
+
+    /// The source kinds that benefit from enrichment, as their `as_str()` text — the typed source of
+    /// truth (from [`benefits_from_enrichment`](Self::benefits_from_enrichment)) for the
+    /// [`enrich`](crate::enrich) sweep's pending-frontier SQL (`source = ANY(...)`), so scoping a new
+    /// link-poor source in flips one `match` arm rather than editing a `source = 'rss'` literal.
+    pub fn enrichable_sources() -> Vec<&'static str> {
+        SourceKind::ALL
+            .iter()
+            .copied()
+            .filter(|s| s.benefits_from_enrichment())
             .map(SourceKind::as_str)
             .collect()
     }

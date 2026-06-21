@@ -267,8 +267,9 @@ pub async fn insert_event(
         "INSERT INTO event (
             fingerprint, source, scope_kind, scope_subscriber_id,
             event_time, title, body, links, group_key, entities,
-            content_kind, severity_hint, raw, connection_id
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            content_kind, severity_hint, raw, connection_id, enriched_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                 CASE WHEN $15 THEN now() END)
         ON CONFLICT ON CONSTRAINT event_fingerprint_unique DO NOTHING
         RETURNING {EVENT_COLUMNS}"
     ))
@@ -286,6 +287,13 @@ pub async fn insert_event(
     .bind(ev.severity_hint)
     .bind(ev.raw.as_deref())
     .bind(ev.connection_id)
+    // Stamp `enriched_at = now()` up front for a source the enrichment sweep will never touch
+    // (`!benefits_from_enrichment` — GitHub/Slack carry structural entities already, §`crate::enrich`):
+    // it has no pending enrichment, so it must not match `public_build_due`'s `enriched_at IS NULL`
+    // clause (which would spin a no-op build + sweep on every tick through its grace window) nor linger
+    // in the `event_enrich_pending` partial index. An enrichable source inserts NULL and the sweep
+    // stamps it when it lands.
+    .bind(!ev.source.benefits_from_enrichment())
     .try_map(from_row)
     .fetch_optional(executor)
     .await

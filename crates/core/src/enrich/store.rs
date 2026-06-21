@@ -4,6 +4,7 @@
 //! (migration 20200101000035) authorizes the write.
 
 use crate::common::event::{from_row, Event};
+use crate::common::kind::SourceKind;
 use sqlx::PgExecutor;
 use uuid::Uuid;
 
@@ -13,13 +14,17 @@ const EVENT_COLUMNS: &str = "id, fingerprint, source, scope_kind, scope_subscrib
      event_time, title, body, links, group_key, entities, \
      content_kind, severity_hint, ingest_time, raw, connection_id, full_text";
 
-/// The pending frontier: public events not yet enriched **and** not yet built (still ahead of the
-/// build watermark, so a write still feeds clustering). Ordered oldest-first and capped at `limit` so
-/// a backlog drains over several sweeps and the oldest — closest to its grace deadline — go first.
+/// The pending frontier: public events from an *enrichable* (link-poor) source, not yet enriched
+/// **and** not yet built (still ahead of the build watermark, so a write still feeds clustering).
+/// Ordered oldest-first and capped at `limit` so a backlog drains over several sweeps and the oldest —
+/// closest to its grace deadline — go first.
 ///
 /// Excluding already-built events (`ingest_time <= built_through`) keeps the sweep from re-enriching
 /// an event whose cluster has already rolled up its entities (a late write would not re-dirty it),
-/// and bounds the work to the live window rather than lifetime history.
+/// and bounds the work to the live window rather than lifetime history. The `source` filter
+/// ([`SourceKind::enrichable_sources`]) skips the structurally-rich sources (GitHub/Slack), whose
+/// events already carry clean `repo:`/`user:` entities — enriching them only mines title noise (the
+/// repo owner as a bogus `org:`) that over-links unrelated repos.
 pub async fn pending_public_events(
     executor: impl PgExecutor<'_>,
     limit: i64,
@@ -29,11 +34,13 @@ pub async fn pending_public_events(
          FROM event
          WHERE scope_kind = 'public'
            AND enriched_at IS NULL
+           AND source = ANY($2)
            AND ingest_time > (SELECT built_through FROM build_watermark)
          ORDER BY ingest_time
          LIMIT $1"
     ))
     .bind(limit)
+    .bind(SourceKind::enrichable_sources())
     .try_map(from_row)
     .fetch_all(executor)
     .await

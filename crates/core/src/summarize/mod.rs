@@ -146,8 +146,11 @@ impl Default for SummarizationConfig {
             // without the bare-domain mentions a mail client would auto-linkify. Bumped to 6 with the
             // opinion/discussion hedge rule (comprehension marks a viewpoint `tentative`; the summarizer
             // attributes it — "argues/says" — rather than asserting a contested take as settled fact), so
-            // the corpus re-summarizes without op-eds rendered as plain fact.
-            prompt_version: 6,
+            // the corpus re-summarizes without op-eds rendered as plain fact. Bumped to 7 when the tldr
+            // depth gate began granting a multi-sentence tldr off sufficient *source text* (not only a
+            // `longform` content_kind label), so the corpus re-summarizes and real articles that had been
+            // stuck headline-only (their full text un-fetchable) finally render a grounded tldr.
+            prompt_version: 7,
             headline_max_tokens: 24,
             tldr_max_tokens: 144,
             comprehension_max_tokens: 256,
@@ -2895,7 +2898,7 @@ mod tests {
     #[test]
     fn summary_model_string() {
         let cfg = SummarizationConfig::default();
-        assert_eq!(cfg.summary_model(), "qwen3.5-4b-instruct@6");
+        assert_eq!(cfg.summary_model(), "qwen3.5-4b-instruct@7");
     }
 
     #[test]

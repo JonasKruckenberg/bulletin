@@ -182,12 +182,14 @@ Fill these fields:
 
 Rules:
 - Use ONLY names that literally appear in the text. Never invent, expand, or infer an entity that is not written there. If unsure, leave it out.
+- Tag only entities that are part of the STORY. Ignore photo credits, image captions, bylines, and the publishing outlet itself: a photo agency (picture alliance, dpa, Reuters, Getty, imago), a photographer's or reporter's name in a credit line, and the source's own brand are NOT what the item is about. Leave them out.
+- Tag the most SPECIFIC entity, not a broad container. Prefer a city, agency, or company over a whole country, and a specific person over a generic group.
 - Copy each place/org/person from the text as written (you may drop a leading "the").
 - Keep each list short - the few most central. Use an empty list if none apply.
 - Output only the JSON the schema asks for. No preamble.
 
 EXAMPLE
-text: Royal Navy warships fired warning shots after a standoff in the English Channel on Tuesday, the Ministry of Defence said.
+text: Royal Navy warships fired warning shots after a standoff in the English Channel on Tuesday, the Ministry of Defence said. (Photo: Jane Doe / picture alliance)
 out: {"analysis":"A naval standoff in the English Channel involving the Royal Navy and the Ministry of Defence.","places":["English Channel"],"orgs":["Royal Navy","Ministry of Defence"],"people":[],"topics":["standoff"]}"#;
 
 /// The per-item enrichment user prompt: the item's title (+ body when present) and the concrete ask.
