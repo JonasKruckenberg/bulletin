@@ -49,6 +49,12 @@ pub struct Enrichment {
     /// before the lists (llama.cpp orders object properties lexically; `a…` guarantees scratchpad-first).
     #[serde(default)]
     pub analysis: String,
+    /// How big a deal this item is — a closed [`salience`](crate::common::salience::IMPACT_VOCAB)
+    /// class the model *classifies* (it never emits a number), turned into the priority-boosting
+    /// importance score by [`crate::common::salience::impact_score`]. Re-validated there, so a
+    /// missing/out-of-vocab value floors to `routine` (no boost).
+    #[serde(default)]
+    pub impact: String,
     /// Geographic places named in the text.
     #[serde(default)]
     pub places: Vec<String>,
@@ -171,10 +177,16 @@ fn strip_article(s: &str) -> &str {
 /// The enrichment system prompt — engineered for a 3–4B model exactly like the comprehension prompt
 /// (short, imperative, one job, closed instructions, a worked example). A constant ⇒ prefix-cached.
 /// The grounding rule is stated *and* enforced deterministically after (defense in depth).
-pub const ENRICH_SYSTEM_PROMPT: &str = r#"You read one news or work item and tag the real-world entities it is about. Think first, then tag.
+pub const ENRICH_SYSTEM_PROMPT: &str = r#"You read one news or work item and tag the real-world entities it is about, then judge how big a deal it is. Think first, then tag.
 
 Fill these fields:
 - analysis: 1-2 short sentences naming what the item is about.
+- impact: how significant the item is, one of:
+    - "major": a breaking, large-scale, or grave development — war or its escalation, mass casualties, a disaster, a critical security advisory, a major release or ruling.
+    - "significant": a serious development — a major policy change, a notable incident, an important market or organizational move.
+    - "notable": worth knowing but not dominating — a debate, a routine announcement or release, a local incident.
+    - "routine": minor or everyday — a market wrap, a soft-news or culture note, chatter, a small update.
+  Judge the EVENT itself, not how dramatic the wording is. When unsure, choose the lower level.
 - places: geographic places named in the text (countries, regions, cities, bodies of water).
 - orgs: organizations, companies, agencies, or teams named in the text.
 - people: specific named people in the text.
@@ -190,7 +202,7 @@ Rules:
 
 EXAMPLE
 text: Royal Navy warships fired warning shots after a standoff in the English Channel on Tuesday, the Ministry of Defence said. (Photo: Jane Doe / picture alliance)
-out: {"analysis":"A naval standoff in the English Channel involving the Royal Navy and the Ministry of Defence.","places":["English Channel"],"orgs":["Royal Navy","Ministry of Defence"],"people":[],"topics":["standoff"]}"#;
+out: {"analysis":"A naval standoff in the English Channel involving the Royal Navy and the Ministry of Defence.","impact":"significant","places":["English Channel"],"orgs":["Royal Navy","Ministry of Defence"],"people":[],"topics":["standoff"]}"#;
 
 /// The per-item enrichment user prompt: the item's title (+ body when present) and the concrete ask.
 /// Short and concrete, like the comprehension prompt.
@@ -205,7 +217,7 @@ pub fn enrich_user_prompt(title: &str, body: Option<&str>) -> String {
         }
     }
     s.push_str(
-        "\nTag the real-world entities this item is about: analysis first, then places, orgs, people, topics.",
+        "\nTag the real-world entities this item is about: analysis first, then impact, places, orgs, people, topics.",
     );
     s
 }
@@ -229,12 +241,14 @@ pub fn enrichment_schema() -> serde_json::Value {
             "type": "object",
             "properties": {
                 "analysis": { "type": "string", "maxLength": 400 },
+                // Mirrors `salience::IMPACT_VOCAB` (asserted by `schema_impact_enum_matches_vocab`).
+                "impact":   { "type": "string", "enum": ["routine", "notable", "significant", "major"] },
                 "places":   value_list,
                 "orgs":     value_list,
                 "people":   value_list,
                 "topics":   value_list
             },
-            "required": ["analysis", "places", "orgs", "people", "topics"],
+            "required": ["analysis", "impact", "places", "orgs", "people", "topics"],
             "additionalProperties": false
         }
     })
@@ -298,12 +312,12 @@ pub async fn sweep_public(
     let mut stats = EnrichStats::default();
     for ev in &events {
         match client::enrich_event(cfg, &http, ev).await {
-            Some(tokens) => {
+            Some((tokens, salience)) => {
                 let event_id = ev.id;
                 let tokens_for_write = tokens.clone();
                 with_scope(pool, ScopeCtx::NoSubscriber, move |conn| {
                     Box::pin(async move {
-                        store::apply_enrichment(conn, event_id, &tokens_for_write)
+                        store::apply_enrichment(conn, event_id, &tokens_for_write, salience)
                             .await
                             .context("apply enrichment to event")
                     })
@@ -326,11 +340,26 @@ mod tests {
         let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect();
         Enrichment {
             analysis: String::new(),
+            impact: String::new(),
             places: v(places),
             orgs: v(orgs),
             people: v(people),
             topics: v(topics),
         }
+    }
+
+    #[test]
+    fn schema_impact_enum_matches_vocab() {
+        // The schema's inline `impact` enum must stay in lockstep with the scoring vocabulary, or the
+        // model could emit a class the scorer floors to routine.
+        let schema = enrichment_schema();
+        let enum_vals: Vec<String> = schema["schema"]["properties"]["impact"]["enum"]
+            .as_array()
+            .expect("impact enum present")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(enum_vals, crate::common::salience::IMPACT_VOCAB);
     }
 
     #[test]

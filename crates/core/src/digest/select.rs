@@ -48,6 +48,10 @@ const SCOPE_BONUS: f32 = 0.5;
 const SEVERITY_WEIGHT: f32 = 0.1;
 /// Recency decay half-life (days): the recency-bound priority halves every this many days of age.
 const RECENCY_HALF_LIFE_DAYS: f64 = 3.0;
+/// Salience (importance) decay half-life (days): the `severity_weight · max_severity` term decays on
+/// its own cadence — deliberately slower than recency (a major story lingers a few days) but faster
+/// than an invested thread, so importance outlives freshness without dragging the base term with it.
+const SALIENCE_HALF_LIFE_DAYS: f64 = 7.0;
 /// Thread-term decay half-life (days): deliberately ≫ recency, so an invested thread stays promoted
 /// for weeks but still eventually ages out (design §8.3 + §9.4).
 const THREAD_HALF_LIFE_DAYS: f64 = 21.0;
@@ -55,6 +59,10 @@ const THREAD_HALF_LIFE_DAYS: f64 = 21.0;
 const STORY_CAP: usize = 5;
 /// Max Notes per digest (~15–25).
 const NOTE_CAP: usize = 20;
+/// Max stories from any one Thread per digest (design §8.4 / thread-layer §5.2): within-topic
+/// diversity, so one busy thread (or an added feed's dominant topic) can't take every slot. Stories
+/// with no assigned thread are unconstrained by it. `0` disables the cap.
+const THREAD_CAP: usize = 2;
 /// Re-surface damping (design §9.4): a no-news re-surface keeps this fraction of its priority.
 const RESURFACE_PENALTY: f32 = 0.25;
 /// Max stale "still developing" re-surfaces per digest. Damping only sinks a no-news re-surface in the
@@ -107,6 +115,9 @@ pub struct ScoringConfig {
     pub severity_weight: f32,
     /// Priority halves every this-many days of age (recency decay at read time).
     pub recency_half_life_days: f64,
+    /// The **salience** (importance) term ages on its own cadence — slower than recency, faster than
+    /// the thread term — so a high-`max_severity` story stays promoted a few days past its freshness.
+    pub salience_half_life_days: f64,
     /// The **thread** relevance term ages on a slower cadence than recency — it halves every
     /// this-many days (typically ≫ `recency_half_life_days`), so a story you've invested a thread in
     /// stays promoted for weeks but still eventually fades (design §8.3 + §9.4).
@@ -115,6 +126,9 @@ pub struct ScoringConfig {
     pub story_cap: usize,
     /// Max Notes rendered (~15–25).
     pub note_cap: usize,
+    /// Max stories from any one Thread per digest — within-topic diversity (design §8.4). Stories with
+    /// no assigned thread are unconstrained; `0` disables the cap.
+    pub thread_cap: usize,
     /// Priority multiplier for a story re-surfaced with no new events since it was last shown
     /// (design §9.4 re-surface suppression) — it fades to a "still developing" note and eventually
     /// out. `1.0` disables the penalty.
@@ -132,9 +146,11 @@ impl Default for ScoringConfig {
             scope_bonus: SCOPE_BONUS,
             severity_weight: SEVERITY_WEIGHT,
             recency_half_life_days: RECENCY_HALF_LIFE_DAYS,
+            salience_half_life_days: SALIENCE_HALF_LIFE_DAYS,
             thread_half_life_days: THREAD_HALF_LIFE_DAYS,
             story_cap: STORY_CAP,
             note_cap: NOTE_CAP,
+            thread_cap: THREAD_CAP,
             resurface_penalty: RESURFACE_PENALTY,
             resurface_cap: RESURFACE_CAP,
         }
@@ -196,6 +212,12 @@ pub struct Candidate {
     /// The story as last shown to this subscriber, if ever — the re-surface suppression input
     /// (design §9.4). `None` = never shown (a fresh story); stable story ids make this well-defined.
     pub last_shown: Option<Shown>,
+    /// The Thread this story advances, if any (the fire-time assignment, design §5.2) — the
+    /// per-thread diversity cap's grouping key. `None` = no thread overlap (unconstrained by the cap).
+    /// Assigned by the digest flow before `select`; `#[serde(default)]` keeps pre-cap snapshots
+    /// replayable (they decode to `None`, i.e. no thread cap effect).
+    #[serde(default)]
+    pub thread_id: Option<Uuid>,
 }
 
 impl Candidate {
@@ -213,6 +235,7 @@ impl Candidate {
             max_severity: None,
             has_private: false,
             last_shown: None,
+            thread_id: None,
         }
     }
 
@@ -235,6 +258,8 @@ impl Candidate {
             max_severity: story.max_severity,
             has_private: story.has_private,
             last_shown,
+            // Assigned by the digest flow (a DB lookup) after this mapping, before `select`.
+            thread_id: None,
         }
     }
 }
@@ -350,17 +375,26 @@ fn relevance(c: &Candidate, cfg: &ScoringConfig) -> f32 {
     base_relevance(c, cfg) + c.relevance
 }
 
-/// Priority — relevance-led, boosted by `max_severity`, aged by recency decay at read time
-/// (design §8.3). The recency-bound part (`base_relevance` + severity) decays on the recency
-/// half-life; the **thread** term (`c.relevance`) decays on the slower `thread_half_life_days`, so an
-/// invested thread stays promoted for weeks yet still eventually ages out (§9.4). The two components
-/// are kept explicit (no reconstructing one from the total), so adding a relevance term later can't
-/// silently mis-split the decay. With no thread term this is the single-decay form.
+/// Priority — relevance-led, boosted by `max_severity` (salience), aged by recency decay at read time
+/// (design §8.3). Three terms, each on its **own** half-life, kept explicit so one can't silently
+/// mis-split another's decay:
+/// - **base** (`base_relevance`) decays on `recency_half_life_days` — plain freshness;
+/// - **salience** (`severity_weight · max_severity`) decays on the slower `salience_half_life_days`,
+///   so a major story stays promoted a few days past its freshness (the importance signal that lifts
+///   the digest off a pure-recency sort);
+/// - **thread** (`c.relevance`) decays on the slowest `thread_half_life_days`, so an invested thread
+///   stays promoted for weeks yet still eventually ages out (§9.4).
+///
+/// With no severity hint and no thread term this collapses to `base_relevance · recency` — exactly the
+/// prior recency behaviour.
 fn priority(c: &Candidate, cfg: &ScoringConfig, now: DateTime<Utc>) -> f32 {
     let sev = c.max_severity.unwrap_or(0) as f32;
     let recency = recency_decay(now, c.last_event_time, cfg.recency_half_life_days) as f32;
+    let salience_decay = recency_decay(now, c.last_event_time, cfg.salience_half_life_days) as f32;
     let thread_decay = recency_decay(now, c.last_event_time, cfg.thread_half_life_days) as f32;
-    (base_relevance(c, cfg) + cfg.severity_weight * sev) * recency + c.relevance * thread_decay
+    base_relevance(c, cfg) * recency
+        + cfg.severity_weight * sev * salience_decay
+        + c.relevance * thread_decay
 }
 
 /// Richness → render format + a human phrase (design §8.4). Story when multi-source, multi-event, or a
@@ -395,6 +429,8 @@ struct Gated {
     /// True when this is a stale, no-news re-surface (demoted to "still developing") — so the cap pass
     /// can hold it to the small `resurface_cap` budget instead of letting it pad the Note cap.
     resurfaced: bool,
+    /// The Thread this story advances, if any — the per-thread diversity cap's grouping key.
+    thread_id: Option<Uuid>,
 }
 
 impl Gated {
@@ -505,6 +541,7 @@ pub fn select(
             format,
             richness: richness_phrase,
             resurfaced,
+            thread_id: c.thread_id,
         });
     }
 
@@ -522,6 +559,9 @@ pub fn select(
     //    *for being a Note* — only for losing the Note cap race; same for Stories. `position` doubles
     //    as the count of items selected so far, so it enforces the overall ceiling.
     let (mut stories, mut notes, mut resurfaced, mut position) = (0usize, 0usize, 0usize, 0usize);
+    // Per-thread selected counts — the within-topic diversity budget (design §8.4). Only stories with
+    // an assigned thread are bounded; an unthreaded story (no overlap) is never held by it.
+    let mut thread_counts: BTreeMap<Uuid, usize> = BTreeMap::new();
     let mut selected: Vec<Decision> = Vec::new();
     let mut over_cap: Vec<Decision> = Vec::new();
     for (rank, g) in gated.into_iter().enumerate() {
@@ -532,10 +572,22 @@ pub fn select(
         // A stale "still developing" re-surface also has to win a slot in the small re-surface budget,
         // on top of its format cap — so a quiet fire can't backfill the digest with recycled notes.
         let resurface_ok = !g.resurfaced || resurfaced < cfg.resurface_cap;
-        let verdict = if *count < cap && resurface_ok && position < max_items {
+        // Per-thread diversity: a thread already at `thread_cap` can't take another slot this digest,
+        // so a busy thread (or an added feed's dominant topic) can't crowd out the rest. Unthreaded
+        // stories and `thread_cap == 0` are unconstrained.
+        let thread_ok = match g.thread_id {
+            Some(t) if cfg.thread_cap > 0 => {
+                thread_counts.get(&t).copied().unwrap_or(0) < cfg.thread_cap
+            }
+            _ => true,
+        };
+        let verdict = if *count < cap && resurface_ok && thread_ok && position < max_items {
             *count += 1;
             if g.resurfaced {
                 resurfaced += 1;
+            }
+            if let Some(t) = g.thread_id {
+                *thread_counts.entry(t).or_insert(0) += 1;
             }
             let pos = position;
             position += 1;
@@ -607,6 +659,96 @@ mod tests {
         c.has_private = true;
         c.relevance = 2.0; // a thread term from apply_thread_weights
         assert_eq!(relevance(&c, &cfg), 3.5); // base 1.0 + scope 0.5 + thread 2.0
+    }
+
+    #[test]
+    fn salience_lifts_an_important_story_over_a_fresher_routine_one() {
+        // The step-function: a major (max_severity 3) story from two days ago must be able to outrank a
+        // brand-new routine one — ranking is no longer pure recency.
+        let now = at(0);
+        let two_days = 2 * 86_400;
+        let mut important = story(1, -two_days);
+        important.max_severity = Some(3);
+        let fresh = story(2, 0); // routine, no severity, right now
+
+        // Pure recency (severity_weight 0): the fresh routine story ranks first.
+        let recency_only = ScoringConfig {
+            severity_weight: 0.0,
+            ..Default::default()
+        };
+        let out = select(
+            vec![important.clone(), fresh.clone()],
+            &recency_only,
+            1000,
+            now,
+            no_floor(),
+        );
+        assert_eq!(
+            selected_ids(&out)[0],
+            fresh.id,
+            "recency-only ranks the fresh one first"
+        );
+
+        // With salience weighted, the important older story overtakes the fresher routine one.
+        let salient = ScoringConfig {
+            severity_weight: 1.0,
+            ..Default::default()
+        };
+        let out = select(
+            vec![important.clone(), fresh.clone()],
+            &salient,
+            1000,
+            now,
+            no_floor(),
+        );
+        assert_eq!(
+            selected_ids(&out)[0],
+            important.id,
+            "a weighted salience boost lifts the important story above the fresher routine one"
+        );
+    }
+
+    #[test]
+    fn thread_cap_bounds_one_thread_but_never_an_unthreaded_story() {
+        // Four stories on one thread + one unthreaded. With thread_cap 2 only the freshest two of the
+        // thread survive (within-topic diversity), while the unthreaded story is never held by the cap.
+        let t = Uuid::from_u128(0xABC);
+        let on_thread = |id, secs| {
+            let mut c = story(id, secs);
+            c.thread_id = Some(t);
+            c
+        };
+        let cands = vec![
+            on_thread(1, 100),
+            on_thread(2, 101),
+            on_thread(3, 102),
+            on_thread(4, 103),
+            story(99, 50), // unthreaded, oldest
+        ];
+
+        let capped = ScoringConfig {
+            thread_cap: 2,
+            ..Default::default()
+        };
+        let sel = selected_ids(&select(cands.clone(), &capped, 1000, at(1000), no_floor()));
+        assert_eq!(sel.len(), 3, "2 from the thread + the unthreaded one");
+        assert!(sel.contains(&Uuid::from_u128(4)) && sel.contains(&Uuid::from_u128(3)));
+        assert!(
+            sel.contains(&Uuid::from_u128(99)),
+            "an unthreaded story is never capped"
+        );
+        assert!(
+            !sel.contains(&Uuid::from_u128(1)) && !sel.contains(&Uuid::from_u128(2)),
+            "the two oldest same-thread stories lose the thread budget"
+        );
+
+        // thread_cap 0 disables the bound — all five select.
+        let off = ScoringConfig {
+            thread_cap: 0,
+            ..Default::default()
+        };
+        let sel = selected_ids(&select(cands, &off, 1000, at(1000), no_floor()));
+        assert_eq!(sel.len(), 5, "a 0 thread_cap is disabled");
     }
 
     #[test]

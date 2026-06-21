@@ -47,13 +47,17 @@ pub async fn pending_public_events(
 }
 
 /// Union `new_entities` onto one event's `entities` (kept sorted + de-duplicated, the cluster rollup's
-/// invariant) and stamp `enriched_at = now()`. Idempotent: re-running unions the same tokens back to
-/// the same set. Marking `enriched_at` even when `new_entities` is empty is deliberate — a clean pass
-/// that grounded nothing must not be retried forever.
+/// invariant), write the classified `salience` as the event's `severity_hint` (the priority-boost the
+/// cluster rollup maxes onto `cluster.max_severity`), and stamp `enriched_at = now()`. Salience is
+/// written as `GREATEST` of any existing hint so a structural hint is never lowered, and only when
+/// positive — a `routine` (0) classification leaves the hint `NULL`, exactly as an un-enriched event.
+/// Idempotent: re-running unions the same tokens and re-asserts the same `GREATEST`. Marking
+/// `enriched_at` even when nothing grounded is deliberate — a clean pass must not be retried forever.
 pub async fn apply_enrichment(
     executor: impl PgExecutor<'_>,
     event_id: Uuid,
     new_entities: &[String],
+    salience: i16,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE event
@@ -62,11 +66,17 @@ pub async fn apply_enrichment(
                  FROM unnest(entities || $2::text[]) AS e
                  ORDER BY e
              ),
+             severity_hint = CASE
+                 WHEN $3::smallint > 0
+                     THEN GREATEST(COALESCE(severity_hint, 0), $3::smallint)
+                 ELSE severity_hint
+             END,
              enriched_at = now()
          WHERE id = $1",
     )
     .bind(event_id)
     .bind(new_entities)
+    .bind(salience)
     .execute(executor)
     .await?;
     Ok(())

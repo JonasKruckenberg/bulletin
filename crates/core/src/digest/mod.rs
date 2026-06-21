@@ -168,6 +168,10 @@ async fn link_and_select(
         .iter()
         .map(|s| Candidate::from_story(s, story_entities[&s.id].clone(), shown.get(&s.id).copied()))
         .collect();
+    // Assign each candidate its Thread *before* ranking, so the per-thread diversity cap can bound a
+    // busy thread during selection (not just label the result after). Best-effort + feature-gated: on
+    // error or with the feature off, every `thread_id` stays `None` and the cap is simply inert.
+    assign_candidate_threads(pool, sub.id, &story_entities, &mut candidates).await;
     // Add the Thread relevance term before ranking (compiled out when the feature is off; a no-op
     // until thread_maintenance has projected weights) — it folds into the M4 relevance score.
     apply_weighting(pool, sub.id, &mut candidates).await?;
@@ -263,6 +267,61 @@ async fn apply_weighting(
 #[cfg(not(feature = "thread-weighting"))]
 async fn apply_weighting(_: &PgPool, _: Uuid, _: &mut [Candidate]) -> Result<()> {
     Ok(())
+}
+
+/// Pre-assign each *candidate* its Thread before ranking, so [`select`]'s per-thread diversity cap has
+/// a grouping key (design §8.4). Mirrors [`assign_threads`] (same `assign_thread` overlap query) but
+/// runs over the full candidate set and writes onto `Candidate.thread_id` rather than `digest_item`.
+/// **Best-effort**: any DB error leaves every `thread_id` `None` (the cap simply does nothing this
+/// fire) — thread assignment is render/ranking metadata, never a reason to fail the punctual digest.
+#[cfg(feature = "thread-weighting")]
+async fn assign_candidate_threads(
+    pool: &PgPool,
+    subscriber_id: Uuid,
+    story_entities: &HashMap<Uuid, Vec<String>>,
+    candidates: &mut [Candidate],
+) {
+    /// Minimum shared entities for a story→thread assignment (mirrors [`assign_threads`]).
+    const MIN_OVERLAP: i64 = 1;
+    let ids: Vec<Uuid> = candidates.iter().map(|c| c.id).collect();
+    let story_entities = story_entities.clone();
+    let result = with_scope(pool, ScopeCtx::Subscriber(subscriber_id), move |conn| {
+        Box::pin(async move {
+            let mut map: HashMap<Uuid, Option<Uuid>> = HashMap::with_capacity(ids.len());
+            for id in &ids {
+                let entities = story_entities.get(id).cloned().unwrap_or_default();
+                let thread_id = crate::thread::store::assign_thread(
+                    &mut *conn,
+                    subscriber_id,
+                    &entities,
+                    MIN_OVERLAP,
+                )
+                .await?;
+                map.insert(*id, thread_id);
+            }
+            Ok(map)
+        })
+    })
+    .await;
+    match result {
+        Ok(map) => {
+            for c in candidates.iter_mut() {
+                c.thread_id = map.get(&c.id).copied().flatten();
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "candidate thread pre-assignment failed (non-fatal); per-thread cap inert this fire");
+        }
+    }
+}
+
+#[cfg(not(feature = "thread-weighting"))]
+async fn assign_candidate_threads(
+    _: &PgPool,
+    _: Uuid,
+    _: &HashMap<Uuid, Vec<String>>,
+    _: &mut [Candidate],
+) {
 }
 
 /// Stamp each selected story with the thread it advances (design §5.2). **Best-effort**: a DB error
