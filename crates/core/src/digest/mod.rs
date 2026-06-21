@@ -11,7 +11,7 @@ pub mod subscriber;
 
 pub use render::{DigestContent, Mailer};
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
@@ -147,36 +147,19 @@ async fn link_and_select(
         .map(|s| (s.id, story_spine(s, &cluster_entities)))
         .collect();
 
-    // The §3.7 story gate: a **multi-member** story may only be a candidate once its cross-source
-    // synthesis is gate-passed (`band` confirmed/probable) — otherwise it's withheld and slips to a later
-    // window rather than collapsing to one member's single-source blurb. Single-member stories have
-    // nothing to fuse and render their one (already-gated) cluster summary, so they're always eligible.
-    // Only multi-member stories consult the synthesis gate, so skip the DB round-trip entirely when there
-    // are none (the common case for a low-volume subscriber).
-    let multi_member_ids: Vec<Uuid> = assignment
-        .stories
-        .iter()
-        .filter(|s| s.clusters.len() > 1)
-        .map(|s| s.id)
-        .collect();
-    let faithful_stories: HashSet<Uuid> = if multi_member_ids.is_empty() {
-        HashSet::new()
-    } else {
-        with_scope(pool, ScopeCtx::Subscriber(sub_id), move |conn| {
-            Box::pin(async move {
-                link::store::faithful_story_ids(&mut *conn, &multi_member_ids)
-                    .await
-                    .context("load faithful story summaries")
-            })
-        })
-        .await?
-        .into_iter()
-        .collect()
-    };
+    // Every candidate cluster already carries a gate-passed Phase-A summary (the candidate query runs with
+    // `require_summary`), so *every* story — single- or multi-member — can always render a faithful line:
+    // its cross-source synthesis when one exists, else its representative member's (already-gated) summary.
+    // So a multi-member story is **no longer withheld** for want of a synthesis (the old §3.7 story gate).
+    // Withholding only starved active fused stories — the synthesis runs out-of-band, and a story whose
+    // membership keeps moving (e.g. a busy GitHub repo with bot churn) re-staled its synthesis every fire
+    // and so never shipped. Instead the fire synthesizes the selected/due stories **inline** below
+    // (deadline-bounded), and the worst case is a representative summary this fire — never a vanished
+    // story. The no-hallucination invariant holds either way: the representative summary itself passed the
+    // §3.4 faithfulness gate.
     let mut candidates: Vec<Candidate> = assignment
         .stories
         .iter()
-        .filter(|s| s.clusters.len() == 1 || faithful_stories.contains(&s.id))
         .map(|s| Candidate::from_story(s, story_entities[&s.id].clone(), shown.get(&s.id).copied()))
         .collect();
     // Add the Thread relevance term before ranking (compiled out when the feature is off; a no-op
@@ -207,6 +190,31 @@ async fn link_and_select(
     let display_floor = now - sub.recurrence.display_window();
     let decisions = select(candidates, &cfg, max_items, now, display_floor);
     Ok((assignment.stories, decisions, story_entities, snapshot))
+}
+
+/// Inline Phase-C story synthesis on the punctual path (see the call site in [`generate`]). Loads the
+/// `BULLETIN_LLM_*` config, runs the per-subscriber synthesis sweep bounded by `cfg.synthesis_deadline`
+/// (newest-first, so the about-to-render stories go first), and **swallows any error** — the digest must
+/// ship regardless, and a story left un-synthesized simply renders its representative member summary.
+/// Idempotent and cache-keyed (the sweep's `summary_sig`), so it's free for a story already synthesized
+/// this fire or by the background sweep.
+async fn synthesize_stories_inline(pool: &PgPool, subscriber_id: Uuid) {
+    let cfg = crate::summarize::SummarizationConfig::from_env();
+    let deadline = std::time::Instant::now() + cfg.synthesis_deadline;
+    match crate::summarize::sweep_stories(pool, subscriber_id, &cfg, Some(deadline)).await {
+        Ok(stats) => tracing::debug!(
+            %subscriber_id,
+            synthesized = stats.summarized,
+            failed = stats.failed,
+            quarantined = stats.quarantined,
+            "inline story synthesis complete"
+        ),
+        Err(e) => tracing::warn!(
+            %subscriber_id,
+            error = %format!("{e:#}"),
+            "inline story synthesis failed (non-fatal); rendering representative summaries"
+        ),
+    }
 }
 
 /// The deduplicated, sorted union of a story's member-cluster entities.
@@ -624,6 +632,15 @@ pub async fn generate(
     // a trial config later (the eval sweep). Best-effort — never fails the send.
     record_candidate_snapshot(pool, digest.id, sub.id, snapshot).await;
     assign_threads(pool, digest.id, sub.id, &selected, &story_entities).await;
+
+    // Inline Phase-C synthesis (the punctual path): upgrade this fire's freshly-persisted multi-member
+    // stories to their faithful cross-source synthesis *now*, deadline-bounded, so a fused story ships
+    // with the cross-source rewrite on its very first fire instead of waiting for the out-of-band sweep
+    // (which, for an active fused story whose membership keeps moving, may never catch up). Best-effort:
+    // a sidecar miss/timeout just leaves the story to render its representative member summary below —
+    // it is never withheld. Runs after the stories are persisted (by `link_and_select`) so the synthesis
+    // lands on the rows `render_items` is about to read.
+    synthesize_stories_inline(pool, sub.id).await;
 
     let digest_id = digest.id;
     let items = with_scope(pool, ScopeCtx::Subscriber(sub.id), move |conn| {

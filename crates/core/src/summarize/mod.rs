@@ -97,6 +97,15 @@ pub struct SummarizationConfig {
     /// Deliberately well under [`request_timeout`](Self::request_timeout) so a slow box delays a send by
     /// at most this long; tune via `BULLETIN_LLM_LEAD_DEADLINE_SECS`.
     pub lead_deadline: Duration,
+    /// Total wall-clock budget for the **inline Phase-C story synthesis** run on the punctual path (after
+    /// selection, before render). The digest upgrades its freshly-persisted multi-member stories to their
+    /// faithful cross-source synthesis *right now*, newest-first, until this budget is spent — so a fused
+    /// story ships with the cross-source rewrite on its very first fire instead of waiting for the
+    /// out-of-band sweep (the staleness race that otherwise starves an active fused story). A story not
+    /// reached within the budget renders its representative member's (already gate-passed) summary this
+    /// fire and stays due for the background sweep — it is never withheld. Tune via
+    /// `BULLETIN_LLM_SYNTHESIS_DEADLINE_SECS`.
+    pub synthesis_deadline: Duration,
     /// Source-text budget per cluster (§7 long-context cliff): truncate the concatenated event
     /// title+body fed to the model so a small model stays in its faithful regime.
     pub max_source_chars: usize,
@@ -149,6 +158,7 @@ impl Default for SummarizationConfig {
             disable_thinking: true,
             request_timeout: Duration::from_secs(120),
             lead_deadline: Duration::from_secs(20),
+            synthesis_deadline: Duration::from_secs(45),
             max_source_chars: 4000,
             max_per_sweep: 200,
             enrich: true,
@@ -239,6 +249,15 @@ impl SummarizationConfig {
             if let Ok(secs) = v.trim().parse::<u64>() {
                 if secs > 0 {
                     cfg.lead_deadline = Duration::from_secs(secs);
+                }
+            }
+        }
+        // The inline Phase-C synthesis budget (the punctual-path story-synthesis pass). A positive
+        // whole-second override only.
+        if let Ok(v) = std::env::var("BULLETIN_LLM_SYNTHESIS_DEADLINE_SECS") {
+            if let Ok(secs) = v.trim().parse::<u64>() {
+                if secs > 0 {
+                    cfg.synthesis_deadline = Duration::from_secs(secs);
                 }
             }
         }
@@ -2046,20 +2065,29 @@ pub async fn eval_public(
 /// their RLS context. Walks the stories whose membership/content changed, recomputes each one's member
 /// signature from the member clusters' `summary_hash`es, and — only if it moved (or a model upgrade) —
 /// synthesizes a fused summary from the **member cluster summaries** (never their raw events, §4),
-/// cached by the signature so a stable story is reused for free across fires. Under the strict §3.7
-/// contract a multi-member synthesis failure is tracked, retried with an escalating seed, and quarantined
-/// once the budget is spent — the story is withheld from digests until it lands, never collapsed to one
-/// member's single-source blurb (a single-member story has nothing to fuse and renders its one cluster
-/// summary directly). The pass continues past a failed story.
+/// cached by the signature so a stable story is reused for free across fires. A multi-member synthesis
+/// failure is tracked, retried with an escalating seed, and quarantined once the budget is spent (so a
+/// hopeless story stops re-burning the sidecar). It is **not** withheld from digests, though: every
+/// member cluster summary is itself gate-passed, so a story with no (yet) faithful synthesis renders its
+/// representative member's summary at fire time rather than vanishing — the digest path no longer gates
+/// candidacy on the synthesis (see `digest::link_and_select`). The pass continues past a failed story.
 ///
 /// (Deviation from §2.2: the member signature is keyed on member content alone — `thread_id` is not
 /// folded in, so a story moving threads doesn't itself force a re-synthesis. The synthesis quality
 /// barely depends on the thread context, and this keeps Phase C decoupled from fire-time
 /// thread-assignment. Revisit if cross-thread restatement proves valuable.)
+///
+/// `deadline` bounds the pass's wall clock: `None` for the unbounded background sweep (the
+/// `thread_maintenance` job), or `Some(instant)` for the **inline punctual-path run** the digest fire
+/// makes after selection — it drains the due stories newest-first (so the ones about to render come
+/// first) until the budget is spent, then returns, leaving any not-yet-synthesized story to render its
+/// representative member summary this fire and stay due for the background sweep. The check is between
+/// stories, never mid-synthesis, so a story is always left in a consistent state.
 pub async fn sweep_stories(
     pool: &sqlx::PgPool,
     subscriber_id: uuid::Uuid,
     cfg: &SummarizationConfig,
+    deadline: Option<std::time::Instant>,
 ) -> anyhow::Result<SummarizeStats> {
     use crate::common::db::with_scope;
     use anyhow::Context;
@@ -2086,6 +2114,12 @@ pub async fn sweep_stories(
 
     let mut stats = SummarizeStats::default();
     for s in due {
+        // Inline-run budget (the punctual path): stop cleanly between stories once the deadline passes.
+        // Whatever's left renders its representative member summary this fire and stays due for the
+        // unbounded background sweep — the digest never blocks on a slow synthesis.
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break;
+        }
         let members = with_scope(pool, ctx, {
             let cluster_ids = s.cluster_ids.clone();
             move |conn| {

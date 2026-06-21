@@ -166,14 +166,15 @@ pub async fn eval_cluster(
 /// over the fused facts. `members` are the story's member-cluster summaries, **newest-first** (so
 /// `members[0]` is the representative and the freshest lifecycle wins in [`synthesize_facts`]).
 ///
-/// Treated exactly like a cluster (§3.7) — and for the same reason: a multi-source story collapsed to one
-/// member's single-source blurb reads as low quality, so a synthesis that can't be made faithful is a
-/// tracked error the story tier *withholds and retries*, never a silent downgrade. One attempt per call
-/// (the sweep escalates the seed across passes via the story's DB attempt counter, mirroring the cluster
-/// sweep): returns [`SummaryOutcome::Faithful`] on a gate-passed cross-source rewrite, or
-/// [`SummaryOutcome::Failed`] (`Unavailable` / `Rejected`) otherwise — there is no representative
-/// fallback. (A single-member story is never synthesized; the sweep renders its one faithful cluster
-/// summary directly, so it never reaches here.)
+/// A synthesis that can't be made faithful is a tracked error the story tier retries with an escalating
+/// seed (and quarantines once the budget is spent, to stop re-burning the sidecar), never a hallucinated
+/// rewrite. One attempt per call (the sweep escalates the seed across passes via the story's DB attempt
+/// counter, mirroring the cluster sweep): returns [`SummaryOutcome::Faithful`] on a gate-passed
+/// cross-source rewrite, or [`SummaryOutcome::Failed`] (`Unavailable` / `Rejected`) otherwise. A failure
+/// does **not** withhold the story from the digest — at fire time it renders its representative member's
+/// (already gate-passed) summary instead, so the worst case is a single-source line, never a vanished
+/// story (see `digest::link_and_select`). (A single-member story is never synthesized; the sweep renders
+/// its one faithful cluster summary directly, so it never reaches here.)
 ///
 /// `members` are the story's member-cluster summaries, **newest-first** (so `members[0]` is the
 /// representative and the freshest lifecycle wins in [`synthesize_facts`]). `cfg` carries this attempt's

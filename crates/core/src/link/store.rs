@@ -163,26 +163,6 @@ pub async fn load_prior_members(
     .await
 }
 
-/// The subset of `story_ids` that carry a **gate-passed cross-source synthesis** (`story.summary`'s
-/// `band` is `confirmed`/`probable`) — the §3.7 story gate the digest uses to decide which multi-member
-/// stories may ship. A multi-source story whose Phase-C synthesis isn't (yet) faithful is withheld so the
-/// digest never collapses it to one member's single-source blurb; it slips to a later window once the
-/// off-path synthesis sweep lands (or stays out while quarantined). Single-member stories are *not*
-/// gated by this (they have nothing to fuse and render their one faithful cluster summary), so the caller
-/// only consults this set for multi-member stories. Reads `story` (RLS-fenced to the owner).
-pub async fn faithful_story_ids(
-    executor: impl PgExecutor<'_>,
-    story_ids: &[Uuid],
-) -> Result<Vec<Uuid>, sqlx::Error> {
-    sqlx::query_scalar(
-        "SELECT id FROM story
-         WHERE id = ANY($1) AND summary ->> 'band' IN ('confirmed', 'probable')",
-    )
-    .bind(story_ids)
-    .fetch_all(executor)
-    .await
-}
-
 /// Persist a recompute: upsert the current stories and record the retro-merges, in one transaction so
 /// the assignment is never observed half-written. A surviving story's row is rewritten in place
 /// (preserving its `created_at`/`last_delivered_at`); a retro-merge loser is tombstoned

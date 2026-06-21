@@ -360,8 +360,9 @@ pub(crate) async fn store_story_summary(
 /// the consecutive-attempt counter to `attempts` (absolute), store the coarse `error`, stamp
 /// `summary_failed_at`, and — crucially — do **not** advance `summarized_at`, so the next sweep retries
 /// it with an escalated seed. `summary_quarantined_at` is set when `quarantine` is true (the synthesis
-/// budget is spent — the multi-source story is withheld from digests until its content changes or an
-/// operator clears it) and NULL'd otherwise (so a story retrying past a quarantine sheds the stale flag).
+/// budget is spent — the story stops being re-attempted until its content changes or an operator clears
+/// it; it still ships, rendering its representative member summary) and NULL'd otherwise (so a story
+/// retrying past a quarantine sheds the stale flag).
 pub(crate) async fn record_story_summary_failure(
     conn: &mut PgConnection,
     story_id: Uuid,
