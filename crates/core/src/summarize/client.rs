@@ -112,20 +112,25 @@ async fn generate_candidate(
     // headline-paraphrase and the tldr token budget. An empty cluster shouldn't reach here, but default
     // to Longform if it somehow does — don't regress a real cluster to a Note.
     //
-    // We also grant a tldr whenever the cluster actually carries enough grounded **source text** to
+    // We also grant a tldr whenever a *single* event in the cluster carries enough grounded text to
     // write one (`TLDR_MIN_SOURCE_CHARS`), independent of the `content_kind` label. `content_kind` is
     // set from the connector's *snippet* at ingest and only raised to `longform` by a successful
     // best-effort full-article fetch (`ingest::fetch`); where that fetch can't run (no egress, a dead
     // link), a real news article stayed an `Announcement` and rendered with no summary at all — the
-    // reported "no summaries show up". Grounding the decision on the text in hand fixes that without
-    // ever giving a genuinely thin item (a bare GitHub push title, a one-line release) a padded tldr.
+    // reported "no summaries show up". The threshold is per-event (the richest event's title+text), not
+    // the concatenated corpus: a cluster of many *thin* events (a run of bare push titles) must still
+    // stay a headline-only Note, so summing their titles past the bar can't earn a padded tldr.
     let depth = events
         .iter()
         .map(|e| e.content_kind)
         .max()
         .unwrap_or(ContentKind::Longform);
-    let want_tldr =
-        depth == ContentKind::Longform || source.chars().count() >= TLDR_MIN_SOURCE_CHARS;
+    let richest_event_chars = events
+        .iter()
+        .map(|e| e.title.chars().count() + e.best_text().map_or(0, |b| b.trim().chars().count()))
+        .max()
+        .unwrap_or(0);
+    let want_tldr = depth == ContentKind::Longform || richest_event_chars >= TLDR_MIN_SOURCE_CHARS;
 
     let candidate = call_model(cfg, http, &facts, &source, want_tldr).await?;
 

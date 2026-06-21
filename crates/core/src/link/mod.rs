@@ -132,6 +132,18 @@ const WEAK_EDGE_THRESHOLD: f64 = 0.35;
 /// distinctive entities, or one dominant high-weight one) still links, while a lone broad coincidence —
 /// already IDF-demoted to a small weight — does not.
 const WEAK_MIN_JACCARD: f64 = 0.2;
+/// A weighted Jaccard at/above this is **saturated**: the shared entities are (essentially) the whole of
+/// *both* clusters' linkable sets, so the weight cancels in the ratio (`w/(w+w−w)=1`) and `wj` reports a
+/// perfect match no matter how IDF-demoted the shared token is. This is the one case where IDF can't bite
+/// — two entity-sparse items sharing a single broad token (`place:germany` and nothing else linkable).
+const SATURATED_WJ: f64 = 0.999;
+/// For a **saturated** weak edge ([`SATURATED_WJ`]) the ratio is uninformative, so the shared mass must
+/// clear this **absolute** weight instead — restoring IDF's say-so. A single broad, IDF-demoted token
+/// (high df ⇒ small weight) falls below it and can't fuse two sparse items, while a rare/specific shared
+/// token, or several shared tokens (their weights sum), clears it. Picked so a `place:`/`org:` that recurs
+/// across a large fraction of the candidate set is rejected while a distinctive single share passes; like
+/// the other thresholds this is conservative and lands in the §15 config table once tuned on real digests.
+const MIN_SATURATED_SHARED_WEIGHT: f64 = 1.2;
 /// Temporal closeness decays linearly to zero across this many days apart.
 const TEMPORAL_WINDOW_DAYS: f64 = 14.0;
 
@@ -334,18 +346,25 @@ fn build_edge(
         0.0
     };
     let score = W_JACCARD * wj + W_TEMPORAL * temporal_closeness(&clusters[a], &clusters[b]);
-    if score >= WEAK_EDGE_THRESHOLD && wj >= WEAK_MIN_JACCARD {
-        let (_, key) = p.best_weak?;
-        Some(Edge {
-            a,
-            b,
-            strong: false,
-            score,
-            reason: format!("shared {key}"),
-        })
-    } else {
-        None
+    if score < WEAK_EDGE_THRESHOLD || wj < WEAK_MIN_JACCARD {
+        return None;
     }
+    // Saturation guard: when `wj` is saturated (the shared entities are the whole of both clusters'
+    // linkable sets) the ratio is a no-op and IDF can't demote a broad shared token, so fall back to an
+    // absolute floor on the shared weight — a single IDF-demoted token can't fuse two sparse items, a
+    // distinctive one (or several shared) still can. Non-saturated pairs are unaffected (the ratio
+    // already carries the corroboration signal).
+    if wj >= SATURATED_WJ && p.shared_weight < MIN_SATURATED_SHARED_WEIGHT {
+        return None;
+    }
+    let (_, key) = p.best_weak?;
+    Some(Edge {
+        a,
+        b,
+        strong: false,
+        score,
+        reason: format!("shared {key}"),
+    })
 }
 
 /// The graded weight of a shared linkable entity: **namespace prior × corpus IDF × feedback multiplier**.
@@ -824,16 +843,30 @@ mod tests {
     fn shared_grounded_place_fuses_but_shared_topic_alone_does_not() {
         // Phase 2: three outlets covering the same happening, each carrying only a per-publisher
         // domain plus the SAME grounded place — they fuse into one story on the weak place edge (same
-        // day → corroborated). This is the motivating "warning shots in the English Channel" case.
-        let same_place = vec![
+        // day → corroborated). This is the motivating "warning shots in the English Channel" case. The
+        // candidate set carries unrelated filler so the place is *distinctive* (low df → high IDF →
+        // weight above the saturated floor): three of nine clusters share it, the realistic shape of one
+        // incident in a digest, not a degenerate 3-cluster universe.
+        let mut same_place = vec![
             cluster(1, &["domain:bbc.com", "place:english-channel"], 1),
             cluster(2, &["domain:reuters.com", "place:english-channel"], 1),
             cluster(3, &["domain:guardian.com", "place:english-channel"], 1),
         ];
+        // Six unrelated filler clusters (each a distinct repo, sharing nothing) — they form no edges,
+        // they just make `place:english-channel` rare across the corpus.
+        for i in 0..6 {
+            same_place.push(cluster(10 + i, &[&format!("repo:filler/r{i}")], 1));
+        }
+        let stories = link(&same_place, &[], minter()).stories;
+        // The three channel items fuse into one story; the six filler items stay singletons (7 total).
         assert_eq!(
-            link(&same_place, &[], minter()).stories.len(),
-            1,
-            "a shared grounded place is a weak link key — corroborated coverage must fuse"
+            stories.len(),
+            7,
+            "a distinctive shared place is a weak link key — corroborated coverage must fuse"
+        );
+        assert!(
+            stories.iter().any(|s| s.clusters.len() == 3),
+            "the three English-Channel items must be the one 3-member story"
         );
 
         // But two items sharing ONLY a broad `topic:` must NOT fuse — topic is non-linking
@@ -851,6 +884,29 @@ mod tests {
             link(&same_topic, &[], minter()).stories.len(),
             2,
             "a shared topic must never fuse stories on its own"
+        );
+    }
+
+    #[test]
+    fn pervasive_place_does_not_fuse_sparse_items() {
+        // The saturated-Jaccard gap: items whose ONLY linkable entity is a broad place share it at
+        // wj=1.0 (the weight cancels in the ratio), so IDF can't demote it through the ratio alone. The
+        // absolute saturated-weight floor catches it: a place that recurs across the candidate set is
+        // IDF-demoted below the floor, so five same-day items sharing only `place:germany` stay five
+        // separate stories instead of collapsing into one blob.
+        let pervasive: Vec<LinkCluster> = (0..5)
+            .map(|i| {
+                cluster(
+                    i as u128 + 1,
+                    &[&format!("domain:p{i}.com"), "place:germany"],
+                    1,
+                )
+            })
+            .collect();
+        assert_eq!(
+            link(&pervasive, &[], minter()).stories.len(),
+            5,
+            "a broad place that is the items' only linkable token must not fuse them"
         );
     }
 
