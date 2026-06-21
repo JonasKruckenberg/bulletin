@@ -472,8 +472,12 @@ pub async fn fetch_article(
         }
         let html = read_capped(resp, cfg.max_bytes).await?;
 
-        return super::html_text::render(&html, cfg.max_html_chars, cfg.full_text_max_chars)
-            .ok_or(FetchError::Empty);
+        return super::html_text::render_article(
+            &html,
+            cfg.max_html_chars,
+            cfg.full_text_max_chars,
+        )
+        .ok_or(FetchError::Empty);
     }
 
     Err(FetchError::TooManyRedirects)
