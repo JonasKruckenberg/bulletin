@@ -126,7 +126,13 @@ async fn link_and_select(
         "candidate clusters loaded"
     );
 
-    let assignment = link::link(&clusters, &prior, Uuid::now_v7);
+    // Per-subscriber linking tuning — the feedback seam (§8.7/§10.3). Neutral today (feedback isn't
+    // projected into linking yet), but the production path threads it so that when it is, the affinity
+    // weight overrides and must/cannot-link corrections load here and flow straight into edge scoring —
+    // no change to `link` itself. (Affinity weights have the exact shape of `EntityWeights`, and the
+    // `feedback` log already records the story-level corrections the constraints will be built from.)
+    let tuning = link::LinkTuning::default();
+    let assignment = link::link_with(&clusters, &prior, &tuning, Uuid::now_v7);
     if persist {
         // Writes the subscriber's own stories → its RLS context (self-scoped inside the store fn).
         link::store::persist_assignment(pool, sub_id, &assignment)
