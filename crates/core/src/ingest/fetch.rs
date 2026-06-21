@@ -571,13 +571,21 @@ async fn due_events_for_fetch(
     .await
 }
 
-/// Persist a successful fetch: set `full_text` (+ provenance), bump the attempt counter, and nudge the
-/// event's cluster (if already built) back into the summarization work queue via
-/// [`cluster::store::touch_group`](crate::cluster::store::touch_group) — so a fetch that lands *after*
-/// the cluster was first summarized off the snippet re-summarizes off the richer text (the
-/// `summary_hash` staleness gate then confirms the content actually moved). A not-yet-built cluster
-/// needs no nudge: it'll summarize with `full_text` already present. Runs in the cluster's scope
-/// context (public sweep → no-subscriber).
+/// Persist a successful fetch: set `full_text` (+ provenance), bump the attempt counter, **re-derive the
+/// event's depth off the real article**, and nudge the event's cluster (if already built) back into the
+/// summarization work queue via [`cluster::store::touch_group`](crate::cluster::store::touch_group) — so a
+/// fetch that lands *after* the cluster was first summarized off the snippet re-summarizes off the richer
+/// text (the `summary_hash` staleness gate then confirms the content moved). A not-yet-built cluster needs
+/// no nudge: it'll summarize — and roll up its depth — with the upgraded fields already present.
+///
+/// The depth re-derivation closes the gap where a thin-snippet RSS item stayed a headline-only Note even
+/// after its full article was fetched: `content_kind` is set at ingest from the *snippet* (`rss.rs`), so a
+/// real article behind a teaser was grounded on the full text yet still classified (and rendered) as a
+/// Note. When the fetched `full_text` clears [`LONGFORM_MIN_CHARS`](crate::ingest::LONGFORM_MIN_CHARS) we
+/// raise the event's `content_kind` to `longform` (and the cluster's `content_depth` with it, in
+/// `touch_group`), so the re-summary is asked for a Story tldr and `richness` reclassifies it. Monotonic —
+/// we never demote a snippet that already qualified. Runs in the cluster's scope context (public sweep →
+/// no-subscriber).
 async fn store_full_text(
     conn: &mut PgConnection,
     id: Uuid,
@@ -586,17 +594,20 @@ async fn store_full_text(
     scope: &Scope,
     text: &str,
 ) -> Result<(), sqlx::Error> {
+    let longform = text.chars().count() >= crate::ingest::LONGFORM_MIN_CHARS;
     sqlx::query(
         "UPDATE event
-         SET full_text = $2, full_text_fetched_at = now(), full_text_attempts = full_text_attempts + 1
+         SET full_text = $2, full_text_fetched_at = now(), full_text_attempts = full_text_attempts + 1,
+             content_kind = CASE WHEN $3 THEN 'longform' ELSE content_kind END
          WHERE id = $1",
     )
     .bind(id)
     .bind(text)
+    .bind(longform)
     .execute(&mut *conn)
     .await?;
 
-    crate::cluster::store::touch_group(&mut *conn, scope, source, group_key).await
+    crate::cluster::store::touch_group(&mut *conn, scope, source, group_key, longform).await
 }
 
 /// Record a failed fetch attempt (leaving `full_text` NULL). A `permanent` failure spends the whole
