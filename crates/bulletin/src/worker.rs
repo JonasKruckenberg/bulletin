@@ -452,7 +452,7 @@ async fn summarize_private(pool: &PgPool, subscriber_id: Uuid) {
     );
     report_sweep(
         Some(subscriber_id),
-        bulletin_core::summarize::sweep_stories(pool, subscriber_id, &cfg).await,
+        bulletin_core::summarize::sweep_stories(pool, subscriber_id, &cfg, None).await,
     );
     report_sweep(
         Some(subscriber_id),

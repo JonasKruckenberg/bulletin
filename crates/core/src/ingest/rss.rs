@@ -36,12 +36,13 @@ pub struct RssItem {
 /// cap here to keep DB rows and the model's input bounded.
 const MAX_BODY_CHARS: usize = 2000;
 
-/// Body length (chars) at or above which an RSS item is treated as [`ContentKind::Longform`] — enough
-/// material to ground a multi-sentence Story tldr. Below it (and for body-less items) the item is an
-/// [`ContentKind::Announcement`]: a thin headline-bearing update that should render as a Note, not be
-/// padded into a vague Story. The depth signal is set here, in the connector, because source semantics
-/// live in the adapter (design §5.1) — deriving it downstream from length would be a gameable heuristic.
-const LONGFORM_MIN_CHARS: usize = 400;
+/// The shared depth threshold (chars) — defined once in [`crate::ingest`] so the ingest gate here and the
+/// article-fetch re-derivation can't drift. Applied here to the feed snippet at ingest: an item whose
+/// snippet clears it is [`ContentKind::Longform`] (enough to ground a Story tldr), else a thin
+/// [`ContentKind::Announcement`] → a headline-only Note. A late article fetch re-applies it to the fetched
+/// `full_text` and *raises* the depth (`ingest::fetch`), so a real article behind a teaser snippet still
+/// earns its Story depth.
+use crate::ingest::LONGFORM_MIN_CHARS;
 
 /// Max HTML handed to the renderer (see [`html_text::render`]): a full-article `<content>` is parsed
 /// only up to the leading slice that comfortably yields the kept text, so ingest work stays

@@ -123,19 +123,26 @@ pub async fn upsert_cluster(
 
 /// Bump a group's cluster `updated_at` so the summarization staleness gate (`updated_at >
 /// summarized_at`) re-picks it, without a full rebuild — used by the best-effort article fetch
-/// (`ingest::fetch`) when late-arriving `full_text` should re-summarize an already-built cluster.
-/// A no-op (0 rows) when the group has no cluster yet: it will summarize with the `full_text` already
-/// present once first built. Keeps the cluster-identity match in one place (here, beside the build's
-/// `upsert_cluster`) instead of re-spelling it in the fetcher.
+/// (`ingest::fetch`) when late-arriving `full_text` should re-summarize an already-built cluster. When
+/// `raise_longform` is set (the fetched article cleared the depth threshold), the same update also
+/// **raises** the cluster's `content_depth` to `longform`, so the re-summary off the richer text is asked
+/// for a Story tldr and `richness` reclassifies it from Note to Story — not left at the thin snippet's
+/// depth. `content_depth` is a max over the group's events and `longform` is its ceiling, so this is
+/// monotonic (it never demotes). A no-op (0 rows) when the group has no cluster yet: once first built it
+/// rolls up the already-upgraded `content_kind` on its events. Keeps the cluster-identity match in one
+/// place (here, beside the build's `upsert_cluster`) instead of re-spelling it in the fetcher.
 pub async fn touch_group(
     executor: impl PgExecutor<'_>,
     scope: &Scope,
     source: SourceKind,
     group_key: &str,
+    raise_longform: bool,
 ) -> Result<(), sqlx::Error> {
     let (scope_kind, scope_subscriber_id) = scope.to_columns();
     sqlx::query(
-        "UPDATE cluster SET updated_at = now()
+        "UPDATE cluster
+         SET updated_at = now(),
+             content_depth = CASE WHEN $5 THEN 'longform' ELSE content_depth END
          WHERE scope_kind = $1 AND scope_subscriber_id IS NOT DISTINCT FROM $2
            AND source = $3 AND group_key = $4",
     )
@@ -143,6 +150,7 @@ pub async fn touch_group(
     .bind(scope_subscriber_id)
     .bind(source)
     .bind(group_key)
+    .bind(raise_longform)
     .execute(executor)
     .await?;
     Ok(())
