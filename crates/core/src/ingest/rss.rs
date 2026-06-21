@@ -36,14 +36,6 @@ pub struct RssItem {
 /// cap here to keep DB rows and the model's input bounded.
 const MAX_BODY_CHARS: usize = 2000;
 
-/// The shared depth threshold (chars) — defined once in [`crate::ingest`] so the ingest gate here and the
-/// article-fetch re-derivation can't drift. Applied here to the feed snippet at ingest: an item whose
-/// snippet clears it is [`ContentKind::Longform`] (enough to ground a Story tldr), else a thin
-/// [`ContentKind::Announcement`] → a headline-only Note. A late article fetch re-applies it to the fetched
-/// `full_text` and *raises* the depth (`ingest::fetch`), so a real article behind a teaser snippet still
-/// earns its Story depth.
-use crate::ingest::LONGFORM_MIN_CHARS;
-
 /// Max HTML handed to the renderer (see [`html_text::render`]): a full-article `<content>` is parsed
 /// only up to the leading slice that comfortably yields the kept text, so ingest work stays
 /// proportional to what we store ([`MAX_BODY_CHARS`]), not to feed size.
@@ -205,11 +197,19 @@ impl Connection for RssConnection {
         let event_time = item.published.unwrap_or_else(Utc::now);
         let links: Vec<String> = item.link.into_iter().collect();
 
-        // Depth gate: only a body with real substance (>= LONGFORM_MIN_CHARS) earns Longform — and with
-        // it a Story-depth multi-sentence tldr. A thin or body-less item is an Announcement, so the
-        // summarizer renders it as a headline-only Note rather than padding it into a vague Story.
+        // Depth by **source semantics**, not snippet length (system-design.md §8.3/§300, and
+        // `ContentKind`'s own doc): "an RSS item is longform … deriving it downstream from body text
+        // would collapse into a gameable length heuristic." An RSS item links out to a published
+        // article, so an item that carries any article text *is* a Story-depth `Longform` — even when
+        // the *feed* only shipped a short teaser (most do: a 200–300-char snippet under the old
+        // 400-char gate is what made nearly every article render as a Note, the all-Notes digest). The
+        // teaser still grounds a short tldr now; the best-effort full-text fetch later enriches it
+        // ([`crate::ingest::fetch`]) without changing the format. Only a genuinely body-less item — no
+        // text to ground a summary at all — stays a thin [`ContentKind::Announcement`] → headline-only
+        // Note, and even that self-heals: it has a link, so the fetch raises it to Longform once the
+        // article lands.
         let content_kind = match &item.body {
-            Some(body) if body.chars().count() >= LONGFORM_MIN_CHARS => ContentKind::Longform,
+            Some(body) if !body.trim().is_empty() => ContentKind::Longform,
             _ => ContentKind::Announcement,
         };
 
@@ -255,20 +255,22 @@ mod tests {
 
     #[test]
     fn bodyless_item_is_announcement() {
+        // No article text at all → a thin headline-only Note (the fetch later raises it once the
+        // linked article lands). A whitespace-only body is treated the same as empty.
         assert_eq!(content_kind_for(None), ContentKind::Announcement);
+        assert_eq!(content_kind_for(Some("   ")), ContentKind::Announcement);
     }
 
     #[test]
-    fn short_body_is_announcement() {
-        // A body shorter than LONGFORM_MIN_CHARS is too thin to ground a Story tldr → Note depth.
-        let short = "x".repeat(LONGFORM_MIN_CHARS - 1);
-        assert_eq!(content_kind_for(Some(&short)), ContentKind::Announcement);
-    }
+    fn any_article_text_is_longform_regardless_of_length() {
+        // Source semantics, not snippet length: an RSS item links to a published article, so any
+        // article text — even a short feed teaser — classifies as Story-depth `Longform`. The old
+        // 400-char snippet gate is gone (it made teaser-only feeds render as all-Notes).
+        let teaser = "Iran and the US raise pressure before talks in Switzerland.";
+        assert!(teaser.chars().count() < 400, "a typical short feed teaser");
+        assert_eq!(content_kind_for(Some(teaser)), ContentKind::Longform);
 
-    #[test]
-    fn long_body_is_longform() {
-        // A body at/above the threshold carries enough material for a Story-depth summary.
-        let long = "x".repeat(LONGFORM_MIN_CHARS);
+        let long = "x".repeat(800);
         assert_eq!(content_kind_for(Some(&long)), ContentKind::Longform);
     }
 }

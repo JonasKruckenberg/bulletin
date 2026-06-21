@@ -30,11 +30,13 @@ pub struct Batch<I, C> {
 /// The poll interval (seconds) a new connection takes when the caller leaves it unset.
 pub const DEFAULT_POLL_INTERVAL_SECS: i64 = 900;
 
-/// The depth threshold (chars): text at or above this carries enough substance to ground a Story-depth
-/// multi-sentence tldr; below it is a thin [`Announcement`](crate::common::kind::ContentKind::Announcement)
-/// → a headline-only Note. Shared by the RSS ingest gate (which applies it to the feed snippet, [`rss`])
-/// and the article-fetch re-derivation (which re-applies it to the fetched `full_text`, [`fetch`]), so the
-/// two can't drift on what "longform" means.
+/// The depth threshold (chars) the **article-fetch re-derivation** ([`fetch`]) uses to lift a
+/// body-less item out of [`Announcement`](crate::common::kind::ContentKind::Announcement): once a
+/// linked article is fetched and clears this, the event is raised to
+/// [`Longform`](crate::common::kind::ContentKind::Longform). RSS *ingest* no longer length-gates —
+/// an item carrying any article text is `Longform` by source semantics (system-design.md §8.3/§300;
+/// see [`rss`]), since deriving format from snippet length is the "gameable length heuristic" the
+/// design warns against and what made teaser-only feeds render as all-Notes.
 pub(crate) const LONGFORM_MIN_CHARS: usize = 400;
 
 /// Validated inputs for [`store::insert_connection`], produced by [`prepare_connection`].
