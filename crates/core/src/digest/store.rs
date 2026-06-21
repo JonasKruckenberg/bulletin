@@ -168,6 +168,10 @@ pub struct RenderItem {
     /// Whether the rendered summary is the Phase-C **story** synthesis (`true`) or the Phase-A
     /// representative-cluster fallback / raw title (`false`) — a debug-trace provenance flag.
     pub synthesized: bool,
+    /// Whether the TL;DR was **composed deterministically from the member headlines** (the fallback for
+    /// a multi-member story whose model synthesis hasn't landed yet) rather than produced by a model — a
+    /// debug-trace provenance flag. Mutually exclusive with [`synthesized`](Self::synthesized).
+    pub composed: bool,
 }
 
 /// The thread chip / context eyebrow on a rendered item (`llm-summarization.md` §6.1 zone 1): the
@@ -276,8 +280,7 @@ pub(crate) fn build_render_item(
     // Choose the summary to render: the story's cross-source synthesis (Phase C) when present and
     // non-empty, else the representative cluster's summary (Phase A). Then prefer its abstractive
     // `headline`, degrading to the raw cluster `title` when neither has run or the gate rejected one
-    // (`llm-summarization.md` §6.1). The `tldr` (flat + structured) rides through — empty until a
-    // summary lands, which the renderer treats as "no TL;DR".
+    // (`llm-summarization.md` §6.1).
     let synthesized = story_summary.is_some_and(|s| !s.is_empty());
     let chosen = story_summary
         .filter(|s| !s.is_empty())
@@ -286,6 +289,22 @@ pub(crate) fn build_render_item(
         rep.title.clone()
     } else {
         chosen.headline.clone()
+    };
+
+    // The TL;DR (flat + structured runs): the chosen summary's own `tldr` when it has one (a synthesis,
+    // or a Longform representative). When it doesn't — a multi-member story whose cross-source synthesis
+    // hasn't landed yet, falling back to a headline-only representative — compose a deterministic TL;DR
+    // from the *other* members' headlines (`compose_member_tldr`), so a fused story always surfaces what
+    // it connects instead of a bare headline; the model synthesis upgrades the line in place once it
+    // lands. Faithful by construction: it only restates lines that already cleared the §3.4 gate (or the
+    // source's own title). A single-member story has no connections to fold, so it stays as-is.
+    let (summary, summary_runs, composed) = if !chosen.tldr.is_empty() {
+        (chosen.tldr_text.clone(), chosen.tldr.clone(), false)
+    } else {
+        let runs = compose_member_tldr(&resolved[1..]);
+        let flat = runs.iter().map(TldrRun::surface).collect();
+        let composed = !runs.is_empty();
+        (flat, runs, composed)
     };
 
     Some(RenderItem {
@@ -297,11 +316,56 @@ pub(crate) fn build_render_item(
         thread: None,
         reason: ItemReason::default(),
         headline,
-        summary: chosen.tldr_text.clone(),
-        summary_runs: chosen.tldr.clone(),
+        summary,
+        summary_runs,
         summary_band: chosen.band,
         synthesized,
+        composed,
     })
+}
+
+/// Max member headlines folded into a composed fallback TL;DR — enough to convey a story's spread
+/// without a wall of text.
+const COMPOSED_TLDR_MAX_MEMBERS: usize = 4;
+
+/// Compose a deterministic fallback TL;DR for a multi-member story from its connected members' headlines
+/// — the safety net for when no model summary carries a `tldr` yet (a synthesis that hasn't landed, over
+/// a headline-only representative). Returns a single text run of up to [`COMPOSED_TLDR_MAX_MEMBERS`]
+/// member headlines as sentences, or empty when there are no connections (a single-member story has
+/// nothing to fold). Faithful by construction: every line already passed the §3.4 faithfulness gate as a
+/// cluster headline, or is the source's own `title`, so joining them invents nothing.
+fn compose_member_tldr(connections: &[(&ClusterRef, &ClusterCard)]) -> Vec<TldrRun> {
+    let sentences: Vec<String> = connections
+        .iter()
+        .filter_map(|(_, c)| {
+            let headline = c.summary.headline.trim();
+            let line = if headline.is_empty() {
+                c.title.trim()
+            } else {
+                headline
+            };
+            (!line.is_empty()).then(|| as_sentence(line))
+        })
+        .take(COMPOSED_TLDR_MAX_MEMBERS)
+        .collect();
+    if sentences.is_empty() {
+        Vec::new()
+    } else {
+        vec![TldrRun::Text {
+            text: sentences.join(" "),
+        }]
+    }
+}
+
+/// Terminate a headline as a sentence (abstractive headlines are usually unterminated), so a composed
+/// TL;DR reads as prose rather than a run-on. Keeps an existing terminator.
+fn as_sentence(s: &str) -> String {
+    let s = s.trim();
+    if s.ends_with(['.', '!', '?']) {
+        s.to_string()
+    } else {
+        format!("{s}.")
+    }
 }
 
 /// Idempotently gets-or-creates the digest for `(subscriber, window_end)` with its selected
@@ -779,4 +843,95 @@ pub async fn story_timeline(
     })
     .fetch_all(&mut *conn)
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::link::ClusterRef;
+    use crate::summarize::{ClusterSummary, TldrRun};
+    use chrono::TimeZone;
+
+    /// A cluster card with a given (abstractive) headline and no tldr — the headline-only shape a
+    /// thin-snippet RSS cluster ends up with.
+    fn card(title: &str, headline: &str, secs: i64) -> ClusterCard {
+        ClusterCard {
+            title: title.to_string(),
+            link: None,
+            source: SourceKind::Rss,
+            last_event_time: Utc.timestamp_opt(secs, 0).single().unwrap(),
+            summary: ClusterSummary {
+                headline: headline.to_string(),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn member(id: u128) -> ClusterRef {
+        ClusterRef {
+            cluster_id: Uuid::from_u128(id),
+            link_reason: None,
+        }
+    }
+
+    #[test]
+    fn multi_member_story_composes_tldr_from_member_headlines() {
+        // Rep (newest) and a connected member are both headline-only, and no model synthesis exists:
+        // the TL;DR is composed from the connection's (gate-passed) headline, faithfully.
+        let mut cards = HashMap::new();
+        cards.insert(Uuid::from_u128(1), card("rep title", "Rep headline", 200));
+        cards.insert(
+            Uuid::from_u128(2),
+            card("conn title", "Connection headline", 100),
+        );
+        let item = build_render_item(&[member(1), member(2)], &cards, None).unwrap();
+        assert!(
+            item.composed,
+            "a multi-member story must compose a fallback TL;DR"
+        );
+        assert!(!item.synthesized);
+        assert_eq!(item.summary, "Connection headline.");
+        assert!(matches!(
+            item.summary_runs.as_slice(),
+            [TldrRun::Text { .. }]
+        ));
+        // The card headline still wins for the headline slot; only the TL;DR is composed.
+        assert_eq!(item.headline, "Rep headline");
+    }
+
+    #[test]
+    fn single_member_story_has_no_composed_tldr() {
+        // No connections to fold → no composition; the item stays headline-only (it degrades to a
+        // bare headline, exactly as before).
+        let mut cards = HashMap::new();
+        cards.insert(Uuid::from_u128(1), card("rep title", "Rep headline", 200));
+        let item = build_render_item(&[member(1)], &cards, None).unwrap();
+        assert!(!item.composed);
+        assert!(item.summary_runs.is_empty());
+        assert_eq!(item.headline, "Rep headline");
+    }
+
+    #[test]
+    fn story_synthesis_tldr_wins_over_composition() {
+        // When the Phase-C synthesis has landed, its tldr is used and nothing is composed.
+        let mut cards = HashMap::new();
+        cards.insert(Uuid::from_u128(1), card("rep title", "Rep headline", 200));
+        cards.insert(
+            Uuid::from_u128(2),
+            card("conn title", "Connection headline", 100),
+        );
+        let synthesis = ClusterSummary {
+            headline: "Synth headline".to_string(),
+            tldr: vec![TldrRun::Text {
+                text: "Synthesized cross-source line.".to_string(),
+            }],
+            tldr_text: "Synthesized cross-source line.".to_string(),
+            ..Default::default()
+        };
+        let item = build_render_item(&[member(1), member(2)], &cards, Some(&synthesis)).unwrap();
+        assert!(item.synthesized);
+        assert!(!item.composed);
+        assert_eq!(item.summary, "Synthesized cross-source line.");
+        assert_eq!(item.headline, "Synth headline");
+    }
 }

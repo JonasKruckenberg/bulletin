@@ -1031,6 +1031,7 @@ mod tests {
             summary_runs: Vec::new(),
             summary_band: Band::Uncertain,
             synthesized: false,
+            composed: false,
         }
     }
 
