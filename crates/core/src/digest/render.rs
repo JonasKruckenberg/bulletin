@@ -715,6 +715,8 @@ fn debug_trace_block(position: usize, item: &RenderItem, tz: Tz) -> String {
         "raw title (no summary)"
     } else if item.synthesized {
         "story.summary cache"
+    } else if item.composed {
+        "composed from members"
     } else {
         "cluster summary"
     };
@@ -948,6 +950,7 @@ mod tests {
             summary_runs: Vec::new(),
             summary_band: Band::Uncertain,
             synthesized: false,
+            composed: false,
         }
     }
 
