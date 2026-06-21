@@ -120,6 +120,14 @@ const W_JACCARD: f64 = 0.7;
 const W_TEMPORAL: f64 = 0.3;
 /// A weak edge forms only at or above this score — corroboration beyond a single shared weak token.
 const WEAK_EDGE_THRESHOLD: f64 = 0.35;
+/// A weak edge also requires at least this much *entity* overlap (Jaccard over the distinctive linkable
+/// entities). Temporal proximity **corroborates** an edge; it must not be able to *carry* one. Without
+/// this floor two same-window items linked on a single broad shared token — `place:germany`, a shared
+/// stock-photo agency — because the temporal term (`W_TEMPORAL`) alone nearly clears the threshold,
+/// chaining unrelated coverage into one blob (the reported "wildly inaccurate" grouping). Tuned so a
+/// genuine same-story pair (several shared distinctive entities, or one dominant one in a sparse set)
+/// still links, while a lone broad coincidence does not.
+const WEAK_MIN_JACCARD: f64 = 0.2;
 /// Temporal closeness decays linearly to zero across this many days apart.
 const TEMPORAL_WINDOW_DAYS: f64 = 14.0;
 
@@ -199,9 +207,16 @@ fn scored_edge(a: &LinkCluster, b: &LinkCluster) -> Option<(bool, f64, String)> 
     {
         return Some((true, 1.0, format!("shared {key}")));
     }
-    let score = W_JACCARD * jaccard(shared.len(), a.entities.len(), b.entities.len())
-        + W_TEMPORAL * temporal_closeness(a, b);
-    if score >= WEAK_EDGE_THRESHOLD {
+    // Jaccard over the **distinctive (linkable) entities only** — a `domain:` (every item from one feed
+    // shares its feed's domain) or a broad `topic:` must not inflate the similarity, or two same-feed
+    // items look more alike than they are. Counting only the entities that can actually form a link
+    // makes the overlap reflect shared *content*, and makes the `WEAK_MIN_JACCARD` floor predictable.
+    let a_link = linkable_count(a);
+    let b_link = linkable_count(b);
+    let shared_link = shared.iter().filter(|e| link_strength(e).is_some()).count();
+    let j = jaccard(shared_link, a_link, b_link);
+    let score = W_JACCARD * j + W_TEMPORAL * temporal_closeness(a, b);
+    if score >= WEAK_EDGE_THRESHOLD && j >= WEAK_MIN_JACCARD {
         // A shared domain isn't linkable, so the weak reason is a repo/user (blocking guaranteed one).
         let key = shared
             .iter()
@@ -210,6 +225,16 @@ fn scored_edge(a: &LinkCluster, b: &LinkCluster) -> Option<(bool, f64, String)> 
     } else {
         None
     }
+}
+
+/// The number of a cluster's **linkable** entities — the ones [`link_strength`] classes as a link key
+/// (`cve:`/`url:`/`repo:`/`user:`/`place:`/`org:`/`person:`), excluding the non-linking `domain:`/`topic:`
+/// and bot actors. The denominator of the distinctive-entity Jaccard in [`scored_edge`].
+fn linkable_count(c: &LinkCluster) -> usize {
+    c.entities
+        .iter()
+        .filter(|e| link_strength(e).is_some())
+        .count()
 }
 
 /// The shared entities of two clusters, sorted. Entities are stored sorted+deduped (genuine sets),
@@ -674,6 +699,73 @@ mod tests {
             cluster(2, &["repo:acme/api", "user:bob"], 60), // far outside the temporal window
         ];
         assert_eq!(link(&stale, &[], minter()).stories.len(), 2);
+    }
+
+    #[test]
+    fn one_broad_shared_entity_in_a_rich_set_does_not_fuse() {
+        // Two same-day items that share a single broad entity (`place:germany`) but are otherwise about
+        // different things must NOT fuse: temporal proximity corroborates, it can't carry the edge. With
+        // ~5 distinctive entities each and only one shared, the Jaccard sits under `WEAK_MIN_JACCARD`.
+        let broad_only = vec![
+            cluster(
+                1,
+                &[
+                    "place:germany",
+                    "org:bundestag",
+                    "org:spd",
+                    "person:alice",
+                    "topic:pensions",
+                    "domain:tagesschau.de",
+                ],
+                1,
+            ),
+            cluster(
+                2,
+                &[
+                    "place:germany",
+                    "org:dwd",
+                    "place:cottbus",
+                    "person:bob",
+                    "topic:weather",
+                    "domain:tagesschau.de",
+                ],
+                1,
+            ),
+        ];
+        assert_eq!(
+            link(&broad_only, &[], minter()).stories.len(),
+            2,
+            "a lone broad shared entity (same day) must not fuse two otherwise-distinct items"
+        );
+
+        // But a genuine same-story pair — several shared distinctive entities — still fuses on the day.
+        let same_story = vec![
+            cluster(
+                1,
+                &[
+                    "place:strait-of-hormuz",
+                    "org:iran",
+                    "org:usa",
+                    "domain:a.com",
+                ],
+                1,
+            ),
+            cluster(
+                2,
+                &[
+                    "place:strait-of-hormuz",
+                    "org:iran",
+                    "org:usa",
+                    "domain:b.com",
+                ],
+                1,
+            ),
+        ];
+        assert_eq!(
+            link(&same_story, &[], minter()).stories.len(),
+            1,
+            "several shared distinctive entities is a real connection — it must fuse"
+        );
     }
 
     #[test]

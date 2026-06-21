@@ -50,8 +50,17 @@ pub enum LinkStrength {
 pub fn link_strength(entity: &str) -> Option<LinkStrength> {
     if entity.starts_with("cve:") || entity.starts_with("url:") {
         Some(LinkStrength::Strong)
+    } else if let Some(login) = entity.strip_prefix("user:") {
+        // A *bot* actor (`renovate[bot]`, `dependabot[bot]`, `github-actions[bot]`) touches a great many
+        // unrelated repos, so a shared bot is noise as a link key — it fused every repo Renovate runs on
+        // into one blob. Only a human actor corroborates a connection; a bot is non-linking (it still
+        // rides on the cluster for display, it just never forms an edge by itself).
+        if is_bot_login(login) {
+            None
+        } else {
+            Some(LinkStrength::Weak)
+        }
     } else if entity.starts_with("repo:")
-        || entity.starts_with("user:")
         || entity.starts_with("place:")
         || entity.starts_with("org:")
         || entity.starts_with("person:")
@@ -60,6 +69,13 @@ pub fn link_strength(entity: &str) -> Option<LinkStrength> {
     } else {
         None
     }
+}
+
+/// Whether a `user:` login is an automation account rather than a person — GitHub's convention is a
+/// trailing `[bot]` suffix (`renovate[bot]`, `dependabot[bot]`, `github-actions[bot]`). Matched on the
+/// bracketed suffix so a human login that merely contains "bot" (`robot`, `botev`) is not caught.
+fn is_bot_login(login: &str) -> bool {
+    login.ends_with("[bot]")
 }
 
 /// Derive the shared, cross-source entities (CVE ids + URLs/domains) from an event's text and links.
@@ -182,6 +198,19 @@ mod tests {
         assert_eq!(link_strength("repo:acme/widget"), Some(Weak));
         assert_eq!(link_strength("user:alice"), Some(Weak));
         assert_eq!(link_strength("domain:example.com"), None);
+    }
+
+    #[test]
+    fn bot_actors_are_not_link_keys() {
+        use LinkStrength::*;
+        // A human actor corroborates a link; a bot does not (it acts across unrelated repos).
+        assert_eq!(link_strength("user:alice"), Some(Weak));
+        assert_eq!(link_strength("user:renovate[bot]"), None);
+        assert_eq!(link_strength("user:dependabot[bot]"), None);
+        assert_eq!(link_strength("user:github-actions[bot]"), None);
+        // A human login that merely contains "bot" is still a link key — only the `[bot]` suffix counts.
+        assert_eq!(link_strength("user:robot"), Some(Weak));
+        assert_eq!(link_strength("user:botev"), Some(Weak));
     }
 
     #[test]

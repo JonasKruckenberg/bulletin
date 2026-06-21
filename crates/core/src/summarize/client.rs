@@ -26,6 +26,13 @@ use crate::summarize::{
     SYSTEM_PROMPT,
 };
 
+/// Minimum budgeted **source-text** length (chars) for a cluster to earn a multi-sentence tldr even
+/// when its `content_kind` label is below `Longform` (see [`generate_candidate`]). A real RSS article
+/// snippet comfortably clears this; a bare title (a GitHub push, a one-line release) does not, so a
+/// genuinely thin item still degrades to a headline-only Note rather than a padded tldr. Sized to a
+/// couple of sentences of grounding — enough for a tldr to add something beyond the ≤90-char headline.
+const TLDR_MIN_SOURCE_CHARS: usize = 200;
+
 /// Summarize one cluster: extract-then-summarize (§3.2) — hand the model the pre-extracted facts +
 /// budgeted source text and ask it to *rewrite* them, then run the §3.4 faithfulness gate.
 ///
@@ -100,16 +107,25 @@ async fn generate_candidate(
     }
 
     // Depth-gate the summary's richness (§5.1): a cluster is only as deep as its richest event
-    // (`ContentKind` is `Ord`: Message < Announcement < Longform). Only a Longform cluster earns a
-    // multi-sentence tldr (a Story); a thinner one gets a headline-only Note, sparing both the vague
+    // (`ContentKind` is `Ord`: Message < Announcement < Longform). A Longform cluster earns a
+    // multi-sentence tldr (a Story); a thin one gets a headline-only Note, sparing both the vague
     // headline-paraphrase and the tldr token budget. An empty cluster shouldn't reach here, but default
     // to Longform if it somehow does — don't regress a real cluster to a Note.
+    //
+    // We also grant a tldr whenever the cluster actually carries enough grounded **source text** to
+    // write one (`TLDR_MIN_SOURCE_CHARS`), independent of the `content_kind` label. `content_kind` is
+    // set from the connector's *snippet* at ingest and only raised to `longform` by a successful
+    // best-effort full-article fetch (`ingest::fetch`); where that fetch can't run (no egress, a dead
+    // link), a real news article stayed an `Announcement` and rendered with no summary at all — the
+    // reported "no summaries show up". Grounding the decision on the text in hand fixes that without
+    // ever giving a genuinely thin item (a bare GitHub push title, a one-line release) a padded tldr.
     let depth = events
         .iter()
         .map(|e| e.content_kind)
         .max()
         .unwrap_or(ContentKind::Longform);
-    let want_tldr = depth == ContentKind::Longform;
+    let want_tldr =
+        depth == ContentKind::Longform || source.chars().count() >= TLDR_MIN_SOURCE_CHARS;
 
     let candidate = call_model(cfg, http, &facts, &source, want_tldr).await?;
 
