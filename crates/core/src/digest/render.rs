@@ -638,11 +638,21 @@ fn render_provenance(item: &RenderItem, tz: Tz) -> String {
 /// plain `surface` text — never a broken badge (the plaintext view uses the flat `tldr_text`).
 fn render_summary_runs(runs: &[TldrRun]) -> String {
     let mut out = String::new();
+    // The previous run's *visible surface* (not its HTML), so the boundary rule sees real punctuation —
+    // a `ref` renders as badge markup whose first/last char is a `<`/`>`, never the surface text.
+    let mut prev_surface = String::new();
     for run in runs {
+        let surface = run.surface();
+        // Re-introduce a single inter-run space the model dropped (the same boundary rule the flat
+        // `tldr_text` uses), so consecutive entity badges don't render glued together.
+        if crate::summarize::join_run_space(&prev_surface, surface) {
+            out.push(' ');
+        }
         match run {
             TldrRun::Text { text } => out.push_str(&escape_prose(text)),
             TldrRun::Ref { entity, surface } => out.push_str(&render_entity_badge(entity, surface)),
         }
+        prev_surface = surface.to_string();
     }
     out
 }
@@ -1203,6 +1213,37 @@ mod tests {
         assert!(html.contains("acme/auth"));
         assert!(html.contains(BADGE_CVE_BG));
         assert!(html.contains("CVE-2026-2200"));
+    }
+
+    #[test]
+    fn consecutive_entity_badges_render_with_a_separating_space() {
+        // The deployment bug: the model emitted back-to-back entity `ref` runs with no text between
+        // them to carry a space, so the badges rendered glued ("ParisShiona McCallum"). render now
+        // re-introduces a single space at the glued boundary — the same rule the flat `tldr_text` uses.
+        let runs = vec![
+            TldrRun::Ref {
+                entity: "place:paris".to_string(),
+                surface: "Paris".to_string(),
+            },
+            TldrRun::Ref {
+                entity: "person:shiona".to_string(),
+                surface: "Shiona McCallum".to_string(),
+            },
+        ];
+        let item = RenderItem {
+            summary: "Paris Shiona McCallum".to_string(),
+            summary_runs: runs,
+            summary_band: Band::Confirmed,
+            ..item("t", None, SourceKind::Github)
+        };
+        let html = render_one(&item);
+        // The two surfaces are separated by a space rather than abutting directly.
+        assert!(html.contains("Paris"));
+        assert!(html.contains("Shiona McCallum"));
+        assert!(
+            !html.contains("ParisShiona McCallum"),
+            "badges must not glue: {html}"
+        );
     }
 
     #[test]
