@@ -49,16 +49,17 @@ impl Recurrence {
         Self::new(freq, on_weekday).map_err(|e| sqlx::Error::Decode(e.into()))
     }
 
-    /// How far back a digest of this cadence may *display* items (design: the "freshness floor").
+    /// The **minimum** reach of a digest's display floor: one cadence plus a deliberate **grace**
+    /// margin. Used by [`display_floor`](Self::display_floor) as the floor when there is no prior
+    /// delivery to reach back to (or when the last delivery is more recent than one cadence).
     ///
     /// The candidate window deliberately reaches 30 days back for *linking/threading context*
     /// (see `CONTEXT_HORIZON_DAYS` / `link::store`), but a subscriber's digest should only ever
-    /// *surface* items recent enough for their chosen cadence — otherwise, when fresh content is
+    /// *surface* items fresh enough for their chosen cadence — otherwise, when fresh content is
     /// thin, stale (e.g. 3-week-old) items quietly fill the slots even though selection's recency
-    /// only *decays* rank, never *gates* inclusion. This is one cadence plus a deliberate **grace**
-    /// margin: a late or outage-delayed run (the schedule coalesces missed boundaries rather than
-    /// firing a backlog burst — see [`advance_after_delivery`]) should still surface ~one cadence
-    /// of items, not collapse to nothing nor reach all the way back to 30 days.
+    /// only *decays* rank, never *gates* inclusion. The grace margin keeps a run that slips a little
+    /// late (the schedule coalesces missed boundaries rather than firing a backlog burst — see
+    /// [`advance_after_delivery`]) from collapsing the window to nothing.
     pub fn display_window(self) -> Duration {
         // Cadence period + grace, kept as named bindings so the grace is documented, not magic.
         // Daily cadence is 1 day; +12h grace covers a run that slips into the next morning.
@@ -69,6 +70,27 @@ impl Recurrence {
             Recurrence::Daily => Duration::days(1) + daily_grace, // 36h
             Recurrence::Weekly { .. } => Duration::days(7) + weekly_grace, // 8d
         }
+    }
+
+    /// The cutoff below which an item is too stale to *surface* in a digest of this cadence — the
+    /// freshness gate `select` applies (dropping older candidates as `StaleForCadence`). The floor
+    /// reaches back to the **last delivery** (`last_run`), so a delayed or outage-coalesced run
+    /// still surfaces *every* fresh event since the previous digest — the literal "digest window" —
+    /// not just the trailing cadence. It never reaches *less* than one [`display_window`] (cadence +
+    /// grace), so a recent manual/extra run can't collapse the window to nothing. With no prior
+    /// delivery (the first-ever digest) it is exactly one `display_window`.
+    ///
+    /// This mirrors the candidate floor's `LEAST(last_run, now − horizon)` shape (`link::store`) one
+    /// tier in: linking reaches back to last delivery (min 30d) for *context*, surfacing reaches back
+    /// to last delivery (min one cadence) for *display*. Items between the two floors stay candidates
+    /// — linking still uses them — but only those above the display floor are surfaced.
+    pub fn display_floor(
+        self,
+        now: DateTime<Utc>,
+        last_run: Option<DateTime<Utc>>,
+    ) -> DateTime<Utc> {
+        let cadence_floor = now - self.display_window();
+        last_run.map_or(cadence_floor, |lr| lr.min(cadence_floor))
     }
 
     /// A compact human label for the debug CLI / status output.
@@ -348,6 +370,7 @@ pub async fn advance_after_delivery(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn validate_schedule_applies_defaults() {
@@ -385,6 +408,45 @@ mod tests {
         assert_eq!(
             Recurrence::Weekly { weekday: 3 }.display_window(),
             Duration::days(8)
+        );
+    }
+
+    #[test]
+    fn display_floor_reaches_back_to_last_delivery_when_it_is_older_than_a_cadence() {
+        // An outage-delayed daily run: last delivery was 5 days ago, well past the 36h cadence
+        // window. The floor reaches back to that delivery so every fresh event since it surfaces —
+        // the subscriber isn't shown only the trailing 36h and silently robbed of the gap.
+        let now = Utc.with_ymd_and_hms(2026, 6, 24, 9, 0, 0).unwrap();
+        let last_run = now - Duration::days(5);
+        let floor = Recurrence::Daily.display_floor(now, Some(last_run));
+        assert_eq!(floor, last_run, "reaches back to the last delivery");
+    }
+
+    #[test]
+    fn display_floor_never_reaches_less_than_one_cadence() {
+        // A recent extra/manual run (last delivery 2h ago) must not collapse the window: the floor
+        // still reaches back a full cadence + grace, so a normal day's items still surface.
+        let now = Utc.with_ymd_and_hms(2026, 6, 24, 9, 0, 0).unwrap();
+        let last_run = now - Duration::hours(2);
+        let floor = Recurrence::Daily.display_floor(now, Some(last_run));
+        assert_eq!(
+            floor,
+            now - Duration::hours(36),
+            "floored at one cadence + grace, not the recent delivery"
+        );
+    }
+
+    #[test]
+    fn display_floor_without_prior_delivery_is_one_cadence() {
+        // The first-ever digest has no delivery to reach back to → exactly one display_window.
+        let now = Utc.with_ymd_and_hms(2026, 6, 24, 9, 0, 0).unwrap();
+        assert_eq!(
+            Recurrence::Daily.display_floor(now, None),
+            now - Duration::hours(36)
+        );
+        assert_eq!(
+            Recurrence::Weekly { weekday: 3 }.display_floor(now, None),
+            now - Duration::days(8)
         );
     }
 

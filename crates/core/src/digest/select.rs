@@ -463,7 +463,8 @@ impl Gated {
 /// it is too stale to *surface* and drops with [`DropCause::StaleForCadence`] before ranking — even
 /// though the caller still hands it 30-day-deep candidates so linking/threading keep their context
 /// (the floor only governs *display*, not candidacy). It is injected (no ambient clock) so `select`
-/// stays pure; the caller derives it as `now − recurrence.display_window()`.
+/// stays pure; the caller derives it per its `DisplayPolicy` — the cadence floor for a scheduled
+/// digest, the full lookback for an off-schedule preview.
 pub fn select(
     candidates: Vec<Candidate>,
     cfg: &ScoringConfig,
