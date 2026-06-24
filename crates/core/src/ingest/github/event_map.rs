@@ -19,7 +19,7 @@
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-use crate::common::{event::EventBuilder, kind::ContentKind, kind::SourceKind};
+use crate::common::{event::EventBuilder, kind::ContentKind, kind::SourceKind, salience};
 use crate::ingest::realtime::LifecycleStatus;
 
 /// One activity from the REST events feed (`GET /repos/{owner}/{repo}/events`) or, later, a webhook
@@ -319,7 +319,7 @@ pub fn to_builder(ev: GithubEvent) -> EventBuilder {
     }
     let links: Vec<String> = html_url(&ev).into_iter().collect();
 
-    EventBuilder::new(
+    let mut builder = EventBuilder::new(
         SourceKind::Github,
         stable_id(&ev),
         ev.created_at,
@@ -328,7 +328,14 @@ pub fn to_builder(ev: GithubEvent) -> EventBuilder {
     )
     .content_kind(content_kind(&ev.kind))
     .links(links)
-    .entities(entities)
+    .entities(entities);
+    // Structural salience: GitHub's activity kind is exact, so importance is a deterministic map (no
+    // LLM — enrichment is deliberately not run over GitHub). A release/issue/PR boosts priority over
+    // routine push/star churn; routine (0) leaves the hint unset (`None`), exactly as before.
+    let importance = salience::github_importance(&ev.kind);
+    if importance > salience::ROUTINE {
+        builder = builder.severity_hint(importance);
+    }
     // The adapter reports only the structural bool; `finalize` binds it to the connection's owner.
-    .private(!ev.public)
+    builder.private(!ev.public)
 }

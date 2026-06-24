@@ -558,6 +558,9 @@ fn to_core_config(c: &proto::ScoringConfig) -> bulletin_core::digest::select::Sc
         note_cap: c.note_cap as usize,
         resurface_penalty: c.resurface_penalty,
         resurface_cap: c.resurface_cap as usize,
+        // The proto config message doesn't carry the salience/thread-cap knobs yet; a trial config
+        // round-tripped through it uses their defaults (the migration defaults the live row holds).
+        ..Default::default()
     }
 }
 

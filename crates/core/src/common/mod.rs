@@ -8,6 +8,7 @@ pub mod event;
 pub mod fingerprint;
 pub mod kind;
 pub mod link_safety;
+pub mod salience;
 pub mod scope;
 pub mod secret;
 pub mod status;
