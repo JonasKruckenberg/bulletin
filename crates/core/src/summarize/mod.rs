@@ -428,8 +428,22 @@ impl ClusterSummary {
 
     /// Recompute [`tldr_text`](Self::tldr_text) from the run-list — the single source of truth for the
     /// flat text, so the plaintext fallback can never drift from the structured runs.
+    ///
+    /// Runs are joined through [`join_run_space`], which re-introduces a single inter-run space the
+    /// model dropped (most visibly between consecutive entity `ref` runs — see that fn), so the flat
+    /// text reads "data centres, Shiona McCallum Paris" rather than the glued
+    /// "data centres,Shiona McCallumParis". The HTML render ([`render_summary_runs`]) applies the same
+    /// boundary rule, so the two views stay byte-for-byte consistent on spacing.
     pub fn rebuild_tldr_text(&mut self) {
-        self.tldr_text = self.tldr.iter().map(TldrRun::surface).collect();
+        let mut out = String::new();
+        for run in &self.tldr {
+            let surface = run.surface();
+            if join_run_space(&out, surface) {
+                out.push(' ');
+            }
+            out.push_str(surface);
+        }
+        self.tldr_text = out;
     }
 
     /// Neutralize any clickable-looking token (an explicit URL or a bare domain) the model wrote into the
@@ -453,6 +467,32 @@ impl ClusterSummary {
         }
         self.rebuild_tldr_text();
     }
+}
+
+/// Whether a single separating space belongs between two adjacent [`TldrRun`]s, given the visible text
+/// so far (`left`) and the next run's surface (`right`). It re-introduces the inter-run spacing the
+/// run-list contract puts inside the text runs but a 3–4B model intermittently drops — most visibly when
+/// it emits *consecutive* entity `ref` runs, which carry no text between them to space (the observed
+/// "data centres,Shiona McCallumParistechnologydata-centres" glue, where four `ref` surfaces collide).
+///
+/// A space is added unless one side already carries the whitespace, the right opens with punctuation
+/// that hugs the preceding token (`,.;:!?)]}%` or a quote), or the left ends with an opener that hugs the
+/// following one (`([{@#/` or a quote) — the standard typographic open/close split, so a correctly-spaced
+/// run-list (`"…in "` + `ref` + `"; …"`) round-trips byte-for-byte while a glued one is repaired.
+/// Inserting a space invents no name, number, or date, so it stays inside the §3.4 faithfulness contract.
+/// Shared by the flat [`ClusterSummary::rebuild_tldr_text`] and the HTML `render_summary_runs` so the two
+/// views can't drift on spacing.
+pub(crate) fn join_run_space(left: &str, right: &str) -> bool {
+    let (Some(l), Some(r)) = (left.chars().next_back(), right.chars().next()) else {
+        return false; // an empty run on either side — nothing to separate
+    };
+    !l.is_whitespace()
+        && !r.is_whitespace()
+        && !matches!(
+            r,
+            ',' | '.' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '%' | '\'' | '"'
+        )
+        && !matches!(l, '(' | '[' | '{' | '@' | '#' | '/' | '\'' | '"')
 }
 
 // ── Content signature (§2.1 staleness gate) ──────────────────────────────────────────────────────
@@ -2485,6 +2525,85 @@ mod tests {
         };
         s.rebuild_tldr_text();
         assert!(faithful(&s, &facts, "").is_ok());
+    }
+
+    #[test]
+    fn rebuild_tldr_text_repairs_dropped_inter_run_spaces() {
+        // The observed deployment bug: the model emits consecutive entity `ref` runs (and abuts text
+        // runs to them) without the surrounding spaces, so a naive concatenation glues words —
+        // "data centres,Shiona McCallumParistechnologydata-centreswhich…". rebuild_tldr_text must
+        // re-introduce exactly one space at each glued boundary while leaving punctuation hugging.
+        let mut s = ClusterSummary {
+            tldr: vec![
+                TldrRun::Text {
+                    text: "Shiona McCallum visited Paris to explore data centres,".to_string(),
+                },
+                TldrRun::Ref {
+                    entity: "person:shiona-mccallum".to_string(),
+                    surface: "Shiona McCallum".to_string(),
+                },
+                TldrRun::Ref {
+                    entity: "place:paris".to_string(),
+                    surface: "Paris".to_string(),
+                },
+                TldrRun::Ref {
+                    entity: "topic:data-centres".to_string(),
+                    surface: "data-centres".to_string(),
+                },
+                TldrRun::Text {
+                    text: "which are central to modern life.".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+        s.rebuild_tldr_text();
+        assert_eq!(
+            s.tldr_text,
+            "Shiona McCallum visited Paris to explore data centres, \
+             Shiona McCallum Paris data-centres which are central to modern life."
+        );
+    }
+
+    #[test]
+    fn rebuild_tldr_text_leaves_correctly_spaced_runs_unchanged() {
+        // A run-list the model spaced correctly (trailing space before a ref, punctuation hugging
+        // after it) must round-trip byte-for-byte — the repair only fires at a glued boundary.
+        let mut s = ClusterSummary {
+            tldr: vec![
+                TldrRun::Text {
+                    text: "A bad config broke validation in ".to_string(),
+                },
+                TldrRun::Ref {
+                    entity: "repo:acme/auth".to_string(),
+                    surface: "acme/auth".to_string(),
+                },
+                TldrRun::Text {
+                    text: "; 12% of logins failed.".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+        s.rebuild_tldr_text();
+        assert_eq!(
+            s.tldr_text,
+            "A bad config broke validation in acme/auth; 12% of logins failed."
+        );
+    }
+
+    #[test]
+    fn join_run_space_respects_punctuation_and_existing_whitespace() {
+        // Glue between two words → insert.
+        assert!(join_run_space("Paris", "technology"));
+        // The model already spaced the boundary → leave it.
+        assert!(!join_run_space("validation in ", "acme/auth"));
+        // The right opens with hugging punctuation → no space (no " ;").
+        assert!(!join_run_space("acme/auth", "; 12% failed"));
+        // A possessive/clitic hugs the preceding token.
+        assert!(!join_run_space("acme/auth", "'s release"));
+        // The left ends with an opener that hugs what follows.
+        assert!(!join_run_space("see (", "CVE-2026-2200"));
+        // Empty sides (the first run) never get a leading space.
+        assert!(!join_run_space("", "anything"));
     }
 
     #[test]
