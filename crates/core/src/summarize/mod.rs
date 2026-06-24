@@ -475,35 +475,24 @@ impl ClusterSummary {
 /// it emits *consecutive* entity `ref` runs, which carry no text between them to space (the observed
 /// "data centres,Shiona McCallumParistechnologydata-centres" glue, where four `ref` surfaces collide).
 ///
-/// A space is added only at a boundary where neither side already carries the whitespace **and** a space
-/// would not be wrong — i.e. not when the right opens with punctuation that hugs the preceding token
-/// (`,.;:!?)]}%…` and closing quotes), nor when the left ends with an opener that hugs the following one
-/// (`([{@#$/` and opening quotes). So a correctly-spaced run-list (`"…in "` + `ref` + `"; …"`) is left
-/// byte-for-byte unchanged, while a glued one is repaired. Inserting a space invents no name, number, or
-/// date, so the result stays squarely inside the §3.4 faithfulness contract. Shared by the flat
-/// [`ClusterSummary::rebuild_tldr_text`] and the HTML `render_summary_runs`, so the two views can't drift.
+/// A space is added unless one side already carries the whitespace, the right opens with punctuation
+/// that hugs the preceding token (`,.;:!?)]}%` or a quote), or the left ends with an opener that hugs the
+/// following one (`([{@#/` or a quote) — the standard typographic open/close split, so a correctly-spaced
+/// run-list (`"…in "` + `ref` + `"; …"`) round-trips byte-for-byte while a glued one is repaired.
+/// Inserting a space invents no name, number, or date, so it stays inside the §3.4 faithfulness contract.
+/// Shared by the flat [`ClusterSummary::rebuild_tldr_text`] and the HTML `render_summary_runs` so the two
+/// views can't drift on spacing.
 pub(crate) fn join_run_space(left: &str, right: &str) -> bool {
     let (Some(l), Some(r)) = (left.chars().next_back(), right.chars().next()) else {
         return false; // an empty run on either side — nothing to separate
     };
-    if l.is_whitespace() || r.is_whitespace() {
-        return false; // the model already spaced this boundary
-    }
-    // The right surface opens with punctuation that hugs the preceding token.
-    if matches!(
-        r,
-        ',' | '.' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '%' | '…' | '\'' | '"' | '’' | '”'
-    ) {
-        return false;
-    }
-    // The left surface ends with an opener that hugs the following token.
-    if matches!(
-        l,
-        '(' | '[' | '{' | '@' | '#' | '$' | '/' | '\'' | '"' | '‘' | '“' | '«'
-    ) {
-        return false;
-    }
-    true
+    !l.is_whitespace()
+        && !r.is_whitespace()
+        && !matches!(
+            r,
+            ',' | '.' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '%' | '\'' | '"'
+        )
+        && !matches!(l, '(' | '[' | '{' | '@' | '#' | '/' | '\'' | '"')
 }
 
 // ── Content signature (§2.1 staleness gate) ──────────────────────────────────────────────────────
