@@ -29,6 +29,9 @@
 #   OWNER_ROLE    (default: bulletin)
 #   RUNTIME_ROLE  (default: bulletin_app)
 #   PG_SUPERUSER  (default: postgres)        OS user with DB superuser peer auth
+#   PGHOST        (default: /run/postgresql) unix-socket dir the server listens on
+#   PSQL          (default: autodetected)    path to the psql binary
+#   PG_DUMP       (default: autodetected)    path to the pg_dump binary
 #   APP_SERVICE   (default: bulletin.service)
 #   MIGRATE_UNIT  (default: bulletin-migrate.service)
 #   GRANT_UNIT    (default: bulletin-grant-public.service)
@@ -40,10 +43,42 @@ DB_NAME="${DB_NAME:-bulletin}"
 OWNER_ROLE="${OWNER_ROLE:-bulletin}"
 RUNTIME_ROLE="${RUNTIME_ROLE:-bulletin_app}"
 PG_SUPERUSER="${PG_SUPERUSER:-postgres}"
+# Connect over the same unix socket the NixOS module wires everything else through
+# (its connection strings all pin host=/run/postgresql). Passed as an explicit -h
+# argument below — psql/pg_dump otherwise fall back to libpq's compile-time default
+# socket dir, which on a NixOS host is not where the server listens, and the bare
+# connection fails with a misleading "cannot connect".
+PGHOST_DIR="${PGHOST:-/run/postgresql}"
 APP_SERVICE="${APP_SERVICE:-bulletin.service}"
 MIGRATE_UNIT="${MIGRATE_UNIT:-bulletin-migrate.service}"
 GRANT_UNIT="${GRANT_UNIT:-bulletin-grant-public.service}"
 BACKUP_DIR="${BACKUP_DIR:-/var/lib/bulletin/backups}"
+
+# Resolve a postgres client binary. The NixOS module never puts psql/pg_dump on the
+# system PATH (it always calls them by absolute store path), so a bare `psql` here is
+# liable to be "command not found" — which the masked preflight used to misreport as a
+# connection failure. Honor an explicit override, else PATH, else derive the package
+# bindir from the running postgresql.service. Resolves to an absolute path so it works
+# unchanged under `sudo -u "$PG_SUPERUSER"`.
+resolve_pg_bin() {
+  local name="$1" override="$2"
+  if [[ -n "$override" ]]; then echo "$override"; return 0; fi
+  if command -v "$name" >/dev/null 2>&1; then command -v "$name"; return 0; fi
+  local bindir
+  bindir="$(systemctl show -p ExecStart --value postgresql.service 2>/dev/null \
+    | sed -n 's#.*path=\(/[^ ;]*\)/bin/postgres.*#\1/bin#p' | head -n1)"
+  if [[ -n "$bindir" && -x "$bindir/$name" ]]; then echo "$bindir/$name"; return 0; fi
+  return 1
+}
+
+if ! PSQL="$(resolve_pg_bin psql "${PSQL:-}")"; then
+  echo "error: cannot find the 'psql' binary. Set PSQL=/path/to/psql." >&2
+  exit 1
+fi
+if ! PG_DUMP="$(resolve_pg_bin pg_dump "${PG_DUMP:-}")"; then
+  echo "error: cannot find the 'pg_dump' binary. Set PG_DUMP=/path/to/pg_dump." >&2
+  exit 1
+fi
 
 MODE="full"
 ASSUME_YES=0
@@ -51,14 +86,15 @@ for arg in "$@"; do
   case "$arg" in
     --truncate) MODE="truncate" ;;
     --yes|-y)   ASSUME_YES=1 ;;
-    -h|--help)  sed -n '2,40p' "$0"; exit 0 ;;
+    -h|--help)  sed -n '2,38p' "$0"; exit 0 ;;
     *) echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
 
-# Run psql as the DB superuser, fail on any SQL error, quiet chrome.
+# Run psql as the DB superuser, fail on any SQL error, quiet chrome. -h pins the unix
+# socket dir so the connection doesn't depend on libpq's compile-time default.
 psql_super() {
-  sudo -u "$PG_SUPERUSER" psql -v ON_ERROR_STOP=1 -qAt -d "$DB_NAME" "$@"
+  sudo -u "$PG_SUPERUSER" "$PSQL" -h "$PGHOST_DIR" -v ON_ERROR_STOP=1 -qAt -d "$DB_NAME" "$@"
 }
 
 # --- preflight ----------------------------------------------------------------
@@ -68,13 +104,22 @@ if [[ "$(id -u)" -ne 0 ]]; then
   exit 1
 fi
 
-# Identify the target so the operator can sanity-check before confirming.
-host="$(sudo -u "$PG_SUPERUSER" psql -qAt -d "$DB_NAME" -c \
-  "select coalesce(inet_server_addr()::text,'local-socket') || ' / ' || current_database();" 2>/dev/null || true)"
-if [[ -z "$host" ]]; then
-  echo "error: cannot connect to database '$DB_NAME' as '$PG_SUPERUSER'." >&2
+# Identify the target so the operator can sanity-check before confirming. Surface
+# psql's own error on failure instead of swallowing it — a blank "cannot connect" hides
+# the actual cause (wrong socket dir, missing role, server down, ...).
+probe_err="$(mktemp)"
+if ! host="$(psql_super -c \
+  "select coalesce(inet_server_addr()::text,'local-socket') || ' / ' || current_database();" \
+  2>"$probe_err")" || [[ -z "$host" ]]; then
+  echo "error: cannot connect to database '$DB_NAME' as '$PG_SUPERUSER' via socket '$PGHOST_DIR'." >&2
+  if [[ -s "$probe_err" ]]; then
+    echo "       psql reported:" >&2
+    sed 's/^/         /' "$probe_err" >&2
+  fi
+  rm -f "$probe_err"
   exit 1
 fi
+rm -f "$probe_err"
 
 echo "============================================================"
 echo " Bulletin database wipe"
@@ -101,7 +146,7 @@ systemctl stop "$APP_SERVICE"
 echo "==> backing up to $BACKUP_DIR"
 mkdir -p "$BACKUP_DIR"
 backup_file="$BACKUP_DIR/manual-wipe-$(date +%Y%m%dT%H%M%S).dump"
-sudo -u "$PG_SUPERUSER" pg_dump -Fc "$DB_NAME" > "$backup_file"
+sudo -u "$PG_SUPERUSER" "$PG_DUMP" -h "$PGHOST_DIR" -Fc "$DB_NAME" > "$backup_file"
 echo "    wrote $backup_file"
 
 # --- 3. wipe ------------------------------------------------------------------
