@@ -29,7 +29,7 @@ hex         = "0.4"   # decode the hex-encoded webhook signature
 secrecy           = "0.10"  # redacted Debug + zeroize-on-drop secret wrappers; explicit .expose_secret()
 zeroize           = "1.8"   # scrub plaintext key material from memory on drop
 chacha20poly1305  = "0.10"  # XChaCha20-Poly1305 AEAD for the at-rest envelope (24-byte nonce, misuse-resistant)
-jsonwebtoken      = "9"     # RS256 app JWT for the GitHub App → installation-token exchange
+jsonwebtoken      = "10"     # RS256 app JWT for the GitHub App → installation-token exchange
 base64            = "0.22"  # encode the sealed envelope + master key as transportable text
 ulid        = "1"  # read enqueue time from the apalis TaskId for job wait/run timing
 clap        = { version = "4", features = ["derive", "env"] }
