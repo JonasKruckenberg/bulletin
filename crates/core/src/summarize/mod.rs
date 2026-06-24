@@ -171,10 +171,14 @@ impl Default for SummarizationConfig {
             // `longform` content_kind label), so the corpus re-summarizes and real articles that had been
             // stuck headline-only (their full text un-fetchable) finally render a grounded tldr.
             // Bumped to 8 with relation extraction: `facts.relations` (who-did-what-to-whom) now enters
-            // the summarizer prompt as pre-bound facts, and rule 7 tells the model to keep their
+            // the summarizer prompt as pre-bound facts, and rule 6 tells the model to keep their
             // direction (subject acts on object, never swap) — so the corpus re-summarizes with the
             // directional grounding that catches the subject↔object inversions a small model makes.
-            prompt_version: 8,
+            // Bumped to 9 when relations moved out of the prompt's `facts` JSON (rendered once, as the
+            // readable relations line, not twice) and the story synthesizer gained the same directional
+            // rule + relations line, so the corpus re-summarizes without the duplicated triples and
+            // stories ground on the same direction rule the cluster path uses.
+            prompt_version: 9,
             headline_max_tokens: 24,
             tldr_max_tokens: 144,
             comprehension_max_tokens: 256,
@@ -196,7 +200,12 @@ impl Default for SummarizationConfig {
             enrich_max_per_sweep: 200,
             relations: true,
             relation_gate: true,
-            relations_max_tokens: 256,
+            // Sized for the extraction pass's worst case: a full `analysis` scratchpad (maxLength 600 ≈
+            // 150 tokens) plus up to 4 free-text triples (~120 tokens) — 256 could truncate the
+            // grammar-constrained JSON mid-object, which fails the parse and silently drops the pass to
+            // "no relations" exactly on the content-rich events most prone to inversion. 384 leaves
+            // headroom; it also comfortably covers the lighter gate verdict (analysis + bool + one line).
+            relations_max_tokens: 384,
         }
     }
 }
@@ -1315,7 +1324,7 @@ out: {"headline":"A case for going back to a monolith",
 pub fn user_prompt(facts: &Facts, source_text: &str) -> String {
     let entity_list = list_or_none(&facts.entities);
     let relations = relations_line(&facts.relations);
-    let facts_json = serde_json::to_string(facts).unwrap_or_else(|_| "{}".to_string());
+    let facts_json = facts_json_for_prompt(facts);
     format!(
         "facts: {facts_json}\n\
          allowed entity ids (use only these for refs): {entity_list}\n\
@@ -1326,9 +1335,23 @@ pub fn user_prompt(facts: &Facts, source_text: &str) -> String {
     )
 }
 
+/// Serialize `facts` for a prompt **without** the `relations` array — those are rendered separately as a
+/// readable `subject -> predicate -> object` line ([`relations_line`]), so leaving them in the JSON too
+/// would send the model every triple twice (in two formats), wasting tokens and giving a 3–4B model two
+/// representations of the same fact to reconcile. The stored `Facts` jsonb keeps its relations; only this
+/// prompt view drops them. A clone is cheap relative to the model call it feeds.
+fn facts_json_for_prompt(facts: &Facts) -> String {
+    if facts.relations.is_empty() {
+        return serde_json::to_string(facts).unwrap_or_else(|_| "{}".to_string());
+    }
+    let mut view = facts.clone();
+    view.relations.clear();
+    serde_json::to_string(&view).unwrap_or_else(|_| "{}".to_string())
+}
+
 /// Render a fact's [`Relation`] list for a prompt line — `subject -> predicate -> object` joined by
 /// `; `, or the literal `(none)` for an empty list (so the model is *told* there are no relations
-/// rather than left to infer it from a blank). Shared by the cluster and headline-only prompts.
+/// rather than left to infer it from a blank). Shared by the cluster, headline-only, and story prompts.
 fn relations_line(relations: &[Relation]) -> String {
     if relations.is_empty() {
         "(none)".to_string()
@@ -1348,7 +1371,7 @@ fn relations_line(relations: &[Relation]) -> String {
 pub fn headline_only_user_prompt(facts: &Facts, source_text: &str) -> String {
     let entity_list = list_or_none(&facts.entities);
     let relations = relations_line(&facts.relations);
-    let facts_json = serde_json::to_string(facts).unwrap_or_else(|_| "{}".to_string());
+    let facts_json = facts_json_for_prompt(facts);
     format!(
         "facts: {facts_json}\n\
          allowed entity ids (use only these for refs): {entity_list}\n\
@@ -1581,7 +1604,10 @@ You write ONE headline and ONE tldr for the whole thing. You add nothing.
 6. Plain words. Active voice. Do not use: massive, huge, critical (unless in the source),
    game-changing, exciting, "!", "you", "we".
 7. Don't paste raw URLs (no "http://...", no "www...").
-8. Output only the JSON the schema asks for. No preamble.
+8. The "relations" are facts as subject -> predicate -> object: who did what to whom. Keep each
+   direction. The subject does the action; the object has it done to them. Never swap them, and never
+   give an action or role to the wrong entity.
+9. Output only the JSON the schema asks for. No preamble.
 
 EXAMPLE
 members:
@@ -1598,7 +1624,8 @@ out: {"headline":"SSRF advisory forces a billing PDF mitigation",
 /// over the pre-distilled inputs, like [`user_prompt`].
 pub fn story_user_prompt(facts: &Facts, members_text: &str, thread_label: Option<&str>) -> String {
     let entity_list = list_or_none(&facts.entities);
-    let facts_json = serde_json::to_string(facts).unwrap_or_else(|_| "{}".to_string());
+    let relations = relations_line(&facts.relations);
+    let facts_json = facts_json_for_prompt(facts);
     let context = match thread_label {
         Some(l) if !l.trim().is_empty() => format!("thread: {}\n", l.trim()),
         _ => String::new(),
@@ -1606,6 +1633,7 @@ pub fn story_user_prompt(facts: &Facts, members_text: &str, thread_label: Option
     format!(
         "{context}facts: {facts_json}\n\
          allowed entity ids (use only these for refs): {entity_list}\n\
+         relations (keep each direction, never swap subject and object): {relations}\n\
          member summaries:\n{members_text}\n\n\
          These are the same happening across sources. Write one headline (<= 90 chars) and one \
          tldr (2-4 sentences) for the whole thing. Do not list the sources."
@@ -3344,7 +3372,7 @@ mod tests {
     #[test]
     fn summary_model_string() {
         let cfg = SummarizationConfig::default();
-        assert_eq!(cfg.summary_model(), "qwen3.5-4b-instruct@8");
+        assert_eq!(cfg.summary_model(), "qwen3.5-4b-instruct@9");
     }
 
     #[test]
@@ -3713,9 +3741,21 @@ mod tests {
         let p = user_prompt(&facts, "source text");
         assert!(p.contains("person:andy-burnham -> would replace -> Rachel Reeves"));
         assert!(p.contains("keep each direction"));
+        // Relations are rendered once, as the readable line — NOT also serialized into the `facts` JSON
+        // (which would send the model every triple twice, in two formats).
+        let facts_segment = p.split("\nallowed entity ids").next().unwrap();
+        assert!(
+            !facts_segment.contains("\"relations\"") && !facts_segment.contains("\"subject\""),
+            "relations must not appear in the facts JSON: {facts_segment}"
+        );
         // The headline-only (Note-depth) prompt carries the same relations line.
         let h = headline_only_user_prompt(&facts, "source text");
         assert!(h.contains("person:andy-burnham -> would replace -> Rachel Reeves"));
+        assert!(!h
+            .split("\nallowed entity ids")
+            .next()
+            .unwrap()
+            .contains("\"relations\""));
         // No relations renders the explicit "(none)" rather than a blank.
         let bare = user_prompt(&Facts::default(), "src");
         assert!(
