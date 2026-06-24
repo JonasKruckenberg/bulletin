@@ -43,6 +43,7 @@ pub fn gate_rejection(phase: &'static str, violation: &GateViolation) {
         GateViolation::BannedWord(_) => "banned_word",
         GateViolation::UrlInProse(_) => "url_in_prose",
         GateViolation::TooLong => "too_long",
+        GateViolation::UnfaithfulRelation(_) => "unfaithful_relation",
     };
     metrics::counter!("bulletin_llm_gate_rejections_total", "phase" => phase, "reason" => reason)
         .increment(1);

@@ -16,14 +16,16 @@ use super::metric;
 use crate::common::event::Event;
 use crate::common::kind::ContentKind;
 use crate::summarize::{
-    apply_comprehension, clean_delta, clean_label, clean_lead, comprehend_user_prompt,
-    comprehension_schema, delta_schema, delta_user_prompt, extract_facts, faithful,
-    headline_only_schema, headline_only_user_prompt, label_schema, label_user_prompt, lead_schema,
-    lead_user_prompt, response_schema, source_corpus, story_member_corpus, story_user_prompt,
-    synthesize_facts, user_prompt, Band, ClusterSummary, Comprehension, Facts, LeadOutcome,
-    SummarizationConfig, SummaryFailure, SummaryOutcome, TldrRun, COMPREHEND_SYSTEM_PROMPT,
-    DELTA_SYSTEM_PROMPT, LABEL_SYSTEM_PROMPT, LEAD_SYSTEM_PROMPT, STORY_SYSTEM_PROMPT,
-    SYSTEM_PROMPT,
+    apply_comprehension, apply_relations, clean_delta, clean_label, clean_lead,
+    comprehend_user_prompt, comprehension_schema, delta_schema, delta_user_prompt, extract_facts,
+    faithful, headline_only_schema, headline_only_user_prompt, label_schema, label_user_prompt,
+    lead_schema, lead_user_prompt, relation_gate_schema, relation_gate_user_prompt,
+    relations_schema, relations_user_prompt, response_schema, source_corpus, story_member_corpus,
+    story_user_prompt, synthesize_facts, user_prompt, Band, ClusterSummary, Comprehension, Facts,
+    GateViolation, LeadOutcome, RelationVerdict, RelationsOutput, SummarizationConfig,
+    SummaryFailure, SummaryOutcome, TldrRun, COMPREHEND_SYSTEM_PROMPT, DELTA_SYSTEM_PROMPT,
+    LABEL_SYSTEM_PROMPT, LEAD_SYSTEM_PROMPT, RELATIONS_SYSTEM_PROMPT, RELATION_GATE_SYSTEM_PROMPT,
+    STORY_SYSTEM_PROMPT, SYSTEM_PROMPT,
 };
 
 /// Minimum budgeted **source-text** length (chars) for a cluster to earn a multi-sentence tldr even
@@ -77,6 +79,19 @@ pub async fn summarize_cluster(
             metric::gate_rejection("summarize", &v);
             return SummaryOutcome::Failed(SummaryFailure::Rejected(v));
         }
+        // The relational gate (§3.2): the deterministic gate above proves every entity/number is
+        // *present*; this proves their *binding* survived — the model didn't reverse a grounded
+        // relation's direction (the subject↔object swap the deterministic checks are blind to). Only
+        // runs when extraction produced relations to check against; fail-open (a judge call that can't
+        // be made does not block an otherwise-faithful summary). A returned violation is a real one and
+        // drives the same escalating-seed retry as any other rejection.
+        if cfg.relation_gate && !facts.relations.is_empty() {
+            if let Some(v) = relation_gate(cfg, http, &summary, &facts).await {
+                tracing::debug!(violation = ?v, "relational gate rejected summary; will retry with an escalated seed");
+                metric::gate_rejection("summarize", &v);
+                return SummaryOutcome::Failed(SummaryFailure::Rejected(v));
+            }
+        }
     }
     SummaryOutcome::Faithful(summary)
 }
@@ -103,6 +118,18 @@ async fn generate_candidate(
     if cfg.comprehend {
         if let Some(comp) = comprehend_cluster(cfg, http, &facts, &source).await {
             apply_comprehension(&mut facts, &comp);
+        }
+    }
+
+    // Relation extraction (§3.2): distil who-did-what-to-whom into grounded triples *before* the
+    // summarizer, so it rephrases a pre-bound direction rather than re-deriving it (the subject↔object
+    // inversion a small model makes — the reported "Reeves becomes PM" for "Burnham becomes PM and
+    // replaces Reeves"). Best-effort and anchored: needs the entity set to constrain the subject, so a
+    // cluster with no grounded entities skips it; a failed call leaves `facts.relations` empty and the
+    // summarizer proceeds exactly as before.
+    if cfg.relations && !facts.entities.is_empty() {
+        if let Some(rel) = extract_relations(cfg, http, &facts, &source).await {
+            apply_relations(&mut facts, &rel);
         }
     }
 
@@ -476,6 +503,91 @@ async fn call_comprehension(
         comprehension_schema(),
     )
     .await
+}
+
+/// Run the relation-extraction pass for one cluster (§3.2): a constrained chat completion that distils
+/// the source into grounded `subject -> predicate -> object` triples (the subject constrained by grammar
+/// to the closed entity set), reasoning free in the `analysis` scratchpad. Best-effort, mirroring
+/// [`comprehend_cluster`].
+///
+/// Returns `None` on any failure (transport, non-2xx, malformed JSON) — extraction is best-effort, so
+/// the caller proceeds with no relations (the summarizer is unchanged from the pre-relations path).
+async fn extract_relations(
+    cfg: &SummarizationConfig,
+    http: &reqwest::Client,
+    facts: &Facts,
+    source: &str,
+) -> Option<RelationsOutput> {
+    match chat_json::<RelationsOutput>(
+        cfg,
+        http,
+        "relations",
+        RELATIONS_SYSTEM_PROMPT,
+        relations_user_prompt(facts, source),
+        cfg.relations_max_tokens,
+        relations_schema(&facts.entities),
+    )
+    .await
+    {
+        Ok(r) => Some(r),
+        Err(e) => {
+            tracing::debug!(
+                error = %format!("{e:#}"),
+                kind = failure_kind(&e),
+                "relation extraction call failed; summarizing without relations"
+            );
+            None
+        }
+    }
+}
+
+/// The relational gate (§3.2): a constrained judge call that checks the candidate `summary` against the
+/// grounded `facts.relations` for a reversed/contradicted direction (the subject↔object swap the
+/// deterministic [`faithful`] gate is blind to). Returns `Some(GateViolation::UnfaithfulRelation)` when
+/// the judge says the summary inverts a relation, `None` when it is consistent.
+///
+/// **Fail-open** (the §3.7 reasoning, inverted for a model-driven check): a judge call that can't be
+/// made — transport down, malformed verdict — returns `None`, so the relational gate never withholds a
+/// summary the deterministic gate already passed just because the *judge* was unavailable. Only an
+/// explicit `faithful: false` verdict rejects. The caller has already verified `facts.relations` is
+/// non-empty (no relations ⇒ nothing to check).
+async fn relation_gate(
+    cfg: &SummarizationConfig,
+    http: &reqwest::Client,
+    summary: &ClusterSummary,
+    facts: &Facts,
+) -> Option<GateViolation> {
+    let verdict = match chat_json::<RelationVerdict>(
+        cfg,
+        http,
+        "relation_gate",
+        RELATION_GATE_SYSTEM_PROMPT,
+        relation_gate_user_prompt(&facts.relations, &summary.headline, &summary.tldr_text),
+        cfg.relations_max_tokens,
+        relation_gate_schema(),
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            // Fail-open: a judge we can't reach must not reject a summary the deterministic gate passed.
+            tracing::debug!(
+                error = %format!("{e:#}"),
+                kind = failure_kind(&e),
+                "relational gate judge unavailable; passing summary on the deterministic gate alone"
+            );
+            return None;
+        }
+    };
+    if verdict.faithful {
+        return None;
+    }
+    let problem = if verdict.problem.trim().is_empty() {
+        "summary reverses or contradicts a grounded relation".to_string()
+    } else {
+        verdict.problem.trim().to_string()
+    };
+    Some(GateViolation::UnfaithfulRelation(problem))
 }
 
 /// The slice of the model's response we parse — the abstractive fields. The rest is reconstructed

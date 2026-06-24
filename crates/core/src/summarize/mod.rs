@@ -130,6 +130,26 @@ pub struct SummarizationConfig {
     pub enrich_grace: Duration,
     /// Max events enriched per sweep — bounds one best-effort pass like [`max_per_sweep`](Self::max_per_sweep).
     pub enrich_max_per_sweep: i64,
+
+    // ── Relation extraction + the relational gate (§3.2 who-did-what-to-whom) ───────────────────────
+    /// Run the best-effort **relation extraction** pass (`extract_relations`) ahead of the summarizer:
+    /// a constrained LLM call that distils the cluster's who-did-what-to-whom into [`Relation`] triples
+    /// (subject anchored to the closed entity set), fed to the summarizer as pre-bound facts so it
+    /// rephrases a fixed direction rather than re-deriving it. Best-effort: off, or a failed call, leaves
+    /// `facts.relations` empty and the summarizer proceeds exactly as before. Toggle via
+    /// `BULLETIN_LLM_RELATIONS`.
+    pub relations: bool,
+    /// Run the **relational gate** (`relation_gate`) after the deterministic [`faithful`] gate: a
+    /// constrained judge call that checks the candidate summary against `facts.relations` for a
+    /// reversed/contradicted direction (the subject↔object swap a small model is prone to), rejecting it
+    /// as a [`GateViolation::UnfaithfulRelation`] so the §3.7 escalating-seed retry redraws. Requires
+    /// `relations` to have run (no relations ⇒ nothing to check, the gate is a no-op). Fail-open: a judge
+    /// call that can't be made does not block the summary (the deterministic gate already ran). Toggle
+    /// via `BULLETIN_LLM_RELATION_GATE`.
+    pub relation_gate: bool,
+    /// Token ceiling shared by the relation-extraction call and the relational-gate judge call: a short
+    /// `analysis` scratchpad + a few small triples / a one-line verdict. Off the hot path.
+    pub relations_max_tokens: u32,
 }
 
 impl Default for SummarizationConfig {
@@ -150,7 +170,11 @@ impl Default for SummarizationConfig {
             // depth gate began granting a multi-sentence tldr off sufficient *source text* (not only a
             // `longform` content_kind label), so the corpus re-summarizes and real articles that had been
             // stuck headline-only (their full text un-fetchable) finally render a grounded tldr.
-            prompt_version: 7,
+            // Bumped to 8 with relation extraction: `facts.relations` (who-did-what-to-whom) now enters
+            // the summarizer prompt as pre-bound facts, and rule 7 tells the model to keep their
+            // direction (subject acts on object, never swap) — so the corpus re-summarizes with the
+            // directional grounding that catches the subject↔object inversions a small model makes.
+            prompt_version: 8,
             headline_max_tokens: 24,
             tldr_max_tokens: 144,
             comprehension_max_tokens: 256,
@@ -170,6 +194,9 @@ impl Default for SummarizationConfig {
             // wait for enrichment. Sized for a few sweep attempts on a slow CPU model before it ages in.
             enrich_grace: Duration::from_secs(90),
             enrich_max_per_sweep: 200,
+            relations: true,
+            relation_gate: true,
+            relations_max_tokens: 256,
         }
     }
 }
@@ -282,6 +309,14 @@ impl SummarizationConfig {
                 }
             }
         }
+        // Relation extraction + the relational gate. Both best-effort toggles (an off pass leaves
+        // `facts.relations` empty and the gate a no-op), so they flip cleanly like `comprehend`/`enrich`.
+        if let Some(b) = env_bool("BULLETIN_LLM_RELATIONS") {
+            cfg.relations = b;
+        }
+        if let Some(b) = env_bool("BULLETIN_LLM_RELATION_GATE") {
+            cfg.relation_gate = b;
+        }
         // The lead deadline only bounds the punctual send if it sits at or under the per-call HTTP
         // timeout — past that, `request_timeout` is the real cap and the "at most `lead_deadline`"
         // guarantee is silently false. Clamp so a misconfigured (or default-vs-lowered-timeout) value
@@ -371,6 +406,39 @@ impl TldrRun {
     }
 }
 
+/// A single grounded **who-did-what-to-whom** fact (§3.2 relation extraction). The directional
+/// backbone the summarizer is most prone to invert on a small model: the reported "Reeves may take a
+/// junior role if she becomes PM" for a source that read "Burnham likely to replace Reeves if he
+/// becomes PM" is exactly a `subject`/`object` swap on the `replace`/`become PM` relations. Extracted
+/// once (`extract_relations`), fed to the summarizer as pre-bound facts so it *rephrases* a fixed
+/// direction rather than re-deriving it, and re-checked after generation by the relational gate
+/// (`relation_gate`) so an inversion that survives is caught before it ships.
+///
+/// `subject` is an entity id from the cluster's closed `facts.entities` set (the schema `enum`
+/// constrains it, and [`apply_relations`] re-validates) — the actor anchor. `predicate` is a short verb
+/// phrase ("replaces", "becomes", "broke"); `object` a short noun phrase (an entity surface or a
+/// literal like "PM"). Tolerant deserialize: a missing field degrades to empty, never an error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct Relation {
+    /// The actor — constrained to a `facts.entities` id by the extraction schema (and re-validated).
+    #[serde(default)]
+    pub subject: String,
+    /// The action, as a short verb phrase.
+    #[serde(default)]
+    pub predicate: String,
+    /// What the action is done to — a short noun phrase (entity surface or literal).
+    #[serde(default)]
+    pub object: String,
+}
+
+impl Relation {
+    /// The one-line `subject -> predicate -> object` form fed to the summarizer prompt and the
+    /// relational gate's judge prompt — the single rendering so the two passes read the same shape.
+    pub fn line(&self) -> String {
+        format!("{} -> {} -> {}", self.subject, self.predicate, self.object)
+    }
+}
+
 /// The "extract" half (§2.1) — the comprehension/extraction product that *grounds* the summary. Stored
 /// on the cluster so the extract step runs once and feeds every higher tier. The summarizer rewrites
 /// these facts; it never recalls them.
@@ -379,6 +447,12 @@ pub struct Facts {
     /// The grounded entity set — the closed `enum` the tldr's refs are constrained to.
     #[serde(default)]
     pub entities: Vec<String>,
+    /// The grounded who-did-what-to-whom relations (§3.2), each with its `subject` anchored to an
+    /// `entities` id. Empty until [`extract_relations`](crate::summarize::client::extract_relations)
+    /// lands (best-effort, like the comprehension fields). Skipped when empty so the summarizer prompt
+    /// stays clean for a cluster that yielded no relation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relations: Vec<Relation>,
     /// Event type (`incident`/`release`/…), from the Phase-2 comprehension pass. `None` until it lands.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_type: Option<String>,
@@ -793,6 +867,219 @@ pub fn comprehension_schema() -> serde_json::Value {
     })
 }
 
+// ── Relation extraction (§3.2 — the who-did-what-to-whom pass) ────────────────────────────────────
+
+/// The relation-extraction pass output: the `analysis` scratchpad first (CRANE "reason, then
+/// constrain", named to sort first), then the grounded [`Relation`] triples. Folded onto the facts by
+/// [`apply_relations`]. Tolerant deserialize: a missing/garbled field degrades to empty, never an error
+/// — extraction is best-effort, like comprehension.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RelationsOutput {
+    /// The reasoning scratchpad (named `a…` so llama.cpp's lexical property order generates it first).
+    #[serde(default)]
+    pub analysis: String,
+    /// The proposed triples — re-validated against the entity set by [`apply_relations`] before they
+    /// reach the facts (defense in depth, like [`apply_comprehension`]).
+    #[serde(default)]
+    pub relations: Vec<Relation>,
+}
+
+/// Fold an extraction result onto the facts (§3.2): keep only a triple with a **grounded subject** (an
+/// id in `facts.entities` — the schema `enum` already constrains it; re-validate as defense in depth)
+/// and a non-empty predicate + object, de-duplicated. A relation with no grounded actor is exactly the
+/// un-anchored claim the gate could not trust, so it is dropped rather than seeded into the gate. Pure +
+/// deterministic, so it is unit-tested without a model.
+pub fn apply_relations(facts: &mut Facts, out: &RelationsOutput) {
+    let mut kept: Vec<Relation> = Vec::new();
+    for r in &out.relations {
+        let rel = Relation {
+            subject: r.subject.trim().to_string(),
+            predicate: r.predicate.trim().to_string(),
+            object: r.object.trim().to_string(),
+        };
+        if rel.subject.is_empty() || rel.predicate.is_empty() || rel.object.is_empty() {
+            continue;
+        }
+        if !facts.entities.iter().any(|e| e == &rel.subject) {
+            continue;
+        }
+        if !kept.contains(&rel) {
+            kept.push(rel);
+        }
+    }
+    facts.relations = kept;
+}
+
+/// The relation-extraction system prompt — engineered for a 3–4B model like [`SYSTEM_PROMPT`]: short,
+/// imperative, one job, the directional rule stated plainly, and two worked few-shot pairs (one of them
+/// the directional `replace` / `become PM` shape this pass exists to ground). A constant ⇒ prefix-cached.
+pub const RELATIONS_SYSTEM_PROMPT: &str = r#"You read one work event and extract its key facts as subject -> predicate -> object triples.
+A triple says WHO did WHAT to WHOM. The subject is the actor; the object is acted upon. Keep the direction exactly as the source states it - never swap subject and object.
+
+Rules:
+1. subject must be one of the given entity ids, copied exactly. If a claim's actor is not in the list, skip that claim.
+2. predicate: a short verb phrase from the source (replaces, becomes, broke, proposes, acquires).
+3. object: a few words from the source - the entity, role, or thing acted upon.
+4. Extract only what the source states. A conditional ("if he becomes PM") is still the source's claim - extract it, do not assert it as settled. Add nothing.
+5. 1 to 4 triples; fewer is fine. Output only the JSON the schema asks for. No preamble.
+
+EXAMPLES
+entities: person:andy-burnham, person:rachel-reeves
+source: Andy Burnham is likely to replace Rachel Reeves as chancellor if he becomes prime minister.
+out: {"analysis":"Burnham is the actor: he would replace Reeves, and he is the one who would become PM. Reeves is acted upon.","relations":[{"subject":"person:andy-burnham","predicate":"would replace","object":"Rachel Reeves as chancellor"},{"subject":"person:andy-burnham","predicate":"could become","object":"prime minister"}]}
+
+entities: org:acme, repo:acme/auth
+source: Acme rolled back the deploy after a bad config broke token validation in acme/auth.
+out: {"analysis":"Acme is the actor that rolled back the deploy. The config that broke validation is not an entity, so that claim is skipped.","relations":[{"subject":"org:acme","predicate":"rolled back","object":"the deploy"}]}"#;
+
+/// The relation-extraction user prompt: the closed entity-id set (the only allowed subjects) + the
+/// budgeted source text + the concrete ask. Short and concrete over the §4 pre-distilled inputs.
+pub fn relations_user_prompt(facts: &Facts, source_text: &str) -> String {
+    format!(
+        "entities (use only these ids as subject): {}\n\
+         source:\n{source_text}\n\n\
+         Extract the key subject -> predicate -> object triples. analysis first, then the triples. \
+         Keep each direction exactly as the source states it.",
+        list_or_none(&facts.entities),
+    )
+}
+
+/// The relation-extraction response schema for `response_format: json_schema`. Constrains `subject` to
+/// the closed `facts.entities` set (the actor anchor — a hallucinated subject is structurally
+/// impossible) while `predicate`/`object` are length-capped free strings (a verb phrase / a short noun
+/// phrase can't be a closed enum). `analysis` is the capped free-text scratchpad. With no entities there
+/// is no anchor, so the caller skips the pass; the empty-set arm here only keeps the schema well-formed
+/// (a plain capped string the grounding fold then drops, since no subject can be in an empty set).
+pub fn relations_schema(allowed_entities: &[String]) -> serde_json::Value {
+    use serde_json::json;
+    let subject_schema = if allowed_entities.is_empty() {
+        json!({ "type": "string", "maxLength": 40 })
+    } else {
+        json!({ "type": "string", "enum": allowed_entities })
+    };
+    json!({
+        "name": "relations",
+        "strict": true,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "analysis": { "type": "string", "maxLength": 600 },
+                "relations": {
+                    "type": "array",
+                    "maxItems": 4,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "subject": subject_schema,
+                            "predicate": { "type": "string", "maxLength": 40 },
+                            "object": { "type": "string", "maxLength": 60 }
+                        },
+                        "required": ["subject", "predicate", "object"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["analysis", "relations"],
+            "additionalProperties": false
+        }
+    })
+}
+
+// ── The relational gate (§3.2 — does the summary keep each direction?) ─────────────────────────────
+
+/// The relational gate's judge output: the `analysis` scratchpad first, then the verdict `faithful` and
+/// the one-line `problem` (empty when faithful). `faithful` defaults to `true` so a missing field never
+/// turns into a spurious rejection — the gate is fail-open by construction (see [`GateViolation::UnfaithfulRelation`]).
+#[derive(Debug, Clone, Deserialize)]
+pub struct RelationVerdict {
+    /// The reasoning scratchpad (named `a…` so it is generated before the verdict).
+    #[serde(default)]
+    pub analysis: String,
+    /// The verdict: `true` ⇒ the summary keeps every relation's direction; `false` ⇒ it reversed or
+    /// contradicted one. Defaults to `true` (fail-open) when absent.
+    #[serde(default = "default_true")]
+    pub faithful: bool,
+    /// The one-line problem statement when `faithful` is `false` (empty otherwise) — the
+    /// [`GateViolation::UnfaithfulRelation`] payload, surfaced in logs.
+    #[serde(default)]
+    pub problem: String,
+}
+
+/// serde default for [`RelationVerdict::faithful`] — fail-open (a verdict missing the field is treated
+/// as faithful, never a rejection).
+fn default_true() -> bool {
+    true
+}
+
+/// The relational-gate system prompt — a strict-on-direction, lenient-on-wording judge, built for a
+/// 3–4B model: one job, the failure modes spelled out, and three worked pairs (the first being the exact
+/// `Reeves`/`Burnham` inversion this gate exists to catch). A constant ⇒ prefix-cached.
+pub const RELATION_GATE_SYSTEM_PROMPT: &str = r#"You check one digest summary against the facts it must not contradict.
+You are given grounded facts as subject -> predicate -> object triples (who did what to whom), and a summary.
+Decide if the summary REVERSES or CONTRADICTS any triple. The most common error is swapping who did the action with who it was done to.
+
+Set faithful=false if the summary:
+- swaps the subject and object of a triple (says the object did the action, or the action was done to the subject), or
+- states the opposite of a triple, or
+- assigns an action or role to the wrong entity.
+Otherwise set faithful=true. A summary that simply leaves a triple out, or rephrases it in the same direction, is faithful.
+
+Be strict about direction, lenient about wording. Think first in analysis, then decide. If faithful, problem is "". Output only the JSON the schema asks for. No preamble.
+
+EXAMPLES
+facts: person:andy-burnham -> would replace -> Rachel Reeves; person:andy-burnham -> could become -> prime minister
+summary: Reeves may take a junior cabinet role if she becomes PM.
+out: {"analysis":"The facts say Burnham would become PM and replace Reeves. The summary makes Reeves the one becoming PM - subject and object are swapped.","faithful":false,"problem":"summary has Reeves becoming PM; the source says Burnham becomes PM and would replace her"}
+
+facts: person:andy-burnham -> would replace -> Rachel Reeves; person:andy-burnham -> could become -> prime minister
+summary: Burnham is tipped to replace Reeves as chancellor if he becomes PM.
+out: {"analysis":"Burnham is the actor who becomes PM and replaces Reeves - same direction as the facts.","faithful":true,"problem":""}
+
+facts: org:acme -> rolled back -> the deploy
+summary: Acme rolled back the deploy after a config broke logins.
+out: {"analysis":"Acme rolled back the deploy, matching the fact's direction.","faithful":true,"problem":""}"#;
+
+/// The relational-gate user prompt: the grounded triples (the ground truth the summary must keep) + the
+/// candidate summary (headline + flat tldr), with the concrete ask. The triples render through
+/// [`Relation::line`] so this and the extraction pass read the same shape.
+pub fn relation_gate_user_prompt(
+    relations: &[Relation],
+    headline: &str,
+    tldr_text: &str,
+) -> String {
+    let facts = relations
+        .iter()
+        .map(Relation::line)
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "facts: {facts}\n\
+         summary: {headline} {tldr_text}\n\n\
+         Does the summary reverse or contradict any fact? analysis first, then faithful, then problem."
+    )
+}
+
+/// The relational-gate response schema: the capped `analysis` scratchpad, the boolean `faithful`
+/// verdict, and the capped one-line `problem`. All required so the scratchpad is always produced (and,
+/// named `analysis`, produced first — before the verdict it justifies).
+pub fn relation_gate_schema() -> serde_json::Value {
+    use serde_json::json;
+    json!({
+        "name": "relation_gate",
+        "strict": true,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "analysis": { "type": "string", "maxLength": 400 },
+                "faithful": { "type": "boolean" },
+                "problem":  { "type": "string", "maxLength": 160 }
+            },
+            "required": ["analysis", "faithful", "problem"],
+            "additionalProperties": false
+        }
+    })
+}
+
 // ── The faithfulness gate (§3.4) — ML never grounds alone ────────────────────────────────────────
 
 /// Why a candidate summary failed the gate — surfaced in logs to explain a baseline fallback.
@@ -811,6 +1098,12 @@ pub enum GateViolation {
     UrlInProse(String),
     /// The headline or tldr exceeds its length budget.
     TooLong,
+    /// The relational gate (§3.2) judged the summary to reverse or contradict a grounded
+    /// [`Relation`] — a subject↔object swap or an inverted predicate the deterministic checks can't see
+    /// (every entity/number is *present*, only their binding is wrong). Carries the judge's one-line
+    /// problem statement. Unlike the deterministic violations this comes from a model call, so the gate
+    /// is fail-open (a judge that can't run does not reject); a returned violation is a real one.
+    UnfaithfulRelation(String),
 }
 
 /// Words the editorial voice forbids (§3.6): hype + second person. A small model *will* occasionally
@@ -992,7 +1285,10 @@ You rephrase the facts. You add nothing.
 5. No web addresses at all: no URLs ("http://...", "www...") and no bare domains
    ("acme.com", "github.com/x"). Name sources plainly; the reader's interface shows
    the link.
-6. Output only the JSON the schema asks for. No preamble.
+6. The "relations" are facts as subject -> predicate -> object: who did what to whom.
+   Keep each direction. The subject does the action; the object has it done to them.
+   Never swap them, and never give an action or role to the wrong entity.
+7. Output only the JSON the schema asks for. No preamble.
 
 EXAMPLES
 facts: {event: deploy broke logins, state: resolved, certainty: asserted,
@@ -1018,14 +1314,31 @@ out: {"headline":"A case for going back to a monolith",
 /// source text, with the concrete ask. Short and concrete, over the §4 pre-distilled inputs.
 pub fn user_prompt(facts: &Facts, source_text: &str) -> String {
     let entity_list = list_or_none(&facts.entities);
+    let relations = relations_line(&facts.relations);
     let facts_json = serde_json::to_string(facts).unwrap_or_else(|_| "{}".to_string());
     format!(
         "facts: {facts_json}\n\
          allowed entity ids (use only these for refs): {entity_list}\n\
+         relations (keep each direction, never swap subject and object): {relations}\n\
          source:\n{source_text}\n\n\
          Write: headline (<= 90 chars): the one most important thing. \
          tldr (2-4 sentences): what happened, the impact, the current state."
     )
+}
+
+/// Render a fact's [`Relation`] list for a prompt line — `subject -> predicate -> object` joined by
+/// `; `, or the literal `(none)` for an empty list (so the model is *told* there are no relations
+/// rather than left to infer it from a blank). Shared by the cluster and headline-only prompts.
+fn relations_line(relations: &[Relation]) -> String {
+    if relations.is_empty() {
+        "(none)".to_string()
+    } else {
+        relations
+            .iter()
+            .map(Relation::line)
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
 }
 
 /// The **headline-only** user prompt (§5.1 depth gate): same facts/entity/source framing as
@@ -1034,10 +1347,12 @@ pub fn user_prompt(facts: &Facts, source_text: &str) -> String {
 /// a vague Story. The model is asked for the one most important thing and nothing else.
 pub fn headline_only_user_prompt(facts: &Facts, source_text: &str) -> String {
     let entity_list = list_or_none(&facts.entities);
+    let relations = relations_line(&facts.relations);
     let facts_json = serde_json::to_string(facts).unwrap_or_else(|_| "{}".to_string());
     format!(
         "facts: {facts_json}\n\
          allowed entity ids (use only these for refs): {entity_list}\n\
+         relations (keep each direction, never swap subject and object): {relations}\n\
          source:\n{source_text}\n\n\
          Write: headline (<= 90 chars): the one most important thing."
     )
@@ -1194,10 +1509,18 @@ pub fn synthesize_facts(members: &[ClusterSummary]) -> Facts {
     let mut certainty = Certainty::Asserted;
     let mut event_type: Option<String> = None;
     let mut state: Option<String> = None;
+    let mut relations: Vec<Relation> = Vec::new();
     for m in members {
         entities.extend(m.facts.entities.iter().cloned());
         numbers.extend(m.facts.numbers.iter().cloned());
         dates.extend(m.facts.dates.iter().cloned());
+        // Union the members' grounded relations (de-duped, order-stable) so the fused facts carry the
+        // same who-did-what-to-whom backbone the cluster path uses — already validated upstream.
+        for r in &m.facts.relations {
+            if !relations.contains(r) {
+                relations.push(r.clone());
+            }
+        }
         if m.facts.certainty == Certainty::Tentative {
             certainty = Certainty::Tentative;
         }
@@ -1213,6 +1536,7 @@ pub fn synthesize_facts(members: &[ClusterSummary]) -> Facts {
     dedup_sorted(&mut dates);
     Facts {
         entities,
+        relations,
         event_type,
         state,
         certainty,
@@ -1644,6 +1968,7 @@ pub struct EvalReport {
     pub banned_word: usize,
     pub url_in_prose: usize,
     pub too_long: usize,
+    pub unfaithful_relation: usize,
 }
 
 impl EvalReport {
@@ -1660,6 +1985,7 @@ impl EvalReport {
                     GateViolation::BannedWord(_) => self.banned_word += 1,
                     GateViolation::UrlInProse(_) => self.url_in_prose += 1,
                     GateViolation::TooLong => self.too_long += 1,
+                    GateViolation::UnfaithfulRelation(_) => self.unfaithful_relation += 1,
                 }
             }
         }
@@ -1713,7 +2039,8 @@ impl std::fmt::Display for EvalReport {
         writeln!(f, "    ungrounded_entity: {}", self.ungrounded_entity)?;
         writeln!(f, "    banned_word:       {}", self.banned_word)?;
         writeln!(f, "    url_in_prose:      {}", self.url_in_prose)?;
-        write!(f, "    too_long:          {}", self.too_long)
+        writeln!(f, "    too_long:          {}", self.too_long)?;
+        write!(f, "    unfaithful_relation: {}", self.unfaithful_relation)
     }
 }
 
@@ -3017,7 +3344,7 @@ mod tests {
     #[test]
     fn summary_model_string() {
         let cfg = SummarizationConfig::default();
-        assert_eq!(cfg.summary_model(), "qwen3.5-4b-instruct@7");
+        assert_eq!(cfg.summary_model(), "qwen3.5-4b-instruct@8");
     }
 
     #[test]
@@ -3316,5 +3643,144 @@ mod tests {
         let empty = lead_user_prompt(&["A lone update".to_string()], &[], &[]);
         assert!(empty.contains("(none)"));
         assert!(empty.contains("A lone update"));
+    }
+
+    // ── Relation extraction + the relational gate (§3.2) ──────────────────────────────────────────
+
+    fn rel(subject: &str, predicate: &str, object: &str) -> Relation {
+        Relation {
+            subject: subject.to_string(),
+            predicate: predicate.to_string(),
+            object: object.to_string(),
+        }
+    }
+
+    #[test]
+    fn apply_relations_keeps_grounded_drops_ungrounded_and_dedups() {
+        let mut facts = Facts {
+            entities: vec![
+                "person:andy-burnham".to_string(),
+                "person:rachel-reeves".to_string(),
+            ],
+            ..Facts::default()
+        };
+        let out = RelationsOutput {
+            analysis: "..".to_string(),
+            relations: vec![
+                // Grounded subject, full triple — kept (and whitespace trimmed).
+                rel(
+                    " person:andy-burnham ",
+                    " would replace ",
+                    " Rachel Reeves ",
+                ),
+                // Exact duplicate of the above (post-trim) — deduped away.
+                rel("person:andy-burnham", "would replace", "Rachel Reeves"),
+                // Subject not in the entity set — dropped (the un-anchored claim the gate can't trust).
+                rel("person:keir-starmer", "leads", "Labour"),
+                // Empty object — dropped.
+                rel("person:rachel-reeves", "is", ""),
+            ],
+        };
+        apply_relations(&mut facts, &out);
+        assert_eq!(
+            facts.relations,
+            vec![rel("person:andy-burnham", "would replace", "Rachel Reeves")],
+            "only the grounded, complete, de-duplicated triple survives"
+        );
+    }
+
+    #[test]
+    fn apply_relations_empty_when_no_grounded_subject() {
+        let mut facts = Facts {
+            entities: vec!["repo:acme/auth".to_string()],
+            ..Facts::default()
+        };
+        let out = RelationsOutput {
+            analysis: String::new(),
+            relations: vec![rel("the deploy", "broke", "logins")],
+        };
+        apply_relations(&mut facts, &out);
+        assert!(facts.relations.is_empty());
+    }
+
+    #[test]
+    fn relations_flow_into_the_summarizer_prompt() {
+        let facts = Facts {
+            entities: vec!["person:andy-burnham".to_string()],
+            relations: vec![rel("person:andy-burnham", "would replace", "Rachel Reeves")],
+            ..Facts::default()
+        };
+        let p = user_prompt(&facts, "source text");
+        assert!(p.contains("person:andy-burnham -> would replace -> Rachel Reeves"));
+        assert!(p.contains("keep each direction"));
+        // The headline-only (Note-depth) prompt carries the same relations line.
+        let h = headline_only_user_prompt(&facts, "source text");
+        assert!(h.contains("person:andy-burnham -> would replace -> Rachel Reeves"));
+        // No relations renders the explicit "(none)" rather than a blank.
+        let bare = user_prompt(&Facts::default(), "src");
+        assert!(
+            bare.contains("relations (keep each direction, never swap subject and object): (none)")
+        );
+    }
+
+    #[test]
+    fn relations_schema_constrains_subject_to_entities() {
+        let entities = vec![
+            "person:andy-burnham".to_string(),
+            "person:rachel-reeves".to_string(),
+        ];
+        let schema = relations_schema(&entities);
+        let subject =
+            &schema["schema"]["properties"]["relations"]["items"]["properties"]["subject"];
+        assert_eq!(
+            subject["enum"],
+            serde_json::json!(["person:andy-burnham", "person:rachel-reeves"]),
+            "subject is the closed entity enum — a hallucinated actor is structurally impossible"
+        );
+        // The empty-entity arm stays well-formed (a plain capped string, no degenerate empty enum).
+        let empty = relations_schema(&[]);
+        let s = &empty["schema"]["properties"]["relations"]["items"]["properties"]["subject"];
+        assert!(s["enum"].is_null() && s["type"] == "string");
+    }
+
+    #[test]
+    fn relation_gate_prompt_renders_facts_and_summary() {
+        let relations = vec![
+            rel("person:andy-burnham", "would replace", "Rachel Reeves"),
+            rel("person:andy-burnham", "could become", "prime minister"),
+        ];
+        let p = relation_gate_user_prompt(
+            &relations,
+            "Reeves may take a junior role if she becomes PM",
+            "",
+        );
+        assert!(p.contains("person:andy-burnham -> would replace -> Rachel Reeves"));
+        assert!(p.contains("person:andy-burnham -> could become -> prime minister"));
+        assert!(p.contains("Reeves may take a junior role if she becomes PM"));
+        assert!(p.contains("reverse or contradict"));
+    }
+
+    #[test]
+    fn relation_verdict_defaults_fail_open() {
+        // A verdict object missing `faithful` (degenerate, shouldn't happen under the strict schema)
+        // deserializes to faithful=true — the gate never rejects on an absent field.
+        let v: RelationVerdict = serde_json::from_str(r#"{"analysis":"x","problem":""}"#).unwrap();
+        assert!(v.faithful);
+        let no: RelationVerdict =
+            serde_json::from_str(r#"{"analysis":"swap","faithful":false,"problem":"reversed"}"#)
+                .unwrap();
+        assert!(!no.faithful);
+        assert_eq!(no.problem, "reversed");
+    }
+
+    #[test]
+    fn eval_report_records_unfaithful_relation() {
+        let mut r = EvalReport::default();
+        r.record(&EvalVerdict::Rejected(GateViolation::UnfaithfulRelation(
+            "reversed".to_string(),
+        )));
+        assert_eq!(r.unfaithful_relation, 1);
+        assert_eq!(r.rejected, 1);
+        assert_eq!(r.passed, 0);
     }
 }
