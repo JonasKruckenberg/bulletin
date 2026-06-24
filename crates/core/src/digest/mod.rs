@@ -14,7 +14,7 @@ pub use render::{DigestContent, Mailer};
 use std::collections::HashMap;
 
 use anyhow::{anyhow, Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -34,6 +34,19 @@ use crate::link::{self, LinkedStory};
 /// reach-back to the last delivery (design §9.4). Generous on purpose: it must exceed the longest
 /// cadence (weekly) plus any plausible outage so nothing ages out unconsidered. Config table later.
 const CONTEXT_HORIZON_DAYS: i32 = 30;
+
+/// How [`link_and_select`] derives the cadence display floor — the freshness gate `select` applies to
+/// decide what *surfaces*. Linking always uses the full candidate window (`horizon_days`) regardless;
+/// this only governs which of those candidates are recent enough to show.
+enum DisplayPolicy {
+    /// Surface items fresh for the subscriber's cadence: reach back to the last delivery, floored at
+    /// one cadence + grace — the scheduled digest and its dry-run `explain` (see
+    /// [`Recurrence::display_floor`](subscriber::Recurrence::display_floor)).
+    Cadence,
+    /// Surface *every* candidate in the lookback window — the off-schedule preview (`dispatch_now`),
+    /// so its `--lookback N` governs what's shown, not just the linking context behind it.
+    FullLookback,
+}
 
 #[derive(Debug)]
 pub enum DigestOutcome {
@@ -81,6 +94,7 @@ async fn link_and_select(
     last_run: Option<DateTime<Utc>>,
     horizon_days: i32,
     shown_before: DateTime<Utc>,
+    display: DisplayPolicy,
     persist: bool,
 ) -> Result<(
     Vec<LinkedStory>,
@@ -191,13 +205,19 @@ async fn link_and_select(
         max_items,
         candidates: candidates.clone(),
     };
-    // Cadence display floor: the candidate set reaches `CONTEXT_HORIZON_DAYS` (30d) back for
-    // linking/threading context, but this subscriber's digest should only *surface* items recent
-    // enough for their chosen cadence (one cadence + grace; see [`Recurrence::display_window`]).
-    // Items older than the floor stay candidates (so linking still uses them) but `select` excludes
-    // them from selection with `StaleForCadence` — fixing stale items filling slots when fresh
-    // content is thin (relevance ranking only decays with age, it never gates on it).
-    let display_floor = now - sub.recurrence.display_window();
+    // Display floor: the candidate set reaches `horizon_days` back for linking/threading context,
+    // but the digest should only *surface* fresh items. Items older than the floor stay candidates
+    // (so linking still uses them) but `select` excludes them with `StaleForCadence` — fixing stale
+    // items filling slots when fresh content is thin (relevance ranking only decays with age, never
+    // gates on it). How far back the floor reaches depends on the path (see [`DisplayPolicy`]):
+    //  - scheduled/explain → the subscriber's cadence: reach back to the last delivery (so a delayed
+    //    or outage-coalesced run surfaces every fresh event since the previous digest — the literal
+    //    "digest window"), floored at one cadence + grace so a recent extra run can't collapse it;
+    //  - off-schedule preview → the full lookback, so `--lookback N` shows the last N days as asked.
+    let display_floor = match display {
+        DisplayPolicy::Cadence => sub.recurrence.display_floor(now, last_run),
+        DisplayPolicy::FullLookback => now - Duration::days(horizon_days as i64),
+    };
     let decisions = select(candidates, &cfg, max_items, now, display_floor);
     Ok((assignment.stories, decisions, story_entities, snapshot))
 }
@@ -669,6 +689,7 @@ pub async fn generate(
         sub.last_run_at,
         CONTEXT_HORIZON_DAYS,
         window_end,
+        DisplayPolicy::Cadence,
         true,
     )
     .await?;
@@ -801,10 +822,20 @@ pub async fn dispatch_now(
         .context("build private clusters")?;
 
     // Explicit lookback floor = now − lookback_days (last_run_at is ignored — this is off-schedule).
-    // A preview links in-memory but persists nothing (`false`): it must not disturb the real story
-    // cache, schedule, or de-dup history.
-    let (stories, decisions, story_entities, _) =
-        link_and_select(pool, &sub, None, lookback_days, Utc::now(), false).await?;
+    // `FullLookback` makes that same window govern *surfacing* too, so `--lookback N` previews the
+    // last N days as named (not the subscriber's much shorter cadence window). A preview links
+    // in-memory but persists nothing (`false`): it must not disturb the real story cache, schedule,
+    // or de-dup history.
+    let (stories, decisions, story_entities, _) = link_and_select(
+        pool,
+        &sub,
+        None,
+        lookback_days,
+        Utc::now(),
+        DisplayPolicy::FullLookback,
+        false,
+    )
+    .await?;
     log_selection(sub.id, &decisions);
     let selected = selected_ids(&decisions);
 
@@ -909,6 +940,7 @@ pub async fn explain(pool: &PgPool, subscriber_id: Uuid) -> Result<Vec<ExplainRo
         sub.last_run_at,
         CONTEXT_HORIZON_DAYS,
         sub.next_run_at,
+        DisplayPolicy::Cadence,
         false,
     )
     .await?;

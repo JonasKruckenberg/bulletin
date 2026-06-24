@@ -12,12 +12,22 @@ use uuid::Uuid;
 
 use crate::link::{Assignment, LinkCluster, PriorMember};
 
+/// Hard upper bound (days) on how far the candidate floor may reach back, regardless of how long
+/// ago the subscriber last ran. The floor is normally `LEAST(last_run, now − horizon)` so it always
+/// reaches back to the last delivery — but a subscriber dormant for months would otherwise pull
+/// their entire cluster history into one linking pass (an unbounded scan + O(n²) blocking cost).
+/// This caps that reach for **perf**: events older than this can't corroborate a fresh one anyway
+/// (they're long past any decay horizon), so bounding the scan costs nothing the digest would surface.
+const MAX_LOOKBACK_DAYS: i32 = 90;
+
 /// The subscriber's candidate clusters for linking: their scope (`subscribed-public ∪ own-private`),
 /// carrying the blocking substrate (`entities`) and recency span. Two arms, unioned
 /// (`scope_subscriber_id = $1` is the isolation boundary — never another subscriber's private
 /// cluster):
 ///
-///  1. **In-floor** — clusters updated since the freshness floor `min(last_run, now − horizon)`: a
+///  1. **In-floor** — clusters updated since the freshness floor `min(last_run, now − horizon)`,
+///     itself clamped to at most [`MAX_LOOKBACK_DAYS`] back (a dormant subscriber's reach is bounded
+///     for perf): a
 ///     public cluster only when the subscriber subscribes to the `connection` that produced it (the
 ///     sources they chose for their digest; an unattributed public row — no origin on record — stays
 ///     global), plus all own-private. The bulk of the candidate set, served by the `cluster_*_recency`
@@ -54,7 +64,15 @@ pub async fn candidate_clusters(
     // ('{}') has no band and a rejected baseline bands `uncertain`, so both are excluded. Applied to the
     // two public-candidate arms (in_floor, cross_boundary), never to the private_strong seed.
     sqlx::query(
-        "WITH floor AS (SELECT LEAST($2, now() - make_interval(days => $3)) AS lo),
+        // The candidate floor reaches back to the last delivery (`LEAST(last_run, now − horizon)`,
+        // so nothing since the last digest ages out unconsidered), but never past `MAX_LOOKBACK_DAYS`
+        // ($5) — the `GREATEST` clamp bounds a dormant subscriber's scan for perf without dropping any
+        // context a fresh event could still corroborate with.
+        "WITH floor AS (
+                  SELECT GREATEST(
+                             LEAST($2, now() - make_interval(days => $3)),
+                             now() - make_interval(days => $5)
+                         ) AS lo),
               in_floor AS (
                   SELECT id, scope_kind, source, entities, first_event_time, last_event_time,
                          event_count, content_depth, max_severity
@@ -117,6 +135,7 @@ pub async fn candidate_clusters(
     .bind(last_run)
     .bind(horizon_days)
     .bind(require_summary)
+    .bind(MAX_LOOKBACK_DAYS)
     .try_map(|row: PgRow| {
         let scope_kind: String = row.get("scope_kind");
         Ok(LinkCluster {
