@@ -65,6 +65,123 @@ pub(crate) fn render(html: &str, max_html_chars: usize, max_chars: usize) -> Opt
     Some(truncate_on_word_boundary(normalized, max_chars))
 }
 
+/// Render a *full fetched page* to the article's plain text — the full-article fetcher's entry point
+/// ([`super::fetch`]), distinct from the generic [`render`] the RSS path uses on a small `<description>`
+/// fragment. A whole-page [`render`] is the wrong tool for a modern news page: the article lives in a
+/// `<script type="application/ld+json">` block html2text deliberately skips and/or in `<article>` markup
+/// that sits *past* [`render`]'s input-size truncation, so a blind strip yields only the nav/footer
+/// chrome (the observed `Hauptnavigation Nebennavigation Inhalt Fußzeile` boilerplate). This isolates
+/// the main content first, in falling order of reliability:
+///
+///   1. **schema.org JSON-LD `articleBody`** — the clean, already-plain article text most news sites
+///      embed for search engines. Immune to both the chrome and the truncation, so it is tried first.
+///   2. **the `<article>` subtree**, rendered in isolation — drops surrounding nav/header/footer, and
+///      (handed to [`render`] on its own) is no longer beyond the truncation horizon.
+///   3. **the whole page** ([`render`]) — the legacy last resort for a page exposing neither signal.
+///
+/// `None` only when all three yield nothing usable (a genuinely content-less page). `max_html_chars` /
+/// `max_chars` bound the parse/output exactly as in [`render`].
+pub(crate) fn render_article(
+    html: &str,
+    max_html_chars: usize,
+    max_chars: usize,
+) -> Option<String> {
+    if let Some(body) = jsonld_article_body(html) {
+        // Route the (already-plain) JSON-LD body through `render` too, so it gets the same HTML-entity
+        // decode (`&amp;` → `&`), whitespace collapse, and word-boundary cap as every other path — one
+        // normalizer, no drift.
+        if let Some(text) = render(&body, max_html_chars, max_chars) {
+            return Some(text);
+        }
+    }
+    if let Some(article) = first_article_subtree(html) {
+        if let Some(text) = render(article, max_html_chars, max_chars) {
+            return Some(text);
+        }
+    }
+    render(html, max_html_chars, max_chars)
+}
+
+/// Extract the article text from a page's schema.org JSON-LD: scan each
+/// `<script type="application/ld+json">` block, parse it, and return the first non-empty `articleBody`
+/// found (walking nested objects / arrays / `@graph`, since the article node is often wrapped). `None`
+/// when the page carries no JSON-LD or none with an `articleBody`.
+///
+/// The scan is a byte-safe, ASCII-case-insensitive walk over the raw HTML ([`find_ascii_ci`]) — no DOM
+/// parser and no new dependency — which is sound because every offset it slices on (`<script`, the
+/// tag-closing `>`, `</script>`) is ASCII, so it lands on a valid char boundary even amid multibyte
+/// UTF-8 article text.
+fn jsonld_article_body(html: &str) -> Option<String> {
+    let mut pos = 0;
+    while let Some(rel) = find_ascii_ci(&html[pos..], "<script") {
+        let tag_open = pos + rel;
+        // The opening tag ends at the first `>`; its content runs to the next `</script>`.
+        let Some(gt_rel) = html[tag_open..].find('>') else {
+            break;
+        };
+        let content_start = tag_open + gt_rel + 1;
+        let open_tag = &html[tag_open..content_start];
+        if find_ascii_ci(open_tag, "application/ld+json").is_some() {
+            if let Some(close_rel) = find_ascii_ci(&html[content_start..], "</script>") {
+                let json = &html[content_start..content_start + close_rel];
+                if let Some(body) = parse_article_body(json) {
+                    return Some(body);
+                }
+            }
+        }
+        // Advance past this opening tag (a boundary) and keep scanning for the next script block.
+        pos = content_start;
+    }
+    None
+}
+
+/// Parse one JSON-LD script block and pull a non-empty `articleBody` out of it, if present.
+fn parse_article_body(json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(json.trim()).ok()?;
+    find_article_body(&value)
+}
+
+/// Recursively search a JSON-LD value for a non-empty `articleBody` string — the node may be a bare
+/// object, an array of nodes (multiple `@type`s on one page), or wrapped in an `@graph`, so any
+/// `articleBody` anywhere in the tree wins (the first found, depth-first).
+fn find_article_body(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::Object(map) => {
+            if let Some(serde_json::Value::String(body)) = map.get("articleBody") {
+                let trimmed = body.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+            map.values().find_map(find_article_body)
+        }
+        serde_json::Value::Array(arr) => arr.iter().find_map(find_article_body),
+        _ => None,
+    }
+}
+
+/// The `<article>…</article>` subtree of `html` (the first `<article` open tag to the next
+/// `</article>` close), or `None` when the page has no `<article>` element. A coarse but effective main-
+/// content isolation for the common semantic-HTML page: it drops the nav/header/footer that a whole-page
+/// strip would fold in. Byte-safe ASCII matching ([`find_ascii_ci`]), like [`jsonld_article_body`].
+fn first_article_subtree(html: &str) -> Option<&str> {
+    let open = find_ascii_ci(html, "<article")?;
+    let close_rel = find_ascii_ci(&html[open..], "</article>")?;
+    Some(&html[open..open + close_rel + "</article>".len()])
+}
+
+/// First byte offset of ASCII `needle` in `haystack`, case-insensitively, or `None`. ASCII-only
+/// matching is byte-offset-safe even within multibyte UTF-8: every continuation/lead byte is `>= 0x80`
+/// and so never equals an ASCII byte, so a match can only start (and end) on a char boundary.
+fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
+    let hay = haystack.as_bytes();
+    let nee = needle.as_bytes();
+    if nee.is_empty() || hay.len() < nee.len() {
+        return None;
+    }
+    (0..=hay.len() - nee.len()).find(|&i| hay[i..i + nee.len()].eq_ignore_ascii_case(nee))
+}
+
 /// Cap `s` to `max_chars`, cutting on a whitespace boundary so the stored body never ends in a split
 /// token — a half-truncated number would otherwise be mined as a (bogus) grounded quantity. Falls back
 /// to a hard char cut only when the truncated prefix holds no space at all (one pathological long
@@ -138,5 +255,93 @@ mod tests {
         // Only a *standalone* run of `#` (a heading marker) is dropped — issue refs and `C#` stay.
         let out = render("<p>fixed in #123 for C# users</p>", 16_000, 2000).unwrap();
         assert_eq!(out, "fixed in #123 for C# users");
+    }
+
+    #[test]
+    fn jsonld_article_body_is_extracted_and_entity_decoded() {
+        let html = r#"<html><head>
+            <script type="application/ld+json">
+            {"@context":"https://schema.org","@type":"NewsArticle",
+             "headline":"x","articleBody":"The boom did not happen. Hotels &amp; bars stayed empty."}
+            </script></head><body><p>nav</p></body></html>"#;
+        let out = render_article(html, 200_000, 8000).unwrap();
+        assert_eq!(out, "The boom did not happen. Hotels & bars stayed empty.");
+    }
+
+    #[test]
+    fn jsonld_article_body_found_inside_a_graph_array() {
+        // The article node is commonly wrapped in an `@graph` alongside breadcrumb/org nodes — the
+        // recursive search must still find its `articleBody`.
+        let html = r#"<script type="application/ld+json">
+            {"@context":"https://schema.org","@graph":[
+              {"@type":"BreadcrumbList","itemListElement":[]},
+              {"@type":"Article","articleBody":"Real article text here."}
+            ]}</script>"#;
+        assert_eq!(
+            render_article(html, 200_000, 8000).unwrap(),
+            "Real article text here."
+        );
+    }
+
+    #[test]
+    fn regression_news_page_returns_article_not_nav_chrome() {
+        // The shape that produced "FIFA announces a fan boom in the USA": a script/chrome-heavy page
+        // whose only *visible* text near the top is the accessibility skip-links, with the real article
+        // exposed via JSON-LD. A whole-page strip yields the nav boilerplate; `render_article` must pull
+        // the JSON-LD body instead.
+        let html = r##"<html><head>
+            <script>var darkmode=1;</script>
+            <script type="application/ld+json">
+            {"@type":"NewsArticle","headline":"Fan-Boom bleibt aus",
+             "articleBody":"Vor dem Turnier hatte die FIFA einen Boom versprochen. Doch die Rechnung geht bislang nicht auf."}
+            </script></head>
+            <body>
+              <a href="#nav">Zur Hauptnavigation springen</a>
+              <a href="#sub">Zur Nebennavigation</a>
+              <a href="#content">Zum Inhalt</a>
+              <a href="#footer">Zur Fußzeile</a>
+            </body></html>"##;
+        let out = render_article(html, 200_000, 8000).unwrap();
+        assert!(
+            out.starts_with("Vor dem Turnier hatte die FIFA einen Boom versprochen."),
+            "expected the article body, got: {out}"
+        );
+        // The crucial negation that the title-only summary dropped is present in the grounding now.
+        assert!(out.contains("Doch die Rechnung geht bislang nicht auf."));
+        // And the nav skip-links are not what we returned.
+        assert!(!out.contains("Hauptnavigation"), "nav chrome leaked: {out}");
+    }
+
+    #[test]
+    fn article_subtree_is_used_when_no_jsonld() {
+        // No JSON-LD: isolate the <article> subtree so the surrounding nav/footer is dropped.
+        let html = r##"<html><body>
+            <nav><a href="/">Home</a> Navigation menu</nav>
+            <article><h1>Title.</h1><p>The body of the story.</p></article>
+            <footer>Footer links here</footer>
+            </body></html>"##;
+        let out = render_article(html, 200_000, 8000).unwrap();
+        assert_eq!(out, "Title. The body of the story.");
+        assert!(!out.contains("Navigation"));
+        assert!(!out.contains("Footer"));
+    }
+
+    #[test]
+    fn falls_back_to_whole_page_without_jsonld_or_article() {
+        // Neither signal present → legacy whole-page strip (unchanged behavior).
+        let html = "<html><body><p>Just a plain page.</p></body></html>";
+        assert_eq!(
+            render_article(html, 200_000, 8000).unwrap(),
+            "Just a plain page."
+        );
+    }
+
+    #[test]
+    fn find_ascii_ci_is_case_insensitive_and_utf8_safe() {
+        // Case-insensitive match, and a byte offset that lands correctly past multibyte UTF-8.
+        let s = "Fußball <SCRIPT TYPE=\"x\">";
+        assert_eq!(find_ascii_ci(s, "<script"), s.find('<'));
+        assert_eq!(find_ascii_ci("abc", "zzz"), None);
+        assert_eq!(find_ascii_ci("", "x"), None);
     }
 }
