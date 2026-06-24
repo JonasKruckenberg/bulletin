@@ -12,13 +12,17 @@ use uuid::Uuid;
 use crate::digest::subscriber::Recurrence;
 
 /// The bare time-of-day phrase for the subscriber's local delivery time — what the wall clock would
-/// say when the mail lands. Late nights and the small hours greet as "evening" (a 2am "good morning"
-/// reads odd).
+/// say when the mail lands. Six buckets across the day; the two unusual edges (the early hours before
+/// the day proper, and the small hours past midnight) get a warmer, playful hello rather than a flat
+/// "good morning"/"good evening" that reads odd at those times.
 fn time_of_day(t: NaiveTime) -> &'static str {
     match t.hour() {
-        5..=11 => "Good morning",
-        12..=16 => "Good afternoon",
-        _ => "Good evening",
+        5..=7 => "Bright and early",     // early morning
+        8..=11 => "Good morning",        // morning
+        12..=13 => "Good midday",        // midday
+        14..=17 => "Good afternoon",     // afternoon
+        18..=21 => "Good evening",       // evening
+        _ => "Burning the midnight oil", // late night (22:00–04:59)
     }
 }
 
@@ -99,12 +103,21 @@ mod tests {
     #[test]
     fn salutation_tracks_time_of_day() {
         let at = |h| salutation(NaiveTime::from_hms_opt(h, 0, 0).unwrap(), None);
-        assert_eq!(at(5), "Good morning");
+        // Each bucket, checked at both its edges so a boundary shift can't pass unnoticed.
+        assert_eq!(at(5), "Bright and early"); // early morning — playful at an unusual hour
+        assert_eq!(at(7), "Bright and early");
+        assert_eq!(at(8), "Good morning");
         assert_eq!(at(11), "Good morning");
-        assert_eq!(at(12), "Good afternoon");
-        assert_eq!(at(16), "Good afternoon");
-        assert_eq!(at(17), "Good evening");
-        assert_eq!(at(2), "Good evening"); // small hours stay "evening"
+        assert_eq!(at(12), "Good midday");
+        assert_eq!(at(13), "Good midday");
+        assert_eq!(at(14), "Good afternoon");
+        assert_eq!(at(17), "Good afternoon");
+        assert_eq!(at(18), "Good evening");
+        assert_eq!(at(21), "Good evening");
+        // Late night wraps past midnight; the small hours get the playful nod, not a flat greeting.
+        assert_eq!(at(22), "Burning the midnight oil");
+        assert_eq!(at(0), "Burning the midnight oil");
+        assert_eq!(at(4), "Burning the midnight oil");
     }
 
     #[test]
@@ -129,6 +142,29 @@ mod tests {
             );
             assert!(line.contains("daily"));
         }
+    }
+
+    #[test]
+    fn playful_edge_buckets_splice_cleanly() {
+        // The early-morning and late-night phrases are full salutations like the rest, so they take a
+        // name and drop into every template without leaving stray punctuation.
+        let early = greeting(
+            NaiveTime::from_hms_opt(6, 0, 0).unwrap(),
+            Recurrence::Daily,
+            0,
+            Some("Alice"),
+        );
+        assert!(early.starts_with("Bright and early, Alice"), "{early}");
+        let late = greeting(
+            NaiveTime::from_hms_opt(1, 0, 0).unwrap(),
+            Recurrence::Daily,
+            0,
+            Some("Alice"),
+        );
+        assert!(
+            late.starts_with("Burning the midnight oil, Alice"),
+            "{late}"
+        );
     }
 
     #[test]
